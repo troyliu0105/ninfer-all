@@ -2652,25 +2652,27 @@ private:
         std::vector<std::uint32_t> selected_frontiers;
         std::uint64_t selected_gain = 0;
         ContextPortfolioValue projected_value;
-        if (shared_candidates.size() > 7U) {
-            throw std::logic_error("prepared shared candidates exceeded the fixed subset bound");
-        }
-        const std::uint32_t subset_count = 1U << shared_candidates.size();
-        for (std::uint32_t mask = 1; mask < subset_count; ++mask) {
-            const std::uint32_t selected_count = std::popcount(mask);
-            if (selected_count > shared_catalog_count_) { continue; }
+        // One request's own candidate ceiling, kMaximumPreparedPromptCacheCandidatesPerRequest, is
+        // small enough for the exhaustive subset search to stay exact. --auto-prefix-grid adds up
+        // to kPrefixGridCandidates EngineObserved points on top of it, and they join the candidate
+        // set as soon as two independent reuse domains have proposed them, so a larger set is
+        // ordinary traffic rather than a broken invariant: past this bound the search continues by
+        // marginal gain, bounded by the candidate count squared, instead of failing admission.
+        constexpr std::size_t kExhaustiveSubsetBound = 7U;
+        const auto assess_shared_subset =
+            [&](std::span<const std::uint32_t> indices)
+            -> std::optional<std::pair<std::uint64_t, std::vector<std::uint32_t>>> {
+            if (indices.size() > shared_catalog_count_) { return std::nullopt; }
             std::uint32_t surplus_only_count = 0;
             std::vector<std::uint32_t> frontiers;
-            frontiers.reserve(selected_count);
+            frontiers.reserve(indices.size());
             std::vector<ContextPortfolioOwnerPolicy> owners          = projected_owners;
             std::vector<ContextPortfolioCheckpointValue> checkpoints = projected_checkpoints;
-            for (std::size_t index = 0; index < shared_candidates.size(); ++index) {
-                if ((mask & (1U << index)) == 0) { continue; }
+            for (const std::uint32_t index : indices) {
                 const ProjectedSharedCandidate& candidate = shared_candidates[index];
                 if (!candidate.pressure_capable) { ++surplus_only_count; }
                 frontiers.push_back(candidate.frontier);
-                const PlanningOwnerId owner{.value = next_projected_owner +
-                                                     static_cast<std::uint32_t>(index)};
+                const PlanningOwnerId owner{.value = next_projected_owner + index};
                 const bool credit =
                     has_shared_candidate_evidence(candidate.evidence,
                                                   SharedCandidateEvidence::ExplicitBoundary) ||
@@ -2688,31 +2690,73 @@ private:
                     .target_recovery_ns   = 0,
                 });
             }
-            if (surplus_only_count > shared_publication_slack) { continue; }
+            if (surplus_only_count > shared_publication_slack) { return std::nullopt; }
             std::sort(frontiers.begin(), frontiers.end());
             const ContextPortfolioValueResult value = projected_value.fold(owners, checkpoints);
             const std::uint64_t schedule_cost       = split_cost(frontiers);
             if (value.saturated ||
                 value.private_transition_loss >
                     std::numeric_limits<std::uint64_t>::max() - value.baseline_public_value) {
-                continue;
+                return std::nullopt;
             }
             std::uint64_t threshold = value.baseline_public_value + value.private_transition_loss;
-            if (schedule_cost > std::numeric_limits<std::uint64_t>::max() - threshold) { continue; }
+            if (schedule_cost > std::numeric_limits<std::uint64_t>::max() - threshold) {
+                return std::nullopt;
+            }
             threshold += schedule_cost;
-            if (value.target_public_value <= threshold) { continue; }
-            const std::uint64_t gain = value.target_public_value - threshold;
-            const bool better =
-                gain > selected_gain ||
-                (gain == selected_gain &&
-                 (selected_frontiers.empty() || frontiers.size() < selected_frontiers.size() ||
-                  (frontiers.size() == selected_frontiers.size() &&
-                   std::lexicographical_compare(frontiers.begin(), frontiers.end(),
-                                                selected_frontiers.begin(),
-                                                selected_frontiers.end()))));
-            if (better) {
-                selected_gain      = gain;
-                selected_frontiers = std::move(frontiers);
+            if (value.target_public_value <= threshold) { return std::nullopt; }
+            return std::make_pair(value.target_public_value - threshold, std::move(frontiers));
+        };
+        const auto keeps_best_gain = [&](std::uint64_t gain,
+                                         const std::vector<std::uint32_t>& frontiers) {
+            return gain > selected_gain ||
+                   (gain == selected_gain &&
+                    (selected_frontiers.empty() ||
+                     frontiers.size() < selected_frontiers.size() ||
+                     (frontiers.size() == selected_frontiers.size() &&
+                      std::lexicographical_compare(frontiers.begin(), frontiers.end(),
+                                                   selected_frontiers.begin(),
+                                                   selected_frontiers.end()))));
+        };
+        if (shared_candidates.size() <= kExhaustiveSubsetBound) {
+            const std::uint32_t subset_count = 1U << shared_candidates.size();
+            std::vector<std::uint32_t> indices;
+            indices.reserve(shared_candidates.size());
+            for (std::uint32_t mask = 1; mask < subset_count; ++mask) {
+                const std::uint32_t selected_count = std::popcount(mask);
+                if (selected_count > shared_catalog_count_) { continue; }
+                indices.clear();
+                for (std::uint32_t index = 0; index < shared_candidates.size(); ++index) {
+                    if ((mask & (1U << index)) != 0) { indices.push_back(index); }
+                }
+                const auto assessed = assess_shared_subset(indices);
+                if (!assessed || !keeps_best_gain(assessed->first, assessed->second)) { continue; }
+                selected_gain      = assessed->first;
+                selected_frontiers = assessed->second;
+            }
+        } else {
+            // Every accepted step strictly raises the selected gain, so the walk is monotone and
+            // the last set it accepted is the best one it saw.
+            std::vector<std::uint32_t> chosen;
+            std::optional<std::pair<std::uint64_t, std::vector<std::uint32_t>>> best;
+            for (;;) {
+                best.reset();
+                std::uint32_t best_index = 0;
+                for (std::uint32_t index = 0; index < shared_candidates.size(); ++index) {
+                    if (std::find(chosen.begin(), chosen.end(), index) != chosen.end()) {
+                        continue;
+                    }
+                    std::vector<std::uint32_t> trial = chosen;
+                    trial.push_back(index);
+                    auto assessed = assess_shared_subset(trial);
+                    if (!assessed || (best && assessed->first <= best->first)) { continue; }
+                    best       = std::move(assessed);
+                    best_index = index;
+                }
+                if (!best || best->first <= selected_gain) { break; }
+                chosen.push_back(best_index);
+                selected_gain      = best->first;
+                selected_frontiers = std::move(best->second);
             }
         }
         return selected_frontiers;

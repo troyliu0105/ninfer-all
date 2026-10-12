@@ -615,7 +615,10 @@ Shared candidate 必须在 prefill 前决定是否增加 split，而物理状态
 分为两步：
 
 1. admission 已选定 materialization source 后，ResourceManager 用完整逻辑 portfolio 的乐观收益上界和
-   Program 返回的精确 split cost 选择 candidate subset；这一步不预留资源，也不承诺 publication；
+   Program 返回的精确 split cost 选择 candidate subset。单请求自身的候选上限（七个）以内穷举全部子集取
+   精确最优；`--auto-prefix-grid` 把候选数抬到最多十五个后穷举不再可行，搜索改为按边际收益贪心，每步
+   接受严格提高总收益的候选，代价受候选数平方约束，因此开启栅格也不会因候选过多而拒绝 admission；
+   这一步不预留资源，也不承诺 publication；
 2. capture offer 到达后，`SharedCapturePlanner` 从当前 `resource_revision` 搜索完整物理 targets，可以联合
    demote/evict 多个合法 inactive private/shared owners。shared catalog 已满时，logical replacement 与其他
    物理 victims 属于同一个 target 和同一个 transaction。

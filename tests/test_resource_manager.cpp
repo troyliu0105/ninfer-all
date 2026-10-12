@@ -3853,6 +3853,33 @@ void test_projected_nested_shared_candidates_use_marginal_value() {
     (void)finish_active(manager, program, active);
 }
 
+// --auto-prefix-grid raises one request's shared-candidate ceiling past the exhaustive subset
+// search's bound: four explicit markers, three engine automatic candidates and up to eight grid
+// points. A candidate set that large is ordinary traffic, so it must still be scheduled instead of
+// failing admission once the exact enumeration stops being affordable.
+void test_shared_candidates_past_the_exhaustive_bound_still_schedule() {
+    constexpr std::size_t kCandidateCount = 10;
+    FakeRequestBasePlan base              = make_base(101);
+    std::vector<std::uint32_t> expected;
+    for (std::size_t index = 0; index < kCandidateCount; ++index) {
+        const std::uint32_t frontier = 6U * static_cast<std::uint32_t>(index + 1U);
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = frontier,
+        });
+        expected.push_back(frontier);
+    }
+    // Every candidate adds more rebuild saving than the prefill split it costs, so the marginal
+    // search keeps all of them and the schedule equals the full frontier set.
+    FakeManager manager = make_manager(1, 2, kCandidateCount);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 101, base, 1);
+    require(program.selected_shared_capture_frontiers == expected,
+            "a candidate set beyond the exhaustive bound was not scheduled by marginal gain");
+    (void)finish_active(manager, program, active);
+}
+
 void test_observed_shared_candidate_requires_independent_domains() {
     const auto observed_base = [](std::optional<FakeCacheSessionKey> session) {
         FakeRequestBasePlan base = make_base(71, session);
@@ -5559,6 +5586,8 @@ int main() {
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);
+    run_test("shared candidates past the exhaustive bound",
+             test_shared_candidates_past_the_exhaustive_bound_still_schedule);
     run_test("observed shared independent domains",
              test_observed_shared_candidate_requires_independent_domains);
     run_test("zero-prefill private promotion",
