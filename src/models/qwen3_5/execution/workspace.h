@@ -42,10 +42,13 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     out.residual = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
-        if (overlay_staging) {
-            out.visual_embeddings =
-                matrix(allocator, DType::BF16, dimension(config.hidden_size), scatter_tokens + 1);
-        }
+    }
+    if (overlay_staging) {
+        // Allocated even when this chunk scatters no visual token of its own: a chunk ending
+        // exactly on an item's first visual token still stages that column, because the shifted
+        // MTP input of the chunk's last text token names it.
+        out.visual_embeddings =
+            matrix(allocator, DType::BF16, dimension(config.hidden_size), scatter_tokens + 1);
     }
     return out;
 }
