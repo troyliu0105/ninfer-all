@@ -762,7 +762,8 @@ bool HybridDiskTier::stage_image(SnapshotRef snapshot, const PrefixCacheIndex& i
 
 const std::byte* HybridDiskTier::take_staged_image(SnapshotRef snapshot) {
     std::lock_guard lock(mutex_);
-    return staged_image_ == snapshot ? image_staging_.value().data() : nullptr;
+    return staged_image_ == snapshot ? static_cast<const std::byte*>(image_staging_.value().data())
+                                    : nullptr;
 }
 
 void HybridDiskTier::release_staged_image_except(SnapshotRef snapshot) {
@@ -777,7 +778,8 @@ void HybridDiskTier::release_image() {
 
 const std::byte* HybridDiskTier::staged_tail(SnapshotRef snapshot) const noexcept {
     std::lock_guard lock(mutex_);
-    return staged_tail_ == snapshot ? tail_staging_.value().data() : nullptr;
+    return staged_tail_ == snapshot ? static_cast<const std::byte*>(tail_staging_.value().data())
+                                   : nullptr;
 }
 
 void HybridDiskTier::release_staged_tail_except(SnapshotRef snapshot) {
@@ -945,7 +947,7 @@ void HybridDiskTier::run_read(const ReadJob& job) {
 
 void HybridDiskTier::run_image_read(const ImageReadJob& job) {
     bool ok = true;
-    std::byte* staging = image_staging_.value().data();
+    std::byte* staging = static_cast<std::byte*>(image_staging_.value().data());
     for (std::uint32_t segment = 0; segment != host_.image_slabs && ok; ++segment) {
         try {
             catalog_->read_image_segment(
@@ -965,7 +967,7 @@ void HybridDiskTier::run_tail_read(const TailReadJob& job) {
     bool ok = false;
     try {
         catalog_->read_tail(job.disk_ref,
-                            std::span<std::byte>(tail_staging_.value().data(),
+                            std::span<std::byte>(static_cast<std::byte*>(tail_staging_.value().data()),
                                                  host_.block_payload_bytes));
         ok = true;
     } catch (...) { ok = false; }
