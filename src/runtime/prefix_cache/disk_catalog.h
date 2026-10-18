@@ -10,13 +10,24 @@
 // in the other); the catalog is the only writer, so no automatic LRU ever removes a live record.
 //
 // Durability model: an append journal (`catalog.journal`) plus a periodic full checkpoint
-// (`catalog.ckpt`). Every journal record is checksummed; a torn tail is ignored on replay. No
-// fsync: a crash may lose the last unpublished records, never publish a partial closure.
+// (`catalog.ckpt`). Every journal record is checksummed; a torn tail is ignored on replay and cut
+// off, so the next append starts at the last complete record. The checkpoint and the journal keep
+// separate replay state: a checkpoint's records are never mistaken for journal records, and a
+// journal always begins with its own header. Each record carries a journal sequence and each
+// checkpoint the sequence it covers, so a crash between replacing the checkpoint and removing the
+// journal it covers replays that journal as already covered — never resurrecting a record the
+// checkpoint has since dropped. No fsync: a crash may lose the last unpublished records, never
+// publish a partial closure.
 //
 // Identity: record ids are monotonically allocated u32 values, persisted through `next_id` and
 // never reused, so a stale journal entry can never alias a live record. Payload store keys are
 // derived from the record id, not from token digests: exact token identity is decided here, in
-// memory, against the stored tokens (§6 "Format and identity").
+// memory, against the stored tokens (§6 "Format and identity"). A crash can lose `next_id` while
+// payload bytes survive, so open() recovers the allocator above every live payload key (a block, an
+// image segment or a snapshot tail) and reclaims the payloads no replayed record reaches: a record
+// id is never handed out while the payload store still answers to its key. A closure's optional
+// tail needs no persisted flag — its payload is its record — so a surviving tail payload restores
+// `has_tail` on replay.
 //
 // Threading: one I/O worker performs the writes and reads; the Engine worker owns metadata
 // decisions. An internal mutex keeps those two roles from interleaving half-updated state.
@@ -26,6 +37,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -166,27 +178,39 @@ private:
     struct BlockRecord {
         std::uint32_t id   = kNoRecord;
         BlockIdentityRec identity;
-        bool finished      = false;
-        bool reserved      = false;
+        // Journal sequence that published this record; a checkpoint re-emits it.
+        std::uint64_t sequence = 0;
+        bool finished          = false;
+        bool reserved          = false;
     };
 
     struct SnapshotRecord {
         std::uint32_t id   = kNoRecord;
         SnapIdentityRec identity;
-        bool committed     = false;
-        bool reserved      = false;
-        bool has_tail      = false;
+        std::uint64_t sequence = 0;
+        bool committed         = false;
+        bool reserved          = false;
+        bool has_tail          = false;
     };
 
     enum class RecordKind : std::uint8_t { Block = 1, SnapshotCommit = 2, Remove = 3 };
 
+    // What replay made of one stream: it parsed (`valid_bytes` receives the journal's durable
+    // prefix length), its header never landed (`kUnusable`), or it belongs to another version or
+    // execution fingerprint (`kForeign`).
+    enum class ReplayOutcome : std::uint8_t { kOk, kUnusable, kForeign };
+
     class Store;
 
     [[nodiscard]] std::uint32_t allocate_id();
-    void journal_bytes(RecordKind kind, std::uint32_t ref, const void* body,
-                       std::size_t body_bytes);
+    // Appends one record and returns the journal sequence it was written under.
+    [[nodiscard]] std::uint64_t journal_bytes(RecordKind kind, std::uint32_t ref, const void* body,
+                                              std::size_t body_bytes);
     void write_checkpoint_locked();
-    void replay_stream(std::FILE* file, bool checkpoint);
+    ReplayOutcome replay_stream(std::FILE* file, bool checkpoint, std::uint64_t* valid_bytes);
+    // Recovers the allocator from the payload stores and reclaims the payloads that no replayed
+    // record reaches, so a restart never reuses an id whose bytes survived the crash.
+    void recover_payloads();
     void reset_state();
 
     Options options_;
@@ -199,10 +223,17 @@ private:
     std::unordered_map<std::uint32_t, SnapshotRecord> snapshots_;
     std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> children_;
     std::uint32_t next_id_           = 1;
-    std::uint64_t journal_records_   = 0;
-    std::uint64_t journal_since_ckpt_ = 0;
-    bool opened_                     = false;
-    bool foreign_                    = false;
+    // Journal state: complete records in the journal, records since the last checkpoint, the byte
+    // length of the journal's durable prefix (header plus complete records) — the offset the next
+    // append rewrites from, which also drops any torn tail a crash left behind — and the highest
+    // sequence the in-memory state already reflects (a checkpoint's covered sequence, or the last
+    // journal record applied). A journal record at or below it is replayed as covered.
+    std::uint64_t journal_records_     = 0;
+    std::uint64_t journal_since_ckpt_  = 0;
+    std::uint64_t journal_valid_bytes_ = 0;
+    std::uint64_t journal_sequence_    = 0;
+    bool opened_                       = false;
+    bool foreign_                      = false;
     std::vector<ReplayedBlock> replayed_blocks_;
     std::vector<ReplayedSnapshot> replayed_snapshots_;
 };

@@ -323,6 +323,99 @@ void writer_ownership_reprotected_after_reopen(const std::filesystem::path& root
     }
 }
 
+// A batch reclamation — the disk catalog's orphan recovery — drops pages without one index
+// rewrite per page: evict_deferred() returns each slot to the pool at once and publishes with the
+// next flush, and the published index no longer lists the dropped page.
+void deferred_eviction(const std::filesystem::path& root) {
+    const DiskKVStore::Options options{
+        .path = (root / "deferred").string(), .slot_size = kSlot, .max_slots = 2};
+    const auto second = page(kSlot, 2);
+    {
+        DiskKVStore store(options);
+        check(store.upsert_page_reserved(id(1, 7), page(kSlot, 1)) &&
+                  store.upsert_page_reserved(id(2, 7), second),
+              "two reserved pages stored");
+        check(store.free_slot_count() == 0, "no free slot remains");
+        store.evict_deferred(id(1, 7));
+        check(!store.contains(id(1, 7)) && store.free_slot_count() == 1,
+              "a deferred eviction drops the page and returns its slot to the pool");
+        store.evict_deferred(id(1, 7));
+        check(!store.contains(id(1, 7)) && store.free_slot_count() == 1,
+              "a deferred eviction of an absent page changes nothing");
+        check(store.upsert_page_reserved(id(3, 7), page(kSlot, 3)),
+              "the reclaimed slot serves a reserved upsert");
+        store.flush_index();
+    }
+    {
+        DiskKVStore store(options);
+        check(store.live_slots() == 2 && reads_back(store, id(2, 7), second) &&
+                  !store.contains(id(1, 7)),
+              "the published index reflects the deferred eviction");
+    }
+}
+
+// Payloads written under deferred publication live in the data file but not in the published index;
+// a reopen loads that index unchanged, so the pages are invisible until they are adopted from their
+// slot headers. Adoption trusts only a slot whose payload passes its CRC, takes the adopted slots
+// out of the free pool, publishes, and leaves what a rebuild already scanned alone.
+void unlisted_pages_are_adopted(const std::filesystem::path& root) {
+    const DiskKVStore::Options options{.path                = (root / "adopt").string(),
+                                       .slot_size           = kSlot,
+                                       .max_slots           = 3,
+                                       .defer_index_updates = true};
+    const auto first  = page(kSlot, 1);
+    const auto second = page(kSlot, 2);
+    {
+        DiskKVStore store(options);
+        check(store.upsert_page_reserved(id(1, 9), first) &&
+                  store.upsert_page_reserved(id(2, 9), second),
+              "two pages stored under deferred publication");
+        // No flush and no eviction: the index on disk still predates both pages.
+    }
+    {
+        DiskKVStore store(options);
+        check(!store.index_rebuilt_from_scan() && store.live_slots() == 0,
+              "the published index predates the deferred pages");
+        check(store.free_slot_count() == 3 && !reads_back(store, id(1, 9), first),
+              "an unlisted page reads as absent");
+        check(store.adopt_unlisted_pages() == 2, "both written slots are adopted");
+        check(reads_back(store, id(1, 9), first) && reads_back(store, id(2, 9), second),
+              "adopted pages read back byte for byte");
+        check(store.free_slot_count() == 1 && store.adopt_unlisted_pages() == 0,
+              "adopted slots leave the free pool and a second adoption finds nothing");
+        store.evict(id(1, 9));
+        check(store.free_slot_count() == 2, "an adopted page evicts like any other");
+    }
+    {
+        DiskKVStore store(options);
+        check(store.live_slots() == 1 && reads_back(store, id(2, 9), second),
+              "the adoption published the surviving page");
+    }
+
+    // A slot whose payload fails its CRC holds nothing that can be trusted, so it is never adopted
+    // and stays free (a read would refuse it in any case).
+    const DiskKVStore::Options torn{.path                = (root / "adopt-torn").string(),
+                                    .slot_size           = kSlot,
+                                    .max_slots           = 1,
+                                    .defer_index_updates = true};
+    const auto stored = page(kSlot, 3);
+    {
+        DiskKVStore store(torn);
+        check(store.upsert_page_reserved(id(3, 9), stored), "a page stored for the torn case");
+    }
+    if (std::FILE* file = std::fopen(torn.path.c_str(), "r+b")) {
+        std::fseek(file, static_cast<long>(DiskKVStore::kSlotHeaderSize + 11), SEEK_SET);
+        std::fputc(0x5A ^ static_cast<int>(stored[11]), file);
+        std::fclose(file);
+    }
+    {
+        DiskKVStore store(torn);
+        check(store.adopt_unlisted_pages() == 0 && !store.contains(id(3, 9)),
+              "a torn slot is never adopted");
+        check(store.free_slot_count() == 1, "the torn slot stays free");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -336,13 +429,15 @@ int main() {
         claimed_reads(root);
         writer_owned_pages(root);
         writer_ownership_reprotected_after_reopen(root);
+        deferred_eviction(root);
+        unlisted_pages_are_adopted(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "disk KV store test: " << error.what() << '\n';
         return 1;
     }
     if (failures != 0) { return 1; }
-    std::cout << "disk KV store: LRU, persistence, corruption, sizing, concurrent, claimed reads "
-                 "and writer-owned pages ok\n";
+    std::cout << "disk KV store: LRU, persistence, corruption, sizing, concurrent, claimed reads, "
+                 "writer-owned and deferred eviction ok\n";
     return 0;
 }

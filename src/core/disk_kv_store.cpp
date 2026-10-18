@@ -600,7 +600,42 @@ bool DiskKVStore::touch(const DiskKVIdentity& id) {
     return true;
 }
 
-bool DiskKVStore::evict(const DiskKVIdentity& id) {
+bool DiskKVStore::evict(const DiskKVIdentity& id) { return evict_impl(id, true); }
+
+void DiskKVStore::evict_deferred(const DiskKVIdentity& id) { (void)evict_impl(id, false); }
+
+std::uint32_t DiskKVStore::adopt_unlisted_pages() {
+    std::lock_guard lock(mutex_);
+    // A rebuild from a slot scan already covered every slot of the data file.
+    if (rebuilt_from_scan_) { return 0; }
+    std::uint32_t adopted = 0;
+    std::vector<std::byte> payload(options_.slot_size);
+    for (std::uint32_t slot = 0; slot < max_slots_; ++slot) {
+        if (lru_stamps_[slot] != kNoStamp) { continue; } // the index already lists this slot
+        const Header& slot_header = header(slot);
+        if (slot_header.magic != Header::kMagic) { continue; }
+        // Trust a payload only when its checksum matches, exactly as a lost-index rebuild does: a
+        // torn slot, or one another geometry wrote, stays free.
+        if (!read_payload(slot, payload) || crc32(payload) != slot_header.crc) { continue; }
+        const DiskKVIdentity id{slot_header.lo, slot_header.hi, slot_header.tag,
+                                slot_header.frontier};
+        if (index_.contains(id)) { continue; } // one identity owns one slot
+        index_[id] = slot;
+        clock_     = std::max(clock_, slot_header.last_used);
+        lru_touch_locked(slot, slot_header.last_used);
+        ++adopted;
+    }
+    if (adopted == 0) { return 0; }
+    free_slots_.clear();
+    for (std::uint32_t slot = max_slots_; slot-- > 0;) {
+        if (lru_stamps_[slot] == kNoStamp) { free_slots_.push_back(slot); }
+    }
+    index_dirty_ = true;
+    persist_index_locked();
+    return adopted;
+}
+
+bool DiskKVStore::evict_impl(const DiskKVIdentity& id, bool persist) {
     std::lock_guard lock(mutex_);
     const auto found = index_.find(id);
     if (found == index_.end() || readers_[found->second] != 0) { return false; }
@@ -611,7 +646,7 @@ bool DiskKVStore::evict(const DiskKVIdentity& id) {
     clear_slot(slot);
     free_slots_.push_back(slot);
     index_dirty_ = true;
-    persist_index_locked();
+    if (persist) { persist_index_locked(); }
     return true;
 }
 
