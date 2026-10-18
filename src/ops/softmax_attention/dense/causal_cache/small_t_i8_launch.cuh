@@ -269,7 +269,22 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 return;
             }
         }
-        if constexpr (TokenTile >= 6) {
+        if constexpr (Geometry::QHeads == 8 && TokenTile >= 5) {
+            // H8's fifth and sixth query rows fill two 16-row tiles where the 16- and 24-head
+            // geometries fill three, and only an 8- or 16-warp CTA splits 256 output dimensions
+            // exactly over two tiles (the 24's three-tile tiers split them over three, at 24/12/6
+            // warps). So H8 takes two-tile tiers in the pattern of the 24-head geometry's TokenTile 5:
+            // one resident CTA up to the window where i8_partial_ctas_per_sm stops crediting it one,
+            // then the two-CTA eight-warp tier.
+            const int resident_window = TokenTile == 5 ? 4096 : 8198;
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= resident_window) {
+                launch.template operator()<16, 1, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else if constexpr (TokenTile >= 6) {
             // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
             // loop iterations; dynamic smem avoids penalizing the long-context path.
             if (implementation_window > 128 && implementation_window <= 160) {

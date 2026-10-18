@@ -89,6 +89,10 @@ add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
 # under a third of it.
 add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
+# The H8/KV2 geometry's own coverage: bounded, and every case is small, so the default timeout is
+# generous. Also folded into the unflagged public-contract run.
+add_test(NAME ninfer_softmax_attention_h8_kv2_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --h8-kv2-only)
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
 add_test(NAME ninfer_softmax_attention_prompt_split_test
@@ -114,6 +118,7 @@ set_tests_properties(
   ninfer_softmax_attention_rk4v4_e8_test
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_dflash2_test
+  ninfer_softmax_attention_h8_kv2_test
   ninfer_softmax_attention_int8_prompt_test
   ninfer_softmax_attention_prompt_split_test
   ninfer_softmax_attention_small_t_pipelined_test

@@ -211,6 +211,11 @@ constexpr Geometry kGeometries[] = {
     {"d256-h16-kv2", 16, 2},
 };
 
+// The 8-query-head, 2-KV-head geometry (four query heads per KV head), kept out of kGeometries so
+// the sweeps above keep their extent: H8's launchers had no instantiation at all and its coverage
+// is its own bounded sweep (run_h8_kv2_cases). Every storage is still exercised.
+constexpr Geometry kH8Geometry{"d256-h8-kv2", 8, 2};
+
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
 }
@@ -3520,8 +3525,9 @@ int run_wide_copy_cases(KvCacheStorage storage) {
         }
         // Single-row prefill with the small-prefill hint: widths 17-64 over a long context take
         // chunked small-T, a short context and widths outside 17-64 keep their routes, and the
-        // route threshold (64 or 80 visible keys per row) is crossed from both sides.
-        const std::int32_t keys_per_row = geometry.q_heads == 16 ? 80 : 64;
+        // route threshold (64 visible keys per row for H24, 80 for every other geometry) is
+        // crossed from both sides.
+        const std::int32_t keys_per_row = geometry.q_heads == 24 ? 64 : 80;
         const auto prefill = [](std::int32_t width, std::int32_t base, std::uint32_t seed) {
             return AttentionCase{.tokens        = width,
                                  .base          = base,
@@ -3850,6 +3856,102 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+// H8/KV2 (d256, 8 query heads over 2 KV heads). Every launcher of this geometry used to resolve
+// its template on "24 heads else 16": an H8 call ran an H16 grid, so the prompt and small-T
+// kernels read q, k and v past their extent and wrote out past its own, and the INT8-family
+// small-T launch refused the geometry outright. The cases below are the dimensions that finding
+// named: BF16 and every KV coding, narrow decode at short and long windows, multi-token small-T
+// around the fifth and sixth rows (H8's two 16-row tiles, where H16/H24 fill three), chunked
+// widths, prompt widths with a partial 64-row wave, both small-prefill threshold sides, the
+// cached-only entry and batched launches. The one-row tier switch is at 8198 keys and the
+// two-row tiers are the ones H8 had never instantiated, so each is crossed from one side.
+int run_h8_kv2_cases() {
+    const Geometry& h8 = kH8Geometry;
+    const auto sweep   = [&h8](auto storage) {
+        int failures  = 0;
+        unsigned seed = 9100u;
+        const auto next = [&seed] { return seed++; };
+
+        // Narrow decode: one row over a short window (small-T, one row tile) and over a window
+        // past 8198 keys, where the long-context split tier takes over.
+        failures += run_a1_case(h8, storage, {1, 127, 128, next()}, MappingPattern::Fragmented);
+        failures += run_a3_case(h8, storage, {1, 127, 128, next()}, MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage, {1, 8199, 8256, next()}, MappingPattern::Fragmented);
+        failures += run_a3_case(h8, storage, {1, 8199, 8256, next()}, MappingPattern::Fragmented);
+
+        // Fifth, sixth and fourth query rows: two row tiles for the first two, one for the third.
+        failures += run_a1_case(h8, storage, {5, 61, 512, next()}, MappingPattern::Identity);
+        failures += run_a3_case(h8, storage, {5, 61, 512, next()}, MappingPattern::Identity);
+        failures += run_a1_case(h8, storage, {6, 61, 67, next()}, MappingPattern::Fragmented);
+        failures += run_a3_case(h8, storage, {6, 61, 67, next()}, MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage, {4, 61, 300, next()}, MappingPattern::Offset);
+
+        // A chunked multi-row launch (six-row chunks over 4096 keys) and the prompt route at one
+        // chunk of visible keys, at 17 rows and at a partial 64-row wave.
+        failures += run_a1_case(h8, storage, {9, 2048, 4096, next()}, MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage, {7, 17, 512, next()}, MappingPattern::Identity);
+        failures += run_a3_case(h8, storage, {7, 17, 512, next()}, MappingPattern::Identity);
+        failures += run_a1_case(h8, storage, {17, 31, 2048, next()}, MappingPattern::Fragmented);
+        failures += run_a3_case(h8, storage, {17, 31, 2048, next()}, MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage, {66, 63, 129, next()}, MappingPattern::Fragmented);
+
+        // The wide-verification route over a long context, and the graph-replay path, whose
+        // capture asks the route and workspace queries for the whole replay interval.
+        failures += run_a1_case(h8, storage,
+                                {.tokens            = 17,
+                                 .base              = 2048,
+                                 .envelope_max      = 16384,
+                                 .seed              = next(),
+                                 .wide_verification = true},
+                                MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage,
+                                {.tokens       = 6,
+                                 .base         = 8192,
+                                 .envelope_max = 8198,
+                                 .seed         = next(),
+                                 .graph_replay = true},
+                                MappingPattern::Fragmented);
+
+        // The single-row prefill hint's keys-per-row threshold is 80 for every geometry but H24;
+        // both sides of it must select the route they did before this geometry existed.
+        for (std::int32_t visible : {17 * 80 - 1, 17 * 80}) {
+            failures += run_a1_case(h8, storage,
+                                    {.tokens        = 17,
+                                     .base          = visible - 17,
+                                     .envelope_max  = static_cast<std::uint32_t>(visible),
+                                     .seed          = next(),
+                                     .small_prefill = true},
+                                    MappingPattern::Fragmented);
+        }
+
+        // Batched launches: H8's four query heads per KV head fill a multi-batch small-T grid at
+        // width 6, and a chunked grid at width 16.
+        failures += run_batch_case(h8, storage,
+                                   {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented,
+                                    next()});
+        failures += run_batch_case(
+            h8, storage,
+            {16, {2048, 61}, {16, 7}, {1, 0}, MappingPattern::Offset, next()});
+        return failures;
+    };
+
+    int failures = 0;
+    for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4, kPlanRk4v4}) {
+        failures += sweep(plan);
+    }
+    // The quantized storages keep the arch-skip wrapper their own suites use: on a build whose
+    // FP8/NVFP4 execution is compiled out, an arch refusal is a skip, not an H8 failure.
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::RotatedInt4KeyInt4ValueE8,
+          KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+        failures += run_case_allowing_arch_skip(
+            std::string("causal_softmax_attention H8/KV2 ") + cache_name(storage),
+            [&] { return sweep(storage); });
+    }
+    return failures;
+}
+
 // FP8 decode attention (small_t, T<=6) dequantizes K to BF16 and V to FP16 before ordinary MMA
 // and is ported to sm_86/sm_89; the prompt (T>6) kernel still needs the FP8 mma.sync...f8f6f4
 // QK matmul (Blackwell-only) rewritten the same way. Kept in separate functions -- rather than
@@ -4092,6 +4194,10 @@ int run_nvfp4_fast_prompt_cases() {
         failures += run_a1_case(geometry, storage, fast({1100, 3000, 4100, 922u, false, true}),
                                 MappingPattern::Identity);
     }
+    // H8/KV2 at the same 4256 visible keys: the fast kernel's row blocks and split partials are
+    // indexed by the query head count, not assumed to be one of the two head counts above.
+    failures += run_a1_case(kH8Geometry, storage, fast({256, 4000, 4256, 926u}),
+                            MappingPattern::Fragmented);
     const Geometry& h24 = kGeometries[0];
     // |V| up to 900 gives rotated V group scales around 150-250, above the kernel's unscaled limit
     // of 128; |V| up to 2048 reaches the largest UE4M3 scales.
@@ -4157,12 +4263,15 @@ int run_k8v4_prompt_cases() {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
+    // H8/KV2 is a launcher geometry like the other two, so its route and split tiers must satisfy
+    // the same interval/witness contract -- including the wide/narrow row-tile switch at 16 rows.
+    const Geometry geometries[]{kGeometries[0], kGeometries[1], kH8Geometry};
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::RotatedLloyd4KeyInt4Value,
           KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
-        for (const Geometry& heads : kGeometries) {
+        for (const Geometry& heads : geometries) {
             for (const bool wide : {false, true}) {
                 const ops::CausalAttentionExecutionEnvelope envelope{1, 1025, false, wide};
                 const ops::AttentionHeadGeometry geometry{kHeadDim, heads.q_heads, heads.kv_heads};
@@ -4643,6 +4752,17 @@ int run_softmax_attention_dflash2_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+int run_softmax_attention_h8_kv2_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures = verify_workspace_capacity_contract();
+    failures += run_h8_kv2_cases();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention H8/KV2\n";
+    return failures == 0 ? 0 : 1;
+}
+
 int run_softmax_attention_causal_cache_tests() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -4674,6 +4794,7 @@ int run_softmax_attention_causal_cache_tests() {
                                             [&] { return run_fp8_decode_cases(); });
     failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache (prompt)",
                                             [&] { return run_fp8_prompt_cases(); });
+    failures += run_h8_kv2_cases();
     failures += run_rk8v4_cases();
     failures += run_rk4v4_cases();
     failures += run_rk4v4_e8_cases();

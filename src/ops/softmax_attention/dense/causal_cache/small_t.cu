@@ -342,27 +342,15 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
             : 0;
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
-    // geometry inside launch_tc_partial_i8.
-    if (i8_family && Geometry::QHeads == 8) {
-        // The INT8 tile's warp partitioning is built for 16/24 query heads; H8 has no
-        // registered instantiation. BF16 and the FP8-family storages below serve it.
-        throw std::invalid_argument(
-            "causal_attention_small_t_launch: INT8-family storage needs 16 or 24 query heads");
-    }
+    // geometry inside launch_tc_partial_i8, whose tiers cover H8 as well.
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if constexpr (Geometry::QHeads != 8) {                                                 \
-                if (kv_cache_is_int8_family(cache.storage)) {                                      \
+            if (kv_cache_is_int8_family(cache.storage)) {                                          \
                 launch_small_t_i8<Geometry, (TOKENS), CacheInput>(                                 \
                     MultiBatch, Masked, q, input, pos, scale, cache, invocation, logical_capacity, \
                     implementation_window, splits, wave_splits, partial_acc, partial_m, partial_l, \
                     stream);                                                                       \
-                } else {                                                                           \
-                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
-                }                                                                                  \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
