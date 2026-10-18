@@ -1,5 +1,7 @@
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 
+#include "models/qwen3_5/program/prefix/hybrid_disk.h"
+
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 
@@ -891,6 +893,20 @@ void HybridPrefixCache::release_snapshot(SnapshotRef snapshot) noexcept {
 void HybridPrefixCache::drop_snapshot_device_image(SnapshotRef snapshot) noexcept {
     // The snapshot survives on its Host slabs; its Device StateImage is released outright.
     release_snapshot(snapshot);
+}
+
+void HybridPrefixCache::release_disk_record(std::uint32_t disk_ref) noexcept {
+    // The index dropped its last reference to a block bundle's record (a block or a tail).
+    if (disk_tier_ != nullptr) { disk_tier_->release_disk_record(disk_ref); }
+}
+
+void HybridPrefixCache::release_snapshot_disk_records(SnapshotRef /*snapshot*/,
+                                                      std::uint32_t disk_ref,
+                                                      bool /*committed*/) noexcept {
+    // The snapshot and its closure left the index: its image segments and tail record go with
+    // it. `committed` is informational; the catalog's removal is the same for a closure that
+    // never committed, and the removal is journaled either way.
+    if (disk_tier_ != nullptr) { disk_tier_->release_snapshot_disk_records(disk_ref); }
 }
 
 } // namespace ninfer::models::qwen3_5::detail

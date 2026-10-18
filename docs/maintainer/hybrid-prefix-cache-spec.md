@@ -13,9 +13,9 @@ This document is the authority for the Hybrid mode. §0–§11 describe the desi
 marking the parts of the original design that were not built; §12–§15 cover optional features,
 tests, configuration and risks.
 
-The [disk-tier extension](hybrid-prefix-cache-disk-tier.md) is a separate, unimplemented design
-for cold offload and restart reconstruction. It does not change the current two-tier behavior or
-the option restrictions described here.
+The [disk-tier extension](hybrid-prefix-cache-disk-tier.md) adds a third Disk residency for cold
+retention and restart reconstruction. It is implemented for the Hybrid path; the two-tier behavior
+and option contracts described here are unchanged when `--disk-kv-path` is absent.
 
 Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
@@ -25,7 +25,10 @@ and every speculative backend (none, MTP, DFlash, DFlash2).
 In this line the mode runs on one device: pipeline stages (`--devices` with more than one entry)
 are rejected with it, and so are the checkpoint catalog's own policies (`--auto-long-anchors`,
 `--auto-prefix-grid`, `--context-cache-policy`, `--release-diverged-checkpoints`,
-`--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the disk tier). Host
+`--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the Legacy disk
+switches `--disk-kv-restore` and `--disk-kv-directstorage`). The Hybrid disk tier
+(`--disk-kv-path` with `--disk-kv-gib`) is the one disk form it accepts; see its own reference.
+Host
 restores and snapshot copies take the rank-stream form of the KV and StateImage copy routines, and a
 Vision prefill uses the concurrent overlay window when one is configured. The measurements below are the original
 author's on an RTX 5090.

@@ -4,8 +4,11 @@
 [Hybrid prefix cache](hybrid-prefix-cache-spec.md). Hybrid mode accepts `--disk-kv-path` with
 `--disk-kv-gib` (default 64 GiB) and opens its own catalog under the artifact-scoped directory;
 the Legacy-only `--disk-kv-restore` and `--disk-kv-directstorage` switches remain Legacy-only.
-Host-only unit tests cover the index residency rules and the catalog; the demotion and
-preparation lifecycle is exercised by the real-engine scenarios, and the performance contract
+Host-only unit tests cover the index residency rules, the disk-committed tail fill, the Host-copy
+reclamation a committed closure triggers, the source-ranking cost model and the catalog; the
+demotion and preparation lifecycle is exercised by the real-engine scenarios
+(`disk-demotion`, `disk-restore`, `disk-restart`, `disk-tail-restore`, `disk-small-capacity`,
+`disk-long-chain`, plus the `disk-persist-exclusive` option check), and the performance contract
 (§9) holds only within what those runs measured.
 
 The extension retains cold prefixes after the pinned Host cache comes under pressure, serves
@@ -14,7 +17,7 @@ records after restart. It keeps one logical tree and isolates storage and asynch
 model execution so that subsequent upstream rebases have a bounded integration surface.
 
 The Hybrid specification remains the authority for implemented behavior. This document owns the
-proposed disk-specific contracts; it does not change current command-line behavior. The
+disk-specific contracts, including the command-line behavior in §8. The
 [Engine architecture](engine-architecture.md) and
 [paged KV contracts](paged-kv-cache.md) continue to govern request publication and physical pages.
 
@@ -87,9 +90,8 @@ Existing code offers these reuse boundaries:
   keys, references and eviction. Extend this index rather than recreating those facts elsewhere.
 
 New implementation files should separate persistent metadata from model binding. For example,
-`runtime/prefix_cache/disk_catalog.*` could own metadata encoding/replay, while
-`models/qwen3_5/program/prefix/hybrid_disk.*` owns demotion and preparation jobs. These are
-proposed locations, not existing interfaces.
+`runtime/prefix_cache/disk_catalog.*` owns metadata encoding/replay, while
+`models/qwen3_5/program/prefix/hybrid_disk.*` owns demotion and preparation jobs.
 
 ## 3. Residency, identity and capacity
 
@@ -145,6 +147,19 @@ cache. A conservative staging layout holds one full StateImage and a bounded num
 batches. Its size depends on model geometry, not prefix length. The remaining Host pool must
 still satisfy its minimum geometry. Reject an insufficient configuration before serving.
 
+The implementation reserves that staging out of `--host-cache-mib` *before* it sizes the slab
+pool: [`plan_hybrid_disk_staging`](../../src/models/qwen3_5/program/prefix/hybrid_host_layout.cpp)
+takes one StateImage in its physical slab segments, one block payload for the snapshot-tail slot,
+and up to `kHybridDiskMaxStagingBlocks` (256) block payloads — where the block batch gets only
+what the budget leaves after the slab pool's own minimum geometry, so a Host budget that is legal
+without the disk tier stays legal with it. The tier pins the result once with `PinnedHostBuffer`
+(no `make_unique` side allocation), `staging_bytes()` reports the same rounded bytes, the
+`HostKvPin` startup phase's total is the advertised budget (slab pool plus staging), and a budget
+that cannot hold a single block payload beside the slab minimum is rejected at startup with the
+MiB it needs — the plan's own `min_budget_bytes` (image segments, tail payload, slab minimum and
+one block payload), never a re-derived approximation. Disk capacity is not part of the Host
+budget: the catalog's byte capacity stays real bytes.
+
 The current node bound derives from Device pages plus Host slabs in
 [`create_hybrid_prefix_cache`](../../src/models/qwen3_5/program/prefix/hybrid_program.cpp).
 Disk-only entries invalidate that bound. Derive representable metadata limits from the new
@@ -172,6 +187,28 @@ Use existing supersession and GDSF concepts to choose cold candidates, while sep
 value of keeping a Host copy from the value of keeping a Disk copy. Host retention avoids a slow
 restore; Disk retention avoids recomputation. The current Host score is not automatically the
 right score for both tiers.
+
+A committed closure is also the trigger for reclaiming what it duplicated: the tier releases the
+snapshot's Host image and tail slabs through `release_snapshot_host_copy` and the anchor chain's
+Host copies through `release_redundant_host_copies`, which keeps a chain node's copy while any
+live snapshot anchored at or below it still lacks a committed disk closure. A full record
+directory recycles instead of blocking: the tier runs the index's bounded disk victim selection
+(`evict_disk_entries`, lowest-value committed closures first, each including the exclusive anchor
+blocks it kept) plus `reclaim_abandoned` for reserved records no write will finish, and only then
+treats the cycle as backpressure. A closure whose anchor or awaited record the index removed in
+the meantime never commits, so a restart cannot resurrect a closure with a dangling anchor.
+
+A closure that cannot commit returns everything it reserved in the same completion pass. The
+completion step drops each awaited block record as its write lands, and a closure that will never
+commit — a failed block write, a catalog commit failure, a chain record the index removed, or a
+snapshot that left the index — closes its snapshot's disk fill through the index
+(`abort_open_snapshot_fill`), whose release callback hands the image record back to the journaled
+removal path. No snapshot is left Filling and no record stays reserved for a closure that cannot
+publish; a failed closure keeps its Host copy, so the snapshot stays a valid volatile resume point.
+A demotion candidate must also carry a complete Host copy to be written at all: the closure copies
+the snapshot's image grid plus, when a tail exists, its tail slab, and a candidate whose slabs are
+not exactly that set (an aborted Host fill, or a tail the Host tier never allocated) is skipped
+rather than published as a half-closure.
 
 ### Write and publication protocol
 
@@ -250,6 +287,15 @@ Cold preparation proceeds as follows:
    head. Disk read leases protect storage records and metadata, not the Device LRU path.
 2. Read and verify a bounded batch into pinned staging. Coalesce suitable file extents and keep
    read concurrency bounded. Give demanded reads priority over background demotion writes.
+
+   The batch is the staging pool, never the whole cold path: `stage_blocks` queues what the pool
+   can hold now and the next cadence point queues more, so a chain longer than the pool (which is
+   the normal case for a long conversation) advances a batch per cycle instead of requesting more
+   slots than exist and making no progress. Requests are deduplicated against both the tier's
+   queued/running/landed reads and the bytes the Program already holds for a landing batch. A
+   staging slot recycles only after the copy that consumed it lands — the node is device-Resident
+   again, or no batch reads it — and a duplicate release is ignored, so two nodes can never be
+   handed the same slot.
 3. When bytes are ready and spare cache capacity exists, allocate cache-owned Device
    destinations, submit H2D on the restore stream and mark those destinations Filling.
    No Device destination stays pinned while waiting for an unsubmitted disk read.
@@ -371,7 +417,7 @@ in-flight read/write claims protect the records they still need.
 | Queue full, slow writes or budget exhaustion | Stop submissions, skip retention or reclaim lower-value cache; keep serving active work |
 | Missing record, checksum failure or read error | Invalidate the bad copy, release completed job resources and reselect a valid source before activation |
 | Cancelled preparation | Detach request interest; retain accepted I/O buffers and copy destinations until safe completion |
-| Stale completion after deletion/reuse | Reject it by runtime handle and record generation; release only resources owned by that job |
+| Stale completion after deletion/reuse | Reject it by runtime handle and record generation; release only resources owned by that job. A closure whose block write failed or whose anchor record was evicted never commits; the index's removal callbacks reach the catalog, which journals the removal so a restart never resurrects it. A failed closure's own image record is reclaimed only after that write returned, so a queued write can never recreate a deleted payload. |
 | CUDA transfer failure | Preserve existing Engine-wide CUDA failure semantics; do not disguise it as a disk miss |
 | Invalid path, incompatible store or insufficient startup geometry | Fail startup with the incompatible prerequisite identified |
 
@@ -380,12 +426,11 @@ suppress invariant violations or convert arbitrary Program exceptions into cache
 
 ## 8. Configuration and rebase surface
 
-The proposed Hybrid configuration reuses the existing spellings `--disk-kv-path` and
-`--disk-kv-gib` for an opt-in path and positive bounded capacity. These options are currently
-Legacy-only; accepting them in Hybrid requires coordinated CLI and Engine changes. Hybrid opens
-and rebuilds its own catalog whenever this tier is enabled. The Legacy `--disk-kv-restore` and
-`--disk-kv-directstorage` switches remain Legacy-only; this proposal does not add a DirectStorage
-or direct-to-GPU backend. Do not silently accept switches the Hybrid implementation ignores.
+The Hybrid configuration reuses the existing spellings `--disk-kv-path` and `--disk-kv-gib` for
+an opt-in path and positive bounded capacity (default 64 GiB). Hybrid opens and rebuilds its own
+catalog whenever this tier is enabled. The Legacy `--disk-kv-restore` and
+`--disk-kv-directstorage` switches remain Legacy-only; Hybrid adds no DirectStorage or
+direct-to-GPU backend and rejects switches it ignores.
 
 Validate the same combinations at the CLI and Engine boundary:
 
@@ -400,7 +445,7 @@ Watermarks, worker limits and batch sizes should be resolved from resource geome
 qualification, with effective values in the startup ledger. Add user controls only for a
 measured deployment requirement, not an unqualified knob for every internal limit.
 
-Keep the implementation patch concentrated in:
+The implementation patch is concentrated in:
 
 - `runtime/prefix_cache`: per-tier copy predicates, retention/accounting and persistent catalog.
 - `models/qwen3_5/program/prefix`: disk jobs, staging and prepared-source publication.
@@ -409,9 +454,8 @@ Keep the implementation patch concentrated in:
   admission, without a second scheduler.
 - Option normalization/validation, explicit CMake source lists and the affected tests/docs.
 
-No loader weight changes, model mathematics, new family hierarchy or GPU kernel changes belong
-to this feature. Keep the implemented Hybrid reference authoritative and replace its two-tier
-statements when the extension ships; do not leave contradictory status or option contracts.
+No loader weight changes, model mathematics or new family hierarchy belong to this feature. The
+two-tier Hybrid reference remains authoritative where `--disk-kv-path` is absent.
 
 ## 9. Performance contract
 
@@ -454,9 +498,9 @@ retention, not by extending GPU wait chains into SSD latency.
 
 ### Initial acceptance targets
 
-The following are proposed qualification targets, not measured results or previously accepted
-hardware-independent SLAs. Fix the workload and thresholds before collecting implementation
-results; disclose and justify any later change.
+These qualification targets are not measured results or previously accepted hardware-independent
+SLAs. Fix the workload and thresholds before collecting implementation results; disclose and
+justify any later change.
 
 | Workload | Baseline | Initial target |
 |---|---|---|
@@ -491,6 +535,17 @@ Extend existing behavioral coverage for:
 - Tier-local reclaimable bytes, bounded metadata, and no automatic eviction of referenced records.
 - Provisional blocks, complete snapshot commit, removal, interrupted checkpoints/journals,
   missing payloads and checksum failures.
+- The demotion commit state machine: a closure commits only after every awaited block record and
+  its image landed; a failed block write, a failed catalog commit or a record the index removed
+  closes the fill and reclaims the image record, and a failed closure keeps its Host copy.
+- Host-copy reclamation at commit: `release_redundant_host_copies` frees a chain node's slab only
+  once no live snapshot below it lacks a committed closure, and never a pinned node's.
+- The disk-committed tail as a device-fill source after device pressure shed its Device copy, and
+  the refusal of a tail with no Host slab and no committed closure.
+- Demotion candidate selection (unpinned, Host-resident, no committed closure, lowest GDSF first)
+  and the source-ranking cost model, including a disabled or slow disk rate.
+- The staging budget split: `plan_hybrid_disk_staging` caps the block batch, never shrinks the
+  slab pool below its own minimum, and reports the exact rejection figure.
 - Queue saturation, stale completions, cancellation and source lifetime through accepted I/O.
 - CLI and Engine option validation, including persistence-file mutual exclusion.
 

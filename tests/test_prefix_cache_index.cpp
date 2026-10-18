@@ -1361,6 +1361,232 @@ void test_disk_victim_reclamation() {
     index.check_invariants();
 }
 
+// The machine model ranks sources and never decides feasibility (cost.h). A Host-only restore has
+// a finite default cost, the conservative default disk rate keeps disk candidates usable, and a
+// zero disk rate excludes disk candidates only.
+void test_cost_model_source_ranking() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    // Two feasible resume points of one prompt: a shallower Host-only source and a deeper source
+    // whose bytes must come from the disk tier.
+    MatchCandidate host_only;
+    host_only.frontier         = 2048;
+    host_only.restore_bytes    = 4U << 20U;
+    host_only.disk_read_bytes  = 0;
+    MatchCandidate disk_only;
+    disk_only.frontier        = 3008;
+    disk_only.restore_bytes   = 6U << 20U; // H2D still moves the staged bytes
+    disk_only.disk_read_bytes = 6U << 20U;
+    MatchResult match;
+    match.candidates = {host_only, disk_only};
+    constexpr std::uint32_t kPrompt = 4096;
+
+    // Default model: the deeper disk source wins by the prefill it saves; the default disk rate
+    // must be finite, or no disk candidate could ever be selected.
+    require(index.choose(match, kPrompt).candidate == std::optional<std::size_t>{1},
+            "the deeper disk source must win by default");
+
+    // A zero disk rate excludes disk candidates and leaves the Host-only source chooseable.
+    PrefixIndexConfig disabled = disk_config();
+    disabled.cost.disk_read_bytes_per_second = 0.0;
+    PrefixCacheIndex no_disk(disabled, backend);
+    require(no_disk.choose(match, kPrompt).candidate == std::optional<std::size_t>{0},
+            "a disabled disk rate must exclude only the disk source");
+
+    // Slower disk throughput ranks the sources the other way: the disk source's restore stops
+    // paying for the extra 960 tokens it saves.
+    PrefixIndexConfig slow_disk = disabled;
+    slow_disk.cost.disk_read_bytes_per_second = 1.0e6;
+    PrefixCacheIndex slow(slow_disk, backend);
+    require(slow.choose(match, kPrompt).candidate == std::optional<std::size_t>{0},
+            "a slow disk must lose to the Host-only source");
+
+    // Slower H2D costs the Host-only source its advantage; the disk source takes over.
+    PrefixIndexConfig slow_h2d = disk_config();
+    slow_h2d.cost.h2d_bytes_per_second = 1.0e6;
+    PrefixCacheIndex h2d(slow_h2d, backend);
+    require(h2d.choose(match, kPrompt).candidate == std::optional<std::size_t>{1},
+            "a slow H2D must rank the Host-only source below the disk source");
+
+    // A Host-only source that saves a large prefill beats prefilling the prompt from the root.
+    MatchResult host_match;
+    host_match.candidates = {host_only};
+    require(index.choose(host_match, 16384).candidate == std::optional<std::size_t>{0},
+            "a Host-only restore must be selected over prefilling its tokens");
+    // One whose restore costs more than the prefill it saves is not selected: the root prefills.
+    MatchCandidate costly = host_only;
+    costly.frontier        = 64;
+    costly.restore_bytes   = 8ULL << 30U;
+    MatchResult costly_match;
+    costly_match.candidates = {costly};
+    require(!index.choose(costly_match, 16384).candidate.has_value(),
+            "a restore worth less than its prefill must not be selected");
+}
+
+// Device pressure sheds the snapshot tail's Device copy (its own LRU entry). A snapshot whose
+// Host copy has yielded and whose disk closure is committed keeps the tail restorable, so the
+// index must be able to refill it from the record.
+void drop_tail_device_copy(PrefixCacheIndex& index, SnapshotRef snapshot) {
+    require(index.snapshot(snapshot).tail_device_copy == CopyState::Resident,
+            "the tail must still hold its Device copy before it is evicted");
+    while (index.snapshot(snapshot).tail_device_copy != CopyState::Absent) {
+        require(index.evict_backed_device_blocks(1) != 0,
+                "the tail's Device copy must be evictable");
+    }
+    index.check_invariants();
+}
+
+// A disk-committed tail is a legitimate device-fill source once the Host copy is gone, exactly as
+// a disk-only block is (begin_device_fill); a tail with no source is still refused.
+void test_disk_tail_device_fill() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config(16);
+    config.device_snapshot_slots = 2;
+    PrefixCacheIndex index(config, backend);
+    const std::vector<TokenId> tokens = make_tokens(2 * kBlockTokens, 42);
+    const auto path                   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    // A tail-carrying snapshot inside the second block, whose closure then fully commits and
+    // whose Host copy yields.
+    const SnapshotRef tap =
+        publish_at(index, backend, path, tokens, kBlockTokens + 8, SnapshotKind::Tap);
+    require(index.snapshot(tap).tail_len == 8, "the snapshot must carry a tail");
+    backup_snapshot(index, tap);
+    require(index.snapshot(tap).host == CopyState::Resident, "the snapshot needs a Host copy");
+    index.pin_snapshot(tap);
+    index.begin_snapshot_disk_fill(tap, 900);
+    index.complete_snapshot_disk_fill(tap);
+    index.unpin_snapshot(tap);
+    for (const NodeRef node : path) {
+        index.begin_node_disk_fill(node, 800U + node.index);
+        index.mark_disk_backed(node, 800U + node.index);
+    }
+    index.release_snapshot_host_copy(tap);
+    require(index.snapshot(tap).host == CopyState::Absent, "the Host copy must be gone");
+    require(index.snapshot(tap).disk_committed, "the closure must be committed");
+    drop_tail_device_copy(index, tap);
+    require(index.snapshot(tap).tail_device_copy == CopyState::Absent,
+            "device pressure must shed the tail's Device copy");
+
+    // The disk-committed tail fills the Device copy the same way a disk-only block does.
+    index.pin_snapshot(tap);
+    const std::uint32_t tail_id = backend.allocate();
+    index.begin_tail_device_fill(tap, tail_id);
+    require(index.snapshot(tap).tail_device_copy == CopyState::Filling,
+            "a disk-committed tail must be fillable");
+    index.complete_tail_device_fill(tap);
+    require(index.snapshot(tap).tail_device_copy == CopyState::Resident, "the tail must land");
+    index.unpin_snapshot(tap);
+    index.check_invariants();
+
+    // Aborting the fill returns the Device id and leaves the committed closure valid.
+    const SnapshotRef second =
+        publish_at(index, backend, path, tokens, kBlockTokens + 16, SnapshotKind::Tap);
+    backup_snapshot(index, second);
+    index.pin_snapshot(second);
+    index.begin_snapshot_disk_fill(second, 901);
+    index.complete_snapshot_disk_fill(second);
+    index.unpin_snapshot(second);
+    index.release_snapshot_host_copy(second);
+    drop_tail_device_copy(index, second);
+    index.pin_snapshot(second);
+    const std::uint32_t aborted_id = backend.allocate();
+    index.begin_tail_device_fill(second, aborted_id);
+    index.abort_tail_device_fill(second);
+    require(index.snapshot(second).tail_device_copy == CopyState::Absent,
+            "an aborted tail fill must return to absent");
+    require(std::find(backend.released.begin(), backend.released.end(), aborted_id) !=
+                backend.released.end(),
+            "the aborted tail fill must return its Device id");
+    index.unpin_snapshot(second);
+    index.check_invariants();
+
+    // A snapshot without a tail has no tail to fill: the guard still refuses.
+    const SnapshotRef tailless =
+        publish_at(index, backend, path, tokens, 2 * kBlockTokens, SnapshotKind::Tap);
+    index.pin_snapshot(tailless);
+    require_throws([&] { index.begin_tail_device_fill(tailless, backend.allocate()); },
+                   "a snapshot without a tail must be refused");
+    index.unpin_snapshot(tailless);
+    index.check_invariants();
+}
+
+// A committed closure makes the Host copies of its anchor chain redundant; a live snapshot below
+// a chain node that still lacks a committed closure keeps them (its resume needs the volatile
+// copy). The release also runs the index's disk callbacks, so the catalog hears about it.
+void test_disk_closure_reclaims_host_copies() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config(24);
+    config.device_snapshot_slots = 2;
+    PrefixCacheIndex index(config, backend);
+    const std::vector<TokenId> tokens = make_tokens(2 * kBlockTokens, 56);
+    const auto path                   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    // A snapshot anchored at the deep node, whose closure commits, and a second one anchored at
+    // the shallow node that stays uncommitted.
+    const SnapshotRef deep = publish_at(index, backend, path, tokens, 2 * kBlockTokens,
+                                        SnapshotKind::Tap);
+    const SnapshotRef shallow =
+        publish_at(index, backend, path, tokens, kBlockTokens + 8, SnapshotKind::Tap);
+    index.pin_snapshot(deep);
+    index.begin_snapshot_disk_fill(deep, 960);
+    index.complete_snapshot_disk_fill(deep);
+    index.unpin_snapshot(deep);
+    for (const NodeRef node : path) {
+        index.begin_node_disk_fill(node, 961U + node.index);
+        index.mark_disk_backed(node, 961U + node.index);
+    }
+    index.release_path(path); // the inserting reference's pins go away
+
+    // The deep node's Host copy is redundant (its only snapshot below is disk-committed); the
+    // shallow node keeps its copy while `shallow` has no committed closure.
+    require(index.release_redundant_host_copies(
+                std::span<const NodeRef>{&path[1], 1}) == 1,
+            "a committed closure must free its anchor's Host copy");
+    require(index.node(path[1]).host == CopyState::Absent, "the deep Host copy must be released");
+    require(index.release_redundant_host_copies(
+                std::span<const NodeRef>{&path[0], 1}) == 0,
+            "an uncommitted snapshot below a chain node must keep its Host copy");
+    require(index.node(path[0]).host == CopyState::Resident, "the shallow copy must survive");
+    index.check_invariants();
+
+    // Once `shallow` commits too, nothing below the chain node needs the Host bytes any more.
+    index.pin_snapshot(shallow);
+    index.begin_snapshot_disk_fill(shallow, 970);
+    index.complete_snapshot_disk_fill(shallow);
+    index.unpin_snapshot(shallow);
+    require(index.release_redundant_host_copies(
+                std::span<const NodeRef>{&path[0], 1}) == 1,
+            "the last uncommitted dependent must release the Host copy");
+    require(index.node(path[0]).host == CopyState::Absent, "the Host copy must be released");
+    for (const NodeRef node : path) {
+        require(index.node(node).disk == CopyState::Resident, "the disk record must survive");
+    }
+    index.check_invariants();
+
+    // A pinned node yields nothing: an in-flight consumer still reads its bytes.
+    index.pin_node(path[0]);
+    backup_node(index, path[0]);
+    require(index.release_redundant_host_copies(
+                std::span<const NodeRef>{&path[0], 1}) == 0,
+            "a pinned node must keep its Host copy");
+    index.unpin_node(path[0]);
+
+    // Disk victim reclamation drives the backend's release callbacks, so the catalog learns which
+    // records left the running cache (a restart must not resurrect them).
+    backend.disk_released.clear();
+    backend.snapshot_disk_released.clear();
+    const std::uint32_t evicted = index.evict_disk_entries(2);
+    require(evicted != 0, "a committed closure must be reclaimable");
+    require(!backend.snapshot_disk_released.empty(),
+            "removing a committed closure must release its snapshot record");
+    require(std::any_of(backend.snapshot_disk_released.begin(),
+                        backend.snapshot_disk_released.end(),
+                        [](const auto& entry) { return entry.second; }),
+            "the released closure must be reported as committed");
+    index.check_invariants();
+}
+
 // Demotion candidates: unpinned Host-resident snapshots without a committed disk closure,
 // lowest GDSF priority first; pinned, superseded, disk-committed and Host-absent snapshots
 // never demote.
@@ -1433,6 +1659,9 @@ int main() {
         test_disk_snapshot_closure_survives_host_eviction();
         test_restore_disk_reconstruction();
         test_disk_victim_reclamation();
+        test_cost_model_source_ranking();
+        test_disk_tail_device_fill();
+        test_disk_closure_reclaims_host_copies();
         test_demotion_candidates();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

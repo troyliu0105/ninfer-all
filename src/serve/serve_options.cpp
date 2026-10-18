@@ -1614,7 +1614,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     "--disk-kv-path cannot be combined with --prefix-cache-file");
             }
             std::error_code error;
-            if (!std::filesystem::is_directory(cache.disk_kv_path, error)) {
+            if (!cache.disk_kv_path.empty() &&
+                !std::filesystem::is_directory(cache.disk_kv_path, error)) {
                 throw std::invalid_argument("--disk-kv-path " + cache.disk_kv_path.string() +
                                             ": the directory does not exist");
             }

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,33 @@ std::uint32_t hybrid_host_slabs(const HybridHostLayout& layout, std::uint64_t bu
         throw std::overflow_error("hybrid Host slab count is not representable");
     }
     return static_cast<std::uint32_t>(slabs);
+}
+
+HybridDiskStagingPlan plan_hybrid_disk_staging(const HybridHostLayout& layout,
+                                               std::uint64_t budget_bytes) {
+    HybridDiskStagingPlan plan;
+    if (budget_bytes == 0 || layout.slab_bytes == 0 || layout.block_payload_bytes == 0 ||
+        layout.image_slabs == 0) {
+        return plan;
+    }
+    const std::uint64_t image_segments =
+        static_cast<std::uint64_t>(layout.image_slabs) * layout.slab_bytes;
+    const std::uint64_t tail        = layout.block_payload_bytes;
+    const std::uint64_t slab_minimum =
+        (static_cast<std::uint64_t>(layout.image_slabs) + 2U) * layout.slab_bytes;
+    // One block payload of staging is the floor: with fewer the tier could never stage a read.
+    plan.min_budget_bytes = image_segments + tail + slab_minimum + layout.block_payload_bytes;
+    if (budget_bytes <= image_segments + tail) { return plan; }
+    const std::uint64_t after_image = budget_bytes - image_segments - tail;
+    if (after_image <= slab_minimum) { return plan; }
+    const std::uint64_t block_space = after_image - slab_minimum;
+    plan.staging_blocks             = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        kHybridDiskMaxStagingBlocks, block_space / layout.block_payload_bytes));
+    plan.staging_bytes =
+        image_segments + tail +
+        static_cast<std::uint64_t>(plan.staging_blocks) * layout.block_payload_bytes;
+    plan.slab_budget_bytes = budget_bytes - plan.staging_bytes;
+    return plan;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

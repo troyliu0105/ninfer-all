@@ -5,15 +5,28 @@
 #include <filesystem>
 
 #include <iostream>
-#include <unistd.h>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 using namespace ninfer::serve;
+
+int current_process_id() noexcept {
+#ifdef _WIN32
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -709,7 +722,7 @@ int main() {
     // path+gib accepted together, alone neither, and never beside the persistence file or
     // the Legacy-only switches.
     const std::string disk_dir = (std::filesystem::temp_directory_path() /
-                                  ("ninfer-disk-tier-" + std::to_string(::getpid())))
+                                  ("ninfer-disk-tier-" + std::to_string(current_process_id())))
                                      .string();
     std::filesystem::create_directories(disk_dir);
     const auto hybrid_disk = parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching",
@@ -742,6 +755,7 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an inconsistent hybrid disk tier configuration was accepted");
     }
+    std::filesystem::remove(disk_dir);
     const ServeOptions no_slots = parse({"ninfer-serve", "model.ninfer"});
     failures += check(no_slots.slot_save_path.empty() && !no_slots.auto_save_evicted,
                       "slot persistence was on by default");

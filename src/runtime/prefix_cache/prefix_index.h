@@ -301,8 +301,9 @@ public:
     [[nodiscard]] bool begin_snapshot_host_fill(SnapshotRef snapshot);
     void complete_snapshot_host_fill(SnapshotRef snapshot);
     void abort_snapshot_host_fill(SnapshotRef snapshot);
-    // A pinned host-backed snapshot whose tail lost its Device copy receives `device_id` being
-    // filled from its tail slab.
+    // A pinned snapshot whose tail lost its Device copy receives `device_id` being filled from
+    // its tail slab (Host tier) or from its committed disk record's staged bytes, exactly as
+    // begin_device_fill accepts either source for a block.
     void begin_tail_device_fill(SnapshotRef snapshot, std::uint32_t device_id);
     void complete_tail_device_fill(SnapshotRef snapshot);
     // Returns the device id to the backend.
@@ -338,6 +339,13 @@ public:
     // committed closure needs. Returns the number of records released. Skipped when the disk
     // tier is disabled.
     std::uint32_t evict_disk_entries(std::uint32_t records);
+
+    // Returns the Host slabs of `nodes` a committed disk closure has made redundant. A node keeps
+    // its Host copy while a live snapshot anchored below it still lacks a committed disk closure:
+    // only such a resume needs the volatile copy. Pinned nodes are skipped. The disk tier calls
+    // this when a demotion commits (docs/maintainer/hybrid-prefix-cache-disk-tier.md §4 step 4):
+    // it is the Host space the demotion set out to free. Returns the slabs released.
+    std::uint32_t release_redundant_host_copies(std::span<const NodeRef> nodes);
 
     // Host-pressure demotion candidates: unpinned Host-resident snapshots without a committed
     // disk closure, lowest GDSF priority first, at most `count`. The tier's cold-data choice
@@ -430,6 +438,9 @@ private:
         CopyState disk           = CopyState::Absent;
         std::uint32_t pins       = 0;
         std::uint32_t live_below = 0;
+        // Live snapshots anchored at or below this node whose disk closure is not committed: the
+        // ones whose resume still needs this node's volatile copies (§4 dependency accounting).
+        std::uint32_t undisked_below = 0;
         // Retained (not superseded) snapshots anchored at or below this node.
         std::uint32_t retained_below = 0;
         std::uint32_t dead_prev      = kNoId;
@@ -540,6 +551,8 @@ private:
     void drop_node_host_copy(std::uint32_t node);
     void drop_node_disk_copy(std::uint32_t node);
     void adjust_live(std::uint32_t anchor, int delta);
+    // The same walk for undisked_below: a snapshot appearing, committing its closure or leaving.
+    void adjust_undisked(std::uint32_t anchor, int delta);
     // Every Device residency and slot-state change goes through these so the gauges stats()
     // reports stay O(1): the Engine publishes statistics after every decode round.
     void set_device(Node& node, CopyState state) noexcept;

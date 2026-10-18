@@ -87,8 +87,31 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         backend_kv_pages ? &backend_kv_pages->physical_pool().geometry() : nullptr;
     const HybridHostLayout host = plan_hybrid_host_layout(text_pool.geometry(), backend_geometry,
                                                           state_images->host_layout().image_bytes);
-    const std::uint32_t slabs =
-        hybrid_host_slabs(host, context_cache.host_cache_budget_bytes.value_or(0U));
+    // The disk tier's pinned staging is accounted inside the advertised Host budget (docs/...
+    // hybrid-prefix-cache-disk-tier.md §3 budgets): reserve it before sizing the slab pool, so
+    // the tier never adds an unreported second RAM cache and the batch is what the budget
+    // affords. A budget too small to hold one block payload beside the slab pool's minimum
+    // geometry is rejected here, before serving.
+    std::uint64_t slab_budget_bytes = context_cache.host_cache_budget_bytes.value_or(0U);
+    std::uint64_t staging_bytes     = 0;
+    hybrid_disk_staging_blocks_     = 0;
+    if (!context_cache.disk_kv_path.empty() && slab_budget_bytes != 0) {
+        const HybridDiskStagingPlan staging = plan_hybrid_disk_staging(host, slab_budget_bytes);
+        if (staging.staging_blocks == 0) {
+            // The plan owns the geometry arithmetic: report its figure rather than re-deriving it.
+            const std::uint64_t needed = staging.min_budget_bytes;
+            throw std::invalid_argument(
+                "--host-cache-mib is too small for the hybrid disk tier: its pinned staging "
+                "(one state snapshot in physical segments plus a block batch) and the slab "
+                "pool's own minimum geometry need at least " +
+                std::to_string((needed + (1ULL << 20U) - 1U) >> 20U) +
+                " MiB; raise it or drop --disk-kv-path");
+        }
+        hybrid_disk_staging_blocks_ = staging.staging_blocks;
+        staging_bytes               = staging.staging_bytes;
+        slab_budget_bytes           = staging.slab_budget_bytes;
+    }
+    const std::uint32_t slabs = hybrid_host_slabs(host, slab_budget_bytes);
     const std::uint32_t device_slots        = context_cache.device_state_slots.value_or(0U);
     const HybridPrefixCacheOptions& options = context_cache.hybrid;
     if (device_slots == 0 || !options.max_new_taps || !options.tap_ladder_tokens ||
@@ -117,9 +140,14 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         .min_gap_tokens = *options.tap_min_gap_tokens,
     };
     const std::uint64_t host_bytes = static_cast<std::uint64_t>(slabs) * host.slab_bytes;
+    // The phase's total is the advertised Host budget: the slab pool plus the disk tier's pinned
+    // staging, which this scope does not pin (the tier pins it at attach) but which the
+    // deployment's budget must cover.
+    const std::uint64_t advertised_bytes = host_bytes + staging_bytes;
     std::optional<StartupPhaseScope> phase;
-    if (host_bytes != 0) {
-        phase.emplace(observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes, host_bytes);
+    if (advertised_bytes != 0) {
+        phase.emplace(observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
+                      advertised_bytes);
     }
     // Restores land in forward order: each layer's KV planes or recurrent state.
     const TextConfig& text = parameters.model.config().text;
@@ -133,7 +161,7 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
     hybrid_ = std::make_unique<HybridPrefixCache>(
         config, taps, *text_kv_pages, backend_kv_pages.get(), *state_store, *state_images, host,
         std::move(layers), phase ? &*phase : nullptr);
-    if (phase) { phase->complete(host_bytes, host_bytes); }
+    if (phase) { phase->complete(host_bytes, advertised_bytes); }
 }
 
 void ProgramImpl::set_hybrid_cost(const pc::CacheCostModel& cost) {
@@ -146,18 +174,26 @@ bool ProgramImpl::attach_hybrid_disk_tier(const std::filesystem::path& directory
                                            std::uint64_t capacity_bytes,
                                            std::string fingerprint) {
     if (hybrid_ == nullptr) { return false; }
+    if (hybrid_disk_staging_blocks_ == 0) {
+        // create_hybrid_prefix_cache reserved the staging out of the Host budget when the path
+        // was configured; a tier with no block slot could never stage a block read.
+        throw std::logic_error("the hybrid disk tier has no staging reservation");
+    }
     // False means the catalog was foreign or damaged and was wiped: the tier runs empty.
     // A construction failure (unusable directory) throws instead.
     HybridDiskTier::Options options;
     options.directory     = directory;
     // Zero keeps the documented 64 GiB default (ContextCacheOptions).
     capacity_bytes = capacity_bytes != 0 ? capacity_bytes : (std::uint64_t{64} << 30U);
-    // The bounded catalog splits its capacity between block records and image parts.
+    // The bounded catalog splits its capacity between block records and image parts; the disk
+    // capacity is real bytes and is not part of the Host budget.
     options.block_capacity_bytes = capacity_bytes / 2U;
     options.image_capacity_bytes = capacity_bytes - options.block_capacity_bytes;
-    options.staging_blocks       = 256U;
+    options.staging_blocks       = hybrid_disk_staging_blocks_;
     hybrid_disk_ = std::make_unique<HybridDiskTier>(std::move(options),
                                                     hybrid_->host_layout(), std::move(fingerprint));
+    // The index's disk release callbacks must reach the catalog before anything can drop a record.
+    hybrid_->attach_disk_tier(hybrid_disk_.get());
     return hybrid_disk_->restore_into(hybrid_->index());
 }
 
@@ -180,6 +216,64 @@ HybridCachePersistence public_result(const HybridPersistResult& result) {
 
 } // namespace
 
+// ---- disk staging helpers ------------------------------------------------------------------------
+
+bool ProgramImpl::hybrid_staged_held(pc::NodeRef node) const noexcept {
+    const auto matches = [&](const HybridDiskTier::StagedBlock& staged) {
+        return staged.node == node;
+    };
+    return std::any_of(staged_blocks_.begin(), staged_blocks_.end(), matches) ||
+           std::any_of(staged_inflight_.begin(), staged_inflight_.end(), matches);
+}
+
+std::vector<pc::NodeRef>
+ProgramImpl::hybrid_disk_stageable(std::span<const pc::NodeRef> nodes) const {
+    std::vector<pc::NodeRef> cold;
+    if (hybrid_disk_ == nullptr) { return cold; }
+    const pc::PrefixCacheIndex& index = hybrid_->index();
+    for (const pc::NodeRef node : nodes) {
+        if (!index.valid(node)) { continue; }
+        const pc::NodeView view = index.node(node);
+        if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Absent ||
+            view.disk != pc::CopyState::Resident) {
+            continue; // not disk-only: nothing to stage (a Host fill in flight is not either)
+        }
+        if (hybrid_staged_held(node)) { continue; } // already landed or a batch reads it
+        cold.push_back(node);
+    }
+    return cold;
+}
+
+void ProgramImpl::hybrid_disk_release_stale_staging() {
+    if (hybrid_disk_ == nullptr || staged_blocks_.empty()) { return; }
+    const pc::PrefixCacheIndex& index = hybrid_->index();
+    std::vector<HybridDiskTier::StagedBlock> expired;
+    for (std::size_t i = 0; i < staged_blocks_.size();) {
+        HybridDiskTier::StagedBlock& staged = staged_blocks_[i];
+        ++staged.age;
+        bool drop = false;
+        if (!index.valid(staged.node)) {
+            drop = true; // the node left the index: the bytes serve nobody
+        } else {
+            const pc::CopyState device = index.node(staged.node).device;
+            if (device == pc::CopyState::Resident) {
+                // A Device copy exists and no batch reads these bytes: the staging is redundant
+                // (a consuming batch holds the node Filling until its H2D event lands).
+                drop = true;
+            } else if (device != pc::CopyState::Filling) {
+                drop = staged.age >= 2; // nobody consumed it in two cycles: return the slot
+            }
+        }
+        if (!drop) {
+            ++i;
+            continue;
+        }
+        expired.push_back(staged);
+        staged_blocks_.erase(staged_blocks_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    if (!expired.empty()) { hybrid_disk_->release_staged(expired); }
+}
+
 HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
                                                              std::string fingerprint,
                                                              const StartupObserver& observer) {
@@ -197,7 +291,16 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
     struct DiskCheckpoint {
         ProgramImpl* self;
         ~DiskCheckpoint() {
-            if (self->hybrid_disk_) { self->hybrid_disk_->shutdown(); }
+            if (self->hybrid_disk_ == nullptr) { return; }
+            // Landed demotions still belong to the Engine worker: publish them here, before the
+            // tier stops, so a committed closure is checkpointed rather than a node left Filling.
+            // (The index is rebuilt below by clear(), so only the catalog outcome matters.)
+            if (self->hybrid_ != nullptr) {
+                try {
+                    self->hybrid_disk_->publish_completions(self->hybrid_->index());
+                } catch (...) {}
+            }
+            self->hybrid_disk_->shutdown();
         }
     } disk_checkpoint{this};
     if (!hybrid_ || hybrid_file_.empty()) { return; }
@@ -397,7 +500,10 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             if (view.disk == pc::CopyState::Resident) {
                 // The admission's restore path consumes staged block bytes, but the prefetch
                 // cadence that normally stages them does not run while the FIFO head waits:
-                // the quote stages the snapshot's disk-only anchor blocks itself.
+                // the quote stages the snapshot's disk-only anchor blocks itself. The request is
+                // bounded by the staging pool (stage_blocks streams what fits, deduped against
+                // what a batch already holds), so a chain longer than the pool advances a batch
+                // per cycle instead of never being admitted.
                 std::vector<pc::NodeRef> cold;
                 for (pc::NodeRef walk = view.anchor; walk.valid();
                      walk             = index.node(walk).parent) {
@@ -408,7 +514,9 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
                         cold.push_back(walk);
                     }
                 }
-                if (!cold.empty()) { (void)hybrid_disk_->stage_blocks(cold, index); }
+                if (const auto stageable = hybrid_disk_stageable(cold); !stageable.empty()) {
+                    (void)hybrid_disk_->stage_blocks(stageable, index);
+                }
             }
         }
     } else if (fits(nullptr, {})) {
@@ -455,29 +563,9 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
     if (has_context_transaction() || hybrid_->restore_open()) { return std::nullopt; }
     hybrid_->poll();
     if (hybrid_disk_) { hybrid_disk_->publish_completions(hybrid_->index()); }
-    if (hybrid_disk_) {
-        // The staging retry deadline: entries no admission consumed for two cycles go back.
-        std::vector<HybridDiskTier::StagedBlock> expired;
-        for (HybridDiskTier::StagedBlock& staged : staged_blocks_) {
-            ++staged.age;
-            if (staged.age < 2) { continue; }
-            const pc::PrefixCacheIndex& cache_index = hybrid_->index();
-            if (cache_index.valid(staged.node) &&
-                cache_index.node(staged.node).device == pc::CopyState::Resident) {
-                continue; // consumed by a landing batch that has not settled yet
-            }
-            expired.push_back(staged);
-        }
-        if (!expired.empty()) {
-            hybrid_disk_->release_staged(expired);
-            std::erase_if(staged_blocks_, [&](const HybridDiskTier::StagedBlock& staged) {
-                return staged.age >= 2 && std::find_if(expired.begin(), expired.end(),
-                                                       [&](const HybridDiskTier::StagedBlock& e) {
-                                                           return e.bytes == staged.bytes;
-                                                       }) != expired.end();
-            });
-        }
-    }
+    // The staging retry deadline: entries no admission consumed in two cycles go back, and an
+    // entry whose node already has a Device copy is dropped (no batch can still read it).
+    hybrid_disk_release_stale_staging();
     if (hybrid_disk_ && !staged_inflight_.empty()) {
         // Node state marks landing for both prefetch and admission batches: Filling means the
         // H2D is still reading the staged bytes.
@@ -515,22 +603,16 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
                                             chosen->path_blocks);
 
     // Disk-only blocks: stage their records this cycle, restore their staging bytes the next.
-    if (hybrid_disk_ && chosen->disk_only_blocks != 0) {
-        std::vector<pc::NodeRef> cold;
-        for (const pc::NodeRef node : path) {
-            const pc::NodeView view = index.node(node);
-            if (view.device == pc::CopyState::Absent && view.host == pc::CopyState::Absent &&
-                view.disk == pc::CopyState::Resident) {
-                cold.push_back(node);
-            }
+    // The request is bounded by the staging pool: a cold chain longer than the pool stages and
+    // consumes one batch per cycle (docs §5.3), instead of requesting more than the pool holds
+    // and making no progress at all.
+    if (hybrid_disk_) {
+        if (const auto stageable = hybrid_disk_stageable(path); !stageable.empty()) {
+            (void)hybrid_disk_->stage_blocks(stageable, index);
         }
-        if (!cold.empty()) {
-            (void)hybrid_disk_->stage_blocks(cold, index);
-            // Staged bytes that landed last cycle become this cycle's restores.
-            const std::vector<HybridDiskTier::StagedBlock> staged =
-                hybrid_disk_->take_staged_blocks();
-            staged_blocks_.insert(staged_blocks_.end(), staged.begin(), staged.end());
-        }
+        // Staged bytes that landed last cycle become this cycle's restores.
+        const std::vector<HybridDiskTier::StagedBlock> staged = hybrid_disk_->take_staged_blocks();
+        staged_blocks_.insert(staged_blocks_.end(), staged.begin(), staged.end());
     }
 
     // Pinned while room is made, so no block of this path is evicted to hold another of them.
@@ -546,8 +628,24 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
             const std::uint32_t text = text_pool.available_pages();
             return backend_pool != nullptr ? std::min(text, backend_pool->available_pages()) : text;
         };
+        // Copy only what has a source now: a host-backed block, or a disk-only block whose staged
+        // bytes already landed. Reserving pages for blocks still being staged would fail the
+        // whole batch on a pool that cannot hold the chain.
+        const auto ready = [&] {
+            std::uint32_t count = 0;
+            for (const pc::NodeRef node : path) {
+                const pc::NodeView view = index.node(node);
+                if (view.device != pc::CopyState::Absent) { continue; }
+                if (view.host == pc::CopyState::Resident) {
+                    ++count;
+                } else if (view.host == pc::CopyState::Absent && hybrid_staged_held(node)) {
+                    ++count; // disk-only with landed staging bytes
+                }
+            }
+            return count;
+        };
         std::uint32_t wanted =
-            std::min(cold_blocks, kPrefetchBatchBlocks);
+            std::min({cold_blocks, kPrefetchBatchBlocks, ready()});
         while (available() < wanted && index.evict_backed_device_blocks(1) != 0) {}
         wanted = std::min(wanted, available());
         std::optional<DeviceKVPageReservation> text_pages;
@@ -570,18 +668,20 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
                 }
                 if (view.host == pc::CopyState::Resident) {
                     hybrid_->restore_block(node, pages);
-                } else if (const auto staged = std::find_if(staged_blocks_.begin(),
-                                                            staged_blocks_.end(),
-                                                            [&](const HybridDiskTier::StagedBlock&
-                                                                    entry) {
-                                                                return entry.node == node;
-                                                            });
-                           staged != staged_blocks_.end()) {
+                } else if (view.host == pc::CopyState::Absent) {
+                    const auto staged = std::find_if(
+                        staged_blocks_.begin(), staged_blocks_.end(),
+                        [&](const HybridDiskTier::StagedBlock& entry) {
+                            return entry.node == node;
+                        });
+                    if (staged == staged_blocks_.end()) {
+                        continue; // staging not landed for this node yet
+                    }
                     hybrid_->restore_block_from_staging(node, staged->bytes, pages);
                     staged_inflight_.push_back(*staged);
                     staged_blocks_.erase(staged);
                 } else {
-                    continue; // staging not landed for this node yet
+                    continue; // a Host write is still filling this node's slab
                 }
                 ++started;
             }
@@ -842,6 +942,9 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     if (reuse != 0) {
         if (!index.valid(quote.snapshot)) { return false; }
         snapshot = index.snapshot(quote.snapshot);
+        if (snapshot.host == pc::CopyState::Filling) {
+            return false; // its Host image/tail is still being written: replan the admission
+        }
         const pc::MatchResult match =
             index.match(prompt.token_ids, transaction.hashes, transaction.extras, n);
         if (snapshot.frontier != reuse || match.path.size() < full ||
@@ -863,6 +966,9 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     for (const pc::NodeRef node : transaction.path) {
         const pc::NodeView view = index.node(node);
         if (view.device == pc::CopyState::Absent) {
+            if (view.host == pc::CopyState::Filling) {
+                return false; // a Host write is still filling: replan instead of staging a race
+            }
             if (view.host == pc::CopyState::Resident) {
                 host_only.push_back(node);
             } else if (view.disk == pc::CopyState::Resident) {
@@ -1410,6 +1516,9 @@ void ProgramImpl::hybrid_disk_poll() {
         staged_blocks_.push_back(staged);
         staged_blocks_.back().age = 0;
     }
+    // Entries no admission consumed in two cycles go back, and an entry whose node already has
+    // a Device copy is dropped: its bytes have served, so the slot must recycle.
+    hybrid_disk_release_stale_staging();
     // Staging releases on landing marks, not a coarse pending check. A restored image goes to
     // the admission's own state slot — the snapshot's index device_slot stays empty — so the
     // cache's restore batches are the image's landing signal. The tail's device copy and the

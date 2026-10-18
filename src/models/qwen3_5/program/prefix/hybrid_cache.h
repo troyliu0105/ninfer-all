@@ -24,6 +24,8 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+class HybridDiskTier;
+
 // Physical binding of the hybrid prefix index (docs/maintainer/hybrid-prefix-cache-spec.md) to
 // the Program's KV page stores, StateImage store and pinned Host slab pool. The index decides;
 // this class holds the references behind its opaque ids and moves the bytes its decisions imply.
@@ -253,6 +255,15 @@ public:
     void release_device_block(std::uint32_t device_id) noexcept override;
     void release_snapshot(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
+    // Disk records the index dropped: forwarded to the attached tier so the catalog journals the
+    // removal and a restart never resurrects a record the running cache released. Engine worker
+    // only, and only for records whose write already returned (the index releases nothing else).
+    void release_disk_record(std::uint32_t disk_ref) noexcept override;
+    void release_snapshot_disk_records(runtime::prefix_cache::SnapshotRef snapshot,
+                                       std::uint32_t disk_ref, bool committed) noexcept override;
+
+    // The disk tier's catalog release sink; null until a tier attaches (hybrid_program.cpp).
+    void attach_disk_tier(HybridDiskTier* tier) noexcept { disk_tier_ = tier; }
 
 private:
     struct PendingWrite {
@@ -351,6 +362,8 @@ private:
     std::vector<cudaEvent_t> spare_events_;
     PageCopies write_scratch_;
     HybridCacheCounters counters_;
+    // The attached disk tier (null when none): the sink for the index's disk release callbacks.
+    HybridDiskTier* disk_tier_ = nullptr;
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
 };
 

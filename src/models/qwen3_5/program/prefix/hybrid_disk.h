@@ -15,10 +15,17 @@
 //
 // Demotion never blocks admission, restores or `drain()`: it runs from the same `poll()`
 // cadence the Host write-through uses, and neither `drain()` nor `settle_prefetch()` ever
-// waits on this tier. Staging (block payloads plus one whole StateImage) is pinned once and
-// accounted against the advertised Host budget; a staging slot recycles only after its H2D
-// event (observed as the node turning device-Resident on the poll cadence).
+// waits on this tier. Staging (block payloads plus one whole StateImage) is pinned once with
+// `PinnedHostBuffer` and accounted against the advertised Host budget by
+// `plan_hybrid_disk_staging`; a staging slot recycles only after its H2D event (observed as the
+// node turning device-Resident on the poll cadence).
+//
+// The tier also owns the catalog's reclamation: the index's `release_disk_record` /
+// `release_snapshot_disk_records` callbacks arrive here and drop the record (journaling the
+// removal, so a restart never resurrects it), and a full catalog is reclaimed with the index's
+// own bounded disk victim selection instead of failing every later demotion.
 
+#include "core/arena.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/prefix_cache/disk_catalog.h"
 
@@ -53,8 +60,10 @@ public:
         double host_low_watermark  = 0.50;
         // Demotion closures considered per poll cycle.
         std::uint32_t demotion_batch_records = 16;
-        // Staging block payloads.
-        std::uint32_t staging_blocks = 256;
+        // Staging block payloads, from `plan_hybrid_disk_staging`: the affordable part of the
+        // advertised Host budget after the slab pool's own minimum geometry and the image/tail
+        // staging. A configuration with no block slot must not open a tier.
+        std::uint32_t staging_blocks = 0;
         // Bound on queued-but-unstarted demotion bytes.
         std::uint64_t max_inqueue_bytes = std::uint64_t{64} << 20U;
     };
@@ -63,10 +72,17 @@ public:
         std::uint64_t demoted_blocks    = 0;
         std::uint64_t demoted_images    = 0;
         std::uint64_t committed_closures = 0;
+        // Closures whose writes failed (or whose snapshot left the index): never committed.
+        std::uint64_t failed_closures   = 0;
         std::uint64_t disk_read_bytes   = 0;
         std::uint64_t disk_write_bytes  = 0;
         std::uint64_t restored_blocks   = 0;
         std::uint64_t queue_rejects     = 0;
+        // Catalog records the index released and bounded victim eviction reclaimed.
+        std::uint64_t released_records  = 0;
+        std::uint64_t evicted_records   = 0;
+        // Release/removal retries still owed to the catalog after an I/O failure.
+        std::uint32_t pending_removals  = 0;
         std::uint32_t catalog_blocks    = 0;
         std::uint32_t catalog_committed = 0;
     };
@@ -99,8 +115,10 @@ public:
     // Whether any demotion write or staging read is outstanding.
     [[nodiscard]] bool busy() const noexcept;
 
-    // Stops the worker after every accepted job settles and checkpoints the catalog.
-    void shutdown();
+    // Stops the worker after every accepted job settles, drops the records of closures that
+    // never committed, and checkpoints the catalog. Never throws: it runs from destructors and
+    // from the noexcept shutdown path, and reports a checkpoint failure on stderr.
+    void shutdown() noexcept;
 
     // Wipes the catalog to empty and restarts the worker (Engine recovery).
     void reset();
@@ -143,6 +161,16 @@ public:
 
     // The pinned staging footprint (for the Program's startup ledger).
     [[nodiscard]] std::uint64_t staging_bytes() const noexcept;
+
+    // ---- record reclamation (Engine worker) --------------------------------------------------------
+    // The index dropped its last reference to `record`: the catalog drops the record and its
+    // payloads so a restart never resurrects it. Engine-worker only; the record's own write has
+    // completed by construction (the index only releases records that finished or aborted a fill
+    // whose I/O returned). A catalog failure is owed back and retried at the next cadence point.
+    void release_disk_record(std::uint32_t record) noexcept;
+    // A snapshot the index removed: the closure's image segments and tail leave with it. The
+    // anchor-path block records are released through release_disk_record by the index itself.
+    void release_snapshot_disk_records(std::uint32_t record) noexcept;
 
 private:
     // A block record write: the worker copies `source` (the node's pinned Host slab payload)
@@ -205,8 +233,16 @@ private:
         // Every chain record (queued, in-flight from a sibling closure, or committed earlier):
         // the parent link for new writes and the committed identity's anchor come from here.
         std::vector<std::uint32_t> chain_records;
+        // The whole anchor chain: after the commit these nodes' Host copies are duplicates of
+        // the closure's records (release_redundant_host_copies).
+        std::vector<pc::NodeRef> chain_nodes;
         std::uint32_t image_record = pc::PrefixDiskCatalog::kNoRecord;
         bool image_landed          = false;
+        // The image write returned (landed or failed). Only then may its record be reclaimed.
+        bool image_returned        = false;
+        // A block write of this closure failed or was lost: no commit can follow, and the image
+        // record must wait for its own write to return before it is reclaimed.
+        bool failed                = false;
     };
 
     void worker_loop();
@@ -216,15 +252,36 @@ private:
     void run_image_read(const ImageReadJob& job);
     void run_tail_read(const TailReadJob& job);
 
+    // Drops `record` from the catalog, queueing it for retry when the removal fails.
+    void release_record(std::uint32_t record) noexcept;
+    // Recycles a full catalog: bounded disk victim eviction plus the collection of reserved
+    // records no write will finish. True when anything was reclaimed.
+    bool reclaim_records(pc::PrefixCacheIndex& index);
+    // Retries the removals a catalog failure left owed. Engine worker, no index access.
+    void retry_removals();
+    // Ends a closure: unpins its snapshot and releases the chain Host copies the committed
+    // records made redundant.
+    void finish_closure(pc::PrefixCacheIndex& index, PendingClosure& closure, bool committed);
+    // Returns a closure's still-open snapshot disk fill, which reclaims the image record it
+    // reserved through the backend's release callback. A closure whose snapshot already left the
+    // index owns no fill; its record goes back to the catalog directly.
+    void abort_open_snapshot_fill(pc::PrefixCacheIndex& index, const PendingClosure& closure);
+    // Frees one staging slot, ignoring a pointer that belongs to no block slot and one already
+    // returned (a duplicate release must not hand the same slot out twice).
+    void free_staging_slot(const std::byte* bytes) noexcept;
+    [[nodiscard]] std::byte* block_staging(std::uint32_t slot) const noexcept;
+
     Options options_;
     HybridHostLayout host_;
     std::unique_ptr<pc::PrefixDiskCatalog> catalog_;
 
-    // Staging (pinned once).
-    std::unique_ptr<std::byte[]> block_staging_;
-    std::unique_ptr<std::byte[]> image_staging_;
-    std::unique_ptr<std::byte[]> tail_staging_;
+    // Staging (pinned once, accounted inside the advertised Host budget).
+    std::optional<PinnedHostBuffer> block_staging_;
+    std::optional<PinnedHostBuffer> image_staging_;
+    std::optional<PinnedHostBuffer> tail_staging_;
     std::vector<std::uint32_t> free_staging_;
+    // Whether each block staging slot is on free_staging_; a duplicate release is ignored.
+    std::vector<bool> staging_slot_free_;
 
     // Engine-worker submission queues (consumed by the worker under mutex_).
     std::deque<BlockJob> write_blocks_;
@@ -245,6 +302,11 @@ private:
     std::vector<StagedBlock> staged_blocks_;
     pc::SnapshotRef staged_image_;
     pc::SnapshotRef staged_tail_;
+    // Records the catalog refused to drop (I/O failure): retried at the next cadence point.
+    std::vector<std::uint32_t> pending_removals_;
+    // Records the index released while closures still named them: a closure that names one of
+    // these can no longer commit (its anchor would dangle).
+    std::vector<std::uint32_t> removed_records_;
 
     mutable std::mutex mutex_;
     std::condition_variable wake_;
