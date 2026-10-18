@@ -289,6 +289,21 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
         }
     }
 
+    if (is_2b(problem)) {
+        // The 2B control registers only the geometry-generic warp-per-row SIMT schedules; its MMA
+        // tile is not built. Every entry in the 27B/35B tables launches a differently-shaped
+        // kernel, so admitting one here would let execute_candidate reach a wrong-shape launcher.
+        // The warp grid is the CUDA y limit: a C4 CTA covers 4 columns, a C8 CTA 8.
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+            return problem.cols <= 4 * 65'535;
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+            return problem.cols <= 8 * 65'535;
+        default:
+            return false;
+        }
+    }
+
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;

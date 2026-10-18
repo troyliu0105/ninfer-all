@@ -33,6 +33,11 @@ struct Geometry {
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
+// The 2B control pair is 16 heads over 2048 inputs. Both storage forms are registered: two split
+// 16x2048 parents, or one combined [A;B] parent of 32 rows, which is what a contiguous pair of
+// GGUF projections prepares. Only the SIMT routes are built for it.
+constexpr Geometry kQwen2b{"qwen3_6_2b", 2048, 16, false};
+constexpr Geometry kQwen2bParent{"qwen3_6_2b_parent", 2048, 16, true};
 
 #if defined(NINFER_SFU_SOFTPLUS) && NINFER_SFU_SOFTPLUS
 // The SFU softplus carries lg2.approx's error, about 2e-6 of the result.
@@ -657,6 +662,54 @@ int verify_plan_across_sm_counts() {
                   where + " got a control grid that is not resident");
         }
     }
+    // The 2B control registers only the geometry-generic warp-per-row SIMT schedules. Every MMA
+    // entry of the 27B/35B tables launches a differently-shaped kernel, so naming one for a 2B
+    // problem must be refused rather than dispatched to that launcher; the same holds for the
+    // 27B-only small-T schedules. The default plan stays on SIMT for every admitted width, and the
+    // warp grid limit (the CUDA y dimension) bounds each SIMT candidate exactly.
+    constexpr std::int32_t k2bHeads = 16;
+    constexpr std::int32_t k2bRows  = 2048;
+    const auto candidate_rejected   = [](Id schedule, std::int32_t cols) {
+        try {
+            (void)ninfer::ops::detail::bf16_gdn_gating_resolve_candidate(
+                schedule, {k2bHeads, k2bRows, cols}, 82);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    // 1024 is a width where the 35B split-8 grid is comfortably resident, so the old 35B fallback
+    // admitted a 2B MMA route there; all of these must now be refused.
+    for (const std::int32_t cols : {1, 8, 127, 128, 1024}) {
+        for (const Id schedule :
+             {Id::MmaCooperativeSplit32, Id::MmaCooperativeSplit16, Id::MmaCooperativeSplit8,
+              Id::MmaCooperativeSplit4, Id::MmaCooperativeSplit2, Id::MmaUnsplit}) {
+            check(candidate_rejected(schedule, cols),
+                  "2B(" + std::to_string(cols) + "): admitted " +
+                      ninfer::ops::detail::bf16_gdn_gating_schedule_name(schedule));
+        }
+        for (const Id schedule : {Id::GemvPairedRows, Id::SmallTSplit10}) {
+            check(candidate_rejected(schedule, cols),
+                  "2B(" + std::to_string(cols) + "): admitted a 27B-only schedule");
+        }
+    }
+    for (const std::int32_t cols : {1, 4, 4 * 65'535, 4 * 65'535 + 1, 8 * 65'535}) {
+        const Id expected = cols <= 4 * 65'535 ? Id::SimtWarpRowC4 : Id::SimtWarpRowC8;
+        const Bf16GdnGatingPlan plan = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
+            {k2bHeads, k2bRows, cols}, 82);
+        check(plan.schedule == expected,
+              "2B(" + std::to_string(cols) + "): default plan left the covering SIMT route");
+        check(plan.workspace_bytes == 0, "2B: SIMT route reported a workspace");
+    }
+    check(candidate_rejected(Id::SimtWarpRowC4, 4 * 65'535 + 1), "2B: C4 admitted past its grid");
+    check(candidate_rejected(Id::SimtWarpRowC8, 8 * 65'535 + 1), "2B: C8 admitted past its grid");
+    // Both 2B routes are unsplit and write g/beta directly, so the public workspace queries must
+    // stay at zero over every interval they cover (there is nothing to reserve).
+    check(ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(k2bHeads, k2bRows, 1, 4097) == 0,
+          "2B: the control projection query reserved workspace");
+    check(ninfer::ops::gdn_norm_gating_proj_workspace_capacity_bytes(k2bHeads, k2bRows, 1, 257) == 0,
+          "2B: the norm/control query reserved workspace");
+
     if (failures != 0) { std::cerr << failures << " gating plan failures\n"; }
     return failures;
 }
@@ -772,6 +825,18 @@ int main() {
         failures += run_projection_case(kQwen35, tokens,
                                         0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }
+    // The 2B geometry on both storage forms: separate 16x2048 A/B parents, and the combined 32x2048
+    // parent a contiguous pair of GGUF projections prepares. Every admitted width resolves to the
+    // warp-per-row SIMT route, covering predicated column tiles at 5/9/33/257 as well as exact
+    // 4-column tiles.
+    for (const std::int32_t tokens : {1, 2, 4, 5, 8, 9, 33, 257}) {
+        failures += run_projection_case(kQwen2b, tokens,
+                                        0x2800u + static_cast<std::uint32_t>(tokens), execution);
+    }
+    for (const std::int32_t tokens : {1, 5, 9, 257}) {
+        failures += run_projection_case(kQwen2bParent, tokens,
+                                        0x2900u + static_cast<std::uint32_t>(tokens), execution);
+    }
 
     // Direct complete norm/control oracles across variable widths and the existing 35B profile.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u, norm_execution);
@@ -790,6 +855,17 @@ int main() {
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u, norm_execution);
     failures += run_norm_projection_case(kQwen35, 17, 0x4011u, norm_execution);
     failures += run_norm_projection_case(kQwen35, 64, 0x4040u, norm_execution);
+    // The 2B control through the composed norm route on both storage forms. The combined parent
+    // goes through the single-parent norm/gating form, whose row slices must accept 32 rows.
+    for (const std::int32_t tokens : {1, 5, 9, 33, 257}) {
+        failures += run_norm_projection_case(kQwen2b, tokens, 0xB000u + static_cast<std::uint32_t>(tokens),
+                                             norm_execution);
+    }
+    for (const std::int32_t tokens : {1, 5, 16, 33, 257}) {
+        failures += run_norm_projection_case(kQwen2bParent, tokens,
+                                             0xB800u + static_cast<std::uint32_t>(tokens),
+                                             norm_execution);
+    }
 
     // Requalify the retained BF16-staging profile at every prefill reduction boundary.
     for (int tokens : {1024, 1025, 2048, 2049, 4097})

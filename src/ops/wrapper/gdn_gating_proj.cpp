@@ -69,6 +69,12 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
         require_bf16_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};
     }
+    // The 2B control pair is registered as one [A;B] parent of 16+16 rows, exactly as the 35B
+    // parent is 32+32. Its halves run the geometry-generic 2B SIMT schedules.
+    if (parent.n == 32 && parent.k == 2048) {
+        require_bf16_weight(parent, 32, 2048, "ab_weight");
+        return {.input_rows = 2048, .heads = 16};
+    }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
 }
 

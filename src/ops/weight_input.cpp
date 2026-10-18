@@ -278,8 +278,8 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48 || shape[0] == 16,
-            "GDN control: this geometry requires a combined parent");
+    // Only a parent that joins the two halves reaches the combined form. Every admitted geometry
+    // (48/5120, 32/2048, 16/2048) has a split consumer, so separate parents stay a pair.
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
