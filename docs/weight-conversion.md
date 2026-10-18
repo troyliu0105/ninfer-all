@@ -242,6 +242,31 @@ python3 -m tools.convert \
 `--model` needs only the base checkpoint's configuration and tokenizer files. The products that
 serve these formats are described in [GGUF block formats](gguf.md).
 
+### The Qwen3.5-2B GGUF
+
+`qwen3_5_2b_gguf` imports the unsloth Qwen3.5-2B UD quantized GGUF release
+(`Qwen3.5-2B-UD-IQ2_XXS.gguf` and siblings) through the same block-preserving path as the 27B
+recipe above: every block matrix keeps its exporter blocks byte for byte. The 2B geometry
+(24 blocks, 8 attention heads with 2 KV heads, GDN 16 key + 16 value heads with one value head
+per key head, tied output head) needs no value-head regrouping and no `input_columns`
+permutation — the tiling is the identity. The release stores no MTP tensors and no separate
+output head: the artifact shares the token embedding with the output head, and the `mtp`
+component is refused for this source.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.5-2B \
+  --recipe qwen3_5_2b_gguf \
+  --source gguf=/path/to/Qwen3.5-2B-UD-IQ2_XXS.gguf \
+  --components text \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --name qwen3.5-2b \
+  --out models/qwen3_5_2b.ninfer
+```
+
+`--model` needs the base Qwen3.5-2B checkpoint's `config.json`, `tokenizer.json`,
+`tokenizer_config.json` and `generation_config.json`.
+
 ### Qwen3.8-Flash-Next GGUF releases
 
 `qwen3_8_flash_next_gguf` ([`qwen4_exp_gguf.py`](../tools/convert/qwen4_exp_gguf.py)) imports the

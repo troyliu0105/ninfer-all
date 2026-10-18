@@ -369,6 +369,13 @@ public:
         out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
         out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
         out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
+        out.hybrid_disk_resident_blocks     = hybrid.disk_resident_blocks;
+        out.hybrid_disk_committed_snapshots = hybrid.disk_committed_snapshots;
+        out.hybrid_disk_demoted_blocks      = hybrid.disk_demoted_blocks;
+        out.hybrid_disk_demoted_images      = hybrid.disk_demoted_images;
+        out.hybrid_disk_restored_blocks     = hybrid.disk_restored_blocks;
+        out.hybrid_disk_read_bytes          = hybrid.disk_read_bytes;
+        out.hybrid_disk_write_bytes         = hybrid.disk_write_bytes;
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {

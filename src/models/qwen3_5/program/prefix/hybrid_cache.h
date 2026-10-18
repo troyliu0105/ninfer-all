@@ -118,6 +118,13 @@ public:
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
+    // The pinned Host bytes of one slab (a block bundle, or one slab of a snapshot's slab run).
+    // The disk tier reads these bytes on its I/O worker while the submitting pin keeps the
+    // slab from being reclaimed.
+    [[nodiscard]] const std::byte* slab_bytes_of(std::uint32_t slab_id) const noexcept {
+        return slab(slab_id);
+    }
+
     // Replaces the admission/eviction machine model (the Engine's calibrated context costs).
     void set_cost(const runtime::prefix_cache::CacheCostModel& cost);
 
@@ -174,8 +181,19 @@ public:
     // Filling until the batch lands.
     void open_restore(cudaStream_t producer);
     void restore_block(runtime::prefix_cache::NodeRef node, HybridBlockPages destination);
+    // Restores one disk-only node's block from the disk tier's pinned staging bytes (the node
+    // has no Host copy). Same contract as restore_block otherwise.
+    void restore_block_from_staging(runtime::prefix_cache::NodeRef node,
+                                    const std::byte* staged, HybridBlockPages destination);
     void restore_tail(runtime::prefix_cache::SnapshotRef snapshot, HybridBlockPages destination);
+    // Restores a disk-committed tail bundle from the disk tier's pinned staging bytes.
+    void restore_tail_from_staging(runtime::prefix_cache::SnapshotRef snapshot,
+                                   const std::byte* staged, HybridBlockPages destination);
     void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::int32_t device_slot);
+    // Restores a disk-committed image from the disk tier's pinned staging buffer (contiguous
+    // image bytes) into `device_slot`.
+    void restore_image_from_staging(runtime::prefix_cache::SnapshotRef snapshot,
+                                    const std::byte* staged, std::int32_t device_slot);
     // Enqueues the batch in the order a forward pass reads it: a prelude (the snapshot tail, every
     // backend page, and the image's continuation hidden and DFlash state), then each model layer's
     // KV planes or recurrent state, recording an event after the prelude and after every layer.
@@ -205,6 +223,12 @@ public:
     [[nodiscard]] bool prefetch_landing() const noexcept;
     // Waits for every landing prefetch batch and publishes it.
     void settle_prefetch();
+    // Whether any submitted restore batch still references `snapshot` (its image or tail). A
+    // restored image goes to the admission's own state slot — the snapshot's index device_slot
+    // stays empty — so a batch reference is the landing signal for sources (the disk tier's
+    // staging) that only the batch knew. False once no batch names it.
+    [[nodiscard]] bool restore_inflight_for(
+        runtime::prefix_cache::SnapshotRef snapshot) const noexcept;
 
     // Releases every reference the cache holds. The index is rebuilt empty.
     void clear() noexcept;
@@ -266,6 +290,9 @@ private:
         // The snapshot whose Host image lands in `image_slot`.
         std::optional<runtime::prefix_cache::SnapshotRef> image;
         std::int32_t image_slot = -1;
+        // Disk-tier staging bytes of the image when it has no Host copy (else null: segments
+        // come from the snapshot's Host slabs).
+        const std::byte* staged_image = nullptr;
         PageCopies copies;
         PageCopies tail_copies;
         cudaEvent_t prelude = nullptr;

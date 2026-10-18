@@ -127,6 +127,10 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
                                        CausalConvSplitGeometry geometry, cudaStream_t stream) {
     switch (geometry) {
+    case CausalConvSplitGeometry::Rows2048x2048x2048:
+        smallt_split_launch<2048, 2048, 2048>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                              out2, stream);
+        return;
     case CausalConvSplitGeometry::Rows2048x2048x4096:
         smallt_split_launch<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                               out2, stream);
@@ -175,6 +179,10 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
                                         Tensor& out0, Tensor& out1, Tensor& out2,
                                         CausalConvSplitGeometry geometry, cudaStream_t stream) {
     switch (geometry) {
+    case CausalConvSplitGeometry::Rows2048x2048x2048:
+        prefill_split_launch<2048, 2048, 2048>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                               out2, stream);
+        return;
     case CausalConvSplitGeometry::Rows2048x2048x4096:
         prefill_split_launch<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                                out2, stream);

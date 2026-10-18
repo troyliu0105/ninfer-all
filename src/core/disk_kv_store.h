@@ -87,6 +87,18 @@ public:
     bool upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
                      std::vector<DiskKVIdentity>* evicted = nullptr);
 
+    // The caller-controlled reclamation mode the Hybrid prefix-cache tier needs. The page is
+    // owned by its writer: the automatic LRU path (upsert_page and its eviction) never removes
+    // it, and it leaves the store only through evict(). No automatic eviction runs here either:
+    // false — changing nothing — when no free slot exists (the caller backpressures) or the
+    // payload write fails.
+    bool upsert_page_reserved(const DiskKVIdentity& id, std::span<const std::byte> bytes);
+    // Marks a live page writer-owned. A store rebuilt from a slot scan loses the marks, so a
+    // catalog that replays its records re-protects them. False when the page is not live.
+    bool protect(const DiskKVIdentity& id);
+    // Free slots an upsert_page_reserved can still take.
+    [[nodiscard]] std::uint32_t free_slot_count() const;
+
     // Copies the page into `destination` (slot_size bytes) after checking identity and CRC, and
     // refreshes its LRU stamp. The copy and CRC run outside the store lock; eviction skips a slot
     // while it is being read.
@@ -194,6 +206,9 @@ private:
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
     std::vector<std::uint32_t> free_slots_;
     std::vector<std::uint32_t> readers_;
+    // Slots held by writer-owned pages (upsert_page_reserved): excluded from LRU eviction and
+    // from an index scan's live set until their writer evicts them.
+    std::vector<bool> writer_owned_;
     // Live slots by (LRU stamp, slot), so eviction takes the coldest slot without reading every
     // header under the lock; rebuilt from the slot headers on open. lru_stamps_ holds each slot's
     // key, kNoStamp while the slot is not live.

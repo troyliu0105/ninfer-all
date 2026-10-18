@@ -5,6 +5,7 @@
 #include <filesystem>
 
 #include <iostream>
+#include <unistd.h>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -703,6 +704,43 @@ int main() {
             (void)parse(args);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an inconsistent disk tier configuration was accepted");
+    }
+    // The hybrid disk tier reuses the spellings with its own catalog (disk-tier doc §8):
+    // path+gib accepted together, alone neither, and never beside the persistence file or
+    // the Legacy-only switches.
+    const std::string disk_dir = (std::filesystem::temp_directory_path() /
+                                  ("ninfer-disk-tier-" + std::to_string(::getpid())))
+                                     .string();
+    std::filesystem::create_directories(disk_dir);
+    const auto hybrid_disk = parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching",
+                                    "--disk-kv-path", disk_dir, "--disk-kv-gib", "4"});
+    failures += check(hybrid_disk.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          hybrid_disk.context_cache.disk_kv_path == disk_dir &&
+                          hybrid_disk.context_cache.disk_kv_capacity_bytes == (4ULL << 30U),
+                      "the hybrid disk tier did not accept its path and capacity");
+    const auto hybrid_disk_default = parse({"ninfer-serve", "model.ninfer",
+                                             "--use-alt-prefix-caching", "--disk-kv-path",
+                                             disk_dir});
+    failures += check(hybrid_disk_default.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          hybrid_disk_default.context_cache.disk_kv_capacity_bytes == 0,
+                      "path-only must parse with the default capacity resolved at attach");
+    for (const auto& invalid : std::vector<std::vector<std::string>>{
+             {"--use-alt-prefix-caching", "--disk-kv-gib", "8"},
+             {"--use-alt-prefix-caching", "--disk-kv-path", disk_dir, "--disk-kv-gib", "8",
+              "--disk-kv-restore"},
+             {"--use-alt-prefix-caching", "--disk-kv-path", disk_dir, "--disk-kv-gib", "8",
+              "--disk-kv-directstorage"},
+             {"--use-alt-prefix-caching", "--disk-kv-path", disk_dir, "--disk-kv-gib", "8",
+              "--prefix-cache-file", "x.cache"},
+             {"--use-alt-prefix-caching", "--disk-kv-path", "/nonexistent-disk-tier-dir",
+              "--disk-kv-gib", "8"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+        args.insert(args.end(), invalid.begin(), invalid.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an inconsistent hybrid disk tier configuration was accepted");
     }
     const ServeOptions no_slots = parse({"ninfer-serve", "model.ninfer"});
     failures += check(no_slots.slot_save_path.empty() && !no_slots.auto_save_evicted,

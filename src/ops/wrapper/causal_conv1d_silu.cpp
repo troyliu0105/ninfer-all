@@ -159,6 +159,9 @@ detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Te
         throw std::invalid_argument("causal_conv1d: split destinations must match the x column "
                                     "count");
     }
+    if (x.ne[0] == 6144 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 2048) {
+        return detail::CausalConvSplitGeometry::Rows2048x2048x2048;
+    }
     if (x.ne[0] == 8192 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 4096) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x4096;
     }

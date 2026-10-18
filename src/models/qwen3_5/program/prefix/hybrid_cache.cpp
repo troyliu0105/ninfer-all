@@ -262,6 +262,10 @@ StateImageHandle HybridPrefixCache::image(SnapshotRef snapshot) const {
 
 // ---- transfers ---------------------------------------------------------------------------------
 
+// Group id of a disk-tier staging record: one past every slab chunk's id, so it is never
+// joined into a strided run with slab records.
+inline constexpr std::uint32_t kStagingRecordGroup = 0xFFFFFFFFU;
+
 std::byte* HybridPrefixCache::slab(std::uint32_t id) const noexcept {
     return static_cast<std::byte*>(host_chunks_[id / slabs_per_chunk_].data()) +
            static_cast<std::size_t>(id % slabs_per_chunk_) * host_layout_.slab_bytes;
@@ -511,6 +515,39 @@ void HybridPrefixCache::restore_block(NodeRef node, HybridBlockPages destination
     add_copies(restore_.copies, destination, view.host_slab);
 }
 
+void HybridPrefixCache::restore_block_from_staging(NodeRef node, const std::byte* staged,
+                                                   HybridBlockPages destination) {
+    if (!restore_.open || restore_.submitted) {
+        throw std::logic_error("hybrid restore is not open");
+    }
+    const NodeView view = index_->node(node);
+    if (view.device != CopyState::Absent || view.host == CopyState::Resident) {
+        throw std::logic_error("hybrid restore staging source is not disk-only");
+    }
+    adopt_destination(destination, kFullPage);
+    const std::uint32_t id = allocate_block_id(destination);
+    try {
+        index_->begin_device_fill(node, id);
+    } catch (...) {
+        release(destination);
+        free_block_id(id);
+        throw;
+    }
+    restore_.nodes.push_back(node);
+    // Staging bytes ride the batch's ordinary record path. Their group id is a sentinel no
+    // slab chunk can have, so a staged record is never joined with another run: one plain
+    // transfer per page, ordered with the batch's per-layer schedule.
+    restore_.copies.text_pages.push_back(text_pages_->physical(destination.text));
+    restore_.copies.text_records.push_back(const_cast<std::byte*>(staged));
+    restore_.copies.text_groups.push_back(kStagingRecordGroup);
+    if (destination.backend) {
+        restore_.copies.backend_pages.push_back(backend_pages_->physical(*destination.backend));
+        restore_.copies.backend_records.push_back(const_cast<std::byte*>(staged) +
+                                                  host_layout_.backend_offset);
+        restore_.copies.backend_groups.push_back(kStagingRecordGroup);
+    }
+}
+
 void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages destination) {
     if (!restore_.open || restore_.submitted || restore_.tail) {
         throw std::logic_error("hybrid restore is not open");
@@ -533,6 +570,45 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
     add_copies(restore_.tail_copies, destination, view.host_slabs[host_layout_.image_slabs]);
 }
 
+void HybridPrefixCache::restore_tail_from_staging(SnapshotRef snapshot, const std::byte* staged,
+                                                  HybridBlockPages destination) {
+    if (!restore_.open || restore_.submitted || restore_.tail) {
+        throw std::logic_error("hybrid restore is not open");
+    }
+    const SnapshotView view = index_->snapshot(snapshot);
+    if (view.tail_len == 0 || view.tail_device_copy != CopyState::Absent) {
+        throw std::logic_error("hybrid restore staging source tail is not missing");
+    }
+    if (view.host == CopyState::Resident) {
+        // The Host copy serves the restore directly.
+        restore_tail(snapshot, destination);
+        return;
+    }
+    if (view.disk != CopyState::Resident || !view.disk_committed) {
+        throw std::logic_error("hybrid restore staging source tail is not disk-committed");
+    }
+    adopt_destination(destination, view.tail_len);
+    const std::uint32_t id = allocate_block_id(destination);
+    try {
+        index_->begin_tail_device_fill(snapshot, id);
+    } catch (...) {
+        release(destination);
+        free_block_id(id);
+        throw;
+    }
+    restore_.tail = snapshot;
+    restore_.tail_copies.text_pages.push_back(text_pages_->physical(destination.text));
+    restore_.tail_copies.text_records.push_back(const_cast<std::byte*>(staged));
+    restore_.tail_copies.text_groups.push_back(kStagingRecordGroup);
+    if (destination.backend) {
+        restore_.tail_copies.backend_pages.push_back(
+            backend_pages_->physical(*destination.backend));
+        restore_.tail_copies.backend_records.push_back(const_cast<std::byte*>(staged) +
+                                                       host_layout_.backend_offset);
+        restore_.tail_copies.backend_groups.push_back(kStagingRecordGroup);
+    }
+}
+
 void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_slot) {
     if (!restore_.open || restore_.submitted || restore_.image) {
         throw std::logic_error("hybrid restore is not open");
@@ -543,8 +619,30 @@ void HybridPrefixCache::restore_image(SnapshotRef snapshot, std::int32_t device_
     if (restore_.tail && *restore_.tail != snapshot) {
         throw std::logic_error("hybrid restore mixes two snapshots");
     }
-    restore_.image      = snapshot;
-    restore_.image_slot = device_slot;
+    restore_.image              = snapshot;
+    restore_.image_slot         = device_slot;
+    restore_.staged_image       = nullptr;
+}
+
+void HybridPrefixCache::restore_image_from_staging(SnapshotRef snapshot, const std::byte* staged,
+                                                   std::int32_t device_slot) {
+    if (!restore_.open || restore_.submitted || restore_.image) {
+        throw std::logic_error("hybrid restore is not open");
+    }
+    const SnapshotView view = index_->snapshot(snapshot);
+    if (view.host == CopyState::Resident) {
+        restore_image(snapshot, device_slot); // the Host copy serves directly
+        return;
+    }
+    if (view.disk != CopyState::Resident || !view.disk_committed) {
+        throw std::logic_error("hybrid restore staging source image is not disk-committed");
+    }
+    if (restore_.tail && *restore_.tail != snapshot) {
+        throw std::logic_error("hybrid restore mixes two snapshots");
+    }
+    restore_.image        = snapshot;
+    restore_.image_slot   = device_slot;
+    restore_.staged_image = staged;
 }
 
 void HybridPrefixCache::submit_restore() {
@@ -555,8 +653,15 @@ void HybridPrefixCache::submit_restore() {
     if (restore_.image) {
         const SnapshotView view = index_->snapshot(*restore_.image);
         segments.reserve(host_layout_.image_slabs);
-        for (std::uint32_t i = 0; i < host_layout_.image_slabs; ++i) {
-            segments.push_back(slab(view.host_slabs[i]));
+        if (restore_.staged_image != nullptr) {
+            for (std::uint32_t i = 0; i < host_layout_.image_slabs; ++i) {
+                segments.push_back(restore_.staged_image +
+                                   static_cast<std::size_t>(i) * host_layout_.slab_bytes);
+            }
+        } else {
+            for (std::uint32_t i = 0; i < host_layout_.image_slabs; ++i) {
+                segments.push_back(slab(view.host_slabs[i]));
+            }
         }
     }
     const auto record = [&]() {
@@ -657,6 +762,13 @@ void HybridPrefixCache::settle_prefetch() {
         }
     }
     poll();
+}
+
+bool HybridPrefixCache::restore_inflight_for(SnapshotRef snapshot) const noexcept {
+    return std::any_of(landing_.begin(), landing_.end(), [&](const RestoreBatch& batch) {
+        return (batch.image && *batch.image == snapshot) ||
+               (batch.tail && *batch.tail == snapshot);
+    });
 }
 
 std::span<const cudaEvent_t>

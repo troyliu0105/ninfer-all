@@ -297,11 +297,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         if (cache.rolling_retention || cache.release_diverged_checkpoints ||
             cache.thorough_admission_search || cache.recency_eviction || cache.value_aware_demote ||
-            cache.automatic_long_anchors || cache.branch_anchors || !cache.disk_kv_path.empty()) {
+            cache.automatic_long_anchors || cache.branch_anchors) {
             throw std::invalid_argument(
                 "the hybrid prefix cache does not accept Legacy cache policies (rolling retention, "
                 "diverged-checkpoint release, thorough admission search, recency eviction, "
-                "value-aware demotion, automatic long anchors, branch anchors, disk tier)");
+                "value-aware demotion, automatic long anchors, branch anchors)");
+        }
+        // The disk tier (docs/maintainer/hybrid-prefix-cache-disk-tier.md §8) reuses the
+        // Legacy spellings with its own catalog; the Legacy-only switches stay rejected.
+        if (cache.disk_kv_restore || cache.disk_kv_directstorage) {
+            throw std::invalid_argument(
+                "the hybrid prefix cache does not accept the Legacy disk switches "
+                "(--disk-kv-restore, --disk-kv-directstorage)");
+        }
+        if (!cache.disk_kv_path.empty() && !cache.hybrid.persistent_file.empty()) {
+            throw std::invalid_argument(
+                "the hybrid disk tier and --prefix-cache-file are mutually exclusive");
         }
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
@@ -311,6 +322,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
                 cache.host_cache_budget_bytes.value_or(kDefaultHybridHostCacheBytes);
         }
         const bool host_tier = cache.host_cache_auto || *cache.host_cache_budget_bytes != 0;
+        if (!cache.disk_kv_path.empty() && !host_tier) {
+            throw std::invalid_argument(
+                "the hybrid disk tier requires a Host tier (--host-cache-mib or auto)");
+        }
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
@@ -795,6 +810,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                                         device, options.startup_observer,
                                                         std::move(experts));
     LoadSummary::PrefixCacheRestore restore;
+    LoadSummary::DiskTierRestore disk_restore = LoadSummary::DiskTierRestore::NotConfigured;
     if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
         // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
@@ -819,6 +835,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 .required_host_bytes = loaded.required_host_bytes,
                 .host_bytes          = loaded.host_bytes,
             };
+        }
+        if (!resolved.context_cache.disk_kv_path.empty()) {
+            // The disk tier's directory is artifact-scoped (artifact_scoped_disk_tier).
+            const bool disk_ok = instance->program->attach_hybrid_disk_tier(
+                resolved.context_cache.disk_kv_path, resolved.context_cache.disk_kv_capacity_bytes,
+                hybrid_cache_fingerprint(options, signature));
+            disk_restore = disk_ok ? LoadSummary::DiskTierRestore::Replayed
+                                   : LoadSummary::DiskTierRestore::ForeignWiped;
         }
     }
     instance->inject_pinned_grafts();
@@ -856,6 +880,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                            options, instance->model->config().text.max_position_embeddings,
                            runtime::kQwen35RopeScaling)
                            .summary;
+    summary.disk_tier            = disk_restore;
 
     // Static /v1/models metadata: the model identity and dimension facts come from the loaded
     // model; the parameters, weight bytes, and weights profile are pure functions of the

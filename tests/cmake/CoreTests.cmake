@@ -64,6 +64,10 @@ ninfer_add_test(ninfer_disk_kv_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_store.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_prefix_disk_catalog_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_disk_catalog.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_file_read_queue_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_read_queue.cpp"
   LIBRARIES ninfer_core)

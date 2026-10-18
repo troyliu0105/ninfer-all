@@ -127,6 +127,7 @@ DiskKVStore::DiskKVStore(Options options) : options_(std::move(options)) {
     map_file(!reuse);
     readers_.assign(max_slots_, 0);
     lru_stamps_.assign(max_slots_, kNoStamp);
+    writer_owned_.assign(max_slots_, false);
     if (!load_index()) { rebuild_from_scan(); }
 }
 
@@ -307,6 +308,7 @@ bool DiskKVStore::load_index() {
     index_.reserve(rows.size());
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
+    writer_owned_.assign(max_slots_, false);
     std::vector<bool> live(max_slots_, false);
     for (const IndexRow& row : rows) {
         if (row.slot >= max_slots_ || live[row.slot]) { continue; }
@@ -335,6 +337,7 @@ void DiskKVStore::rebuild_from_scan() {
     free_slots_.clear();
     lru_.clear();
     lru_stamps_.assign(max_slots_, kNoStamp);
+    writer_owned_.assign(max_slots_, false);
     clock_ = 0;
     std::vector<bool> live(max_slots_, false);
     std::vector<std::byte> payload(options_.slot_size);
@@ -395,7 +398,7 @@ std::optional<DiskKVIdentity> DiskKVStore::evict_one_lru_locked() {
     for (const auto& entry : lru_) {
         // A copy: erasing the entry below frees the node the loop reads from.
         const std::uint32_t slot = entry.second;
-        if (readers_[slot] != 0) { continue; }
+        if (readers_[slot] != 0 || writer_owned_[slot]) { continue; }
         const Header& victim_header = header(slot);
         const DiskKVIdentity id{victim_header.lo, victim_header.hi, victim_header.tag,
                                 victim_header.frontier};
@@ -407,6 +410,67 @@ std::optional<DiskKVIdentity> DiskKVStore::evict_one_lru_locked() {
         return id;
     }
     return std::nullopt;
+}
+
+bool DiskKVStore::upsert_page_reserved(const DiskKVIdentity& id, std::span<const std::byte> bytes) {
+    if (bytes.size() != options_.slot_size) { return false; }
+    std::uint32_t slot  = 0;
+    std::uint64_t stamp = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto found = index_.find(id); found != index_.end()) {
+            // Already live: never rewrite a reader-reachable slot. Refresh its stamp, keep it
+            // writer-owned, and report success — the page already holds this identity.
+            const std::uint32_t live_slot = found->second;
+            const std::uint64_t now       = ++clock_;
+            header(live_slot).last_used   = now;
+            lru_touch_locked(live_slot, now);
+            writer_owned_[live_slot]      = true;
+            index_dirty_                  = true;
+            return true;
+        } else {
+            if (free_slots_.empty()) { return false; }
+            slot = free_slots_.back();
+            free_slots_.pop_back();
+            clear_slot(slot);
+            stamp = ++clock_;
+        }
+    }
+
+    const std::uint32_t crc = crc32(bytes.first(options_.slot_size));
+    const bool written      = write_payload(slot, bytes.first(options_.slot_size));
+
+    std::lock_guard lock(mutex_);
+    if (!written) {
+        if (!index_.contains(id)) { free_slots_.push_back(slot); }
+        return false;
+    }
+    header(slot) = Header{.magic     = Header::kMagic,
+                          .last_used = stamp,
+                          .lo        = id.lo,
+                          .hi        = id.hi,
+                          .tag       = id.tag,
+                          .frontier  = id.frontier,
+                          .crc       = crc};
+    lru_touch_locked(slot, stamp);
+    writer_owned_[slot] = true;
+    if (!index_.contains(id)) { index_[id] = slot; }
+    index_dirty_ = true;
+    if (!options_.defer_index_updates) { persist_index_locked(); }
+    return true;
+}
+
+bool DiskKVStore::protect(const DiskKVIdentity& id) {
+    std::lock_guard lock(mutex_);
+    const auto found = index_.find(id);
+    if (found == index_.end()) { return false; }
+    writer_owned_[found->second] = true;
+    return true;
+}
+
+std::uint32_t DiskKVStore::free_slot_count() const {
+    std::lock_guard lock(mutex_);
+    return static_cast<std::uint32_t>(free_slots_.size());
 }
 
 std::uint32_t DiskKVStore::live_slots() const {
@@ -543,6 +607,7 @@ bool DiskKVStore::evict(const DiskKVIdentity& id) {
     const std::uint32_t slot = found->second;
     index_.erase(found);
     lru_erase_locked(slot);
+    writer_owned_[slot] = false;
     clear_slot(slot);
     free_slots_.push_back(slot);
     index_dirty_ = true;

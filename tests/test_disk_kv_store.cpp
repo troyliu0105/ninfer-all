@@ -240,6 +240,89 @@ void claimed_reads(const std::filesystem::path& root) {
     check(store.evict(id(1, 64)), "a released page can be evicted");
 }
 
+// The Hybrid prefix-cache tier's caller-controlled reclamation: a writer-owned page never falls
+// to the automatic LRU, a full store refuses a reserved upsert instead of evicting, and evict()
+// returns the page to the pool.
+void writer_owned_pages(const std::filesystem::path& root) {
+    const auto directory = root / "reserved";
+    std::filesystem::create_directories(directory);
+    DiskKVStore::Options options;
+    options.path          = (directory / "store.bin").string();
+    options.slot_size     = kSlot;
+    options.max_slots     = 4;
+    DiskKVStore store(options);
+
+    const auto first  = page(kSlot, 1);
+    const auto second = page(kSlot, 2);
+    const auto third  = page(kSlot, 3);
+    check(store.upsert_page_reserved(id(1, 100), first), "reserved upsert takes a free slot");
+    check(store.upsert_page_reserved(id(2, 100), second), "second reserved upsert");
+    check(store.upsert_page_reserved(id(3, 100), first), "third reserved upsert");
+    check(store.upsert_page_reserved(id(4, 100), second), "fourth reserved upsert fills the pool");
+    check(store.free_slot_count() == 0, "no free slot remains");
+    check(reads_back(store, id(1, 100), first), "reserved page reads back");
+
+    // The automatic LRU path cannot reclaim writer-owned pages: a full pool of them refuses an
+    // automatic upsert instead of evicting one.
+    const auto spill = page(kSlot, 9);
+    check(!store.upsert_page(id(9, 100), spill), "full pool of writer-owned pages refuses");
+    check(!store.contains(id(9, 100)), "refused automatic upsert stored nothing");
+    check(reads_back(store, id(1, 100), first), "reserved page survived LRU pressure");
+    check(reads_back(store, id(4, 100), second), "last reserved page survived LRU pressure");
+    check(store.live_slots() == 4, "pool holds exactly four live pages");
+
+    // A reserved upsert into a full pool changes nothing (backpressure, not eviction).
+    check(!store.upsert_page_reserved(id(6, 100), third), "full pool refuses a reserved upsert");
+    check(!store.contains(id(6, 100)), "refused reserved upsert stored nothing");
+
+    // Re-upserting a live identity is a no-op rewrite: the original bytes stay readable.
+    const auto different = page(kSlot, 77);
+    check(store.upsert_page_reserved(id(1, 100), different),
+          "live identity reserved upsert succeeds");
+    check(reads_back(store, id(1, 100), first),
+          "live identity kept its original bytes");
+
+    // evict() returns a reserved page; protect() re-marks a live page after a reopen.
+    check(store.evict(id(3, 100)), "writer-owned page evicts under the caller's control");
+    check(store.upsert_page_reserved(id(6, 100), third), "freed slot serves a reserved upsert");
+    check(reads_back(store, id(6, 100), third), "new reserved page reads back");
+    check(store.protect(id(4, 100)), "protect marks a live page");
+    check(!store.protect(id(99, 100)), "protect refuses an absent page");
+    store.flush_index();
+}
+
+// A reopened store loses writer ownership (the index cannot carry it); the replayed catalog
+// re-protects its records, which the LRU then respects again.
+void writer_ownership_reprotected_after_reopen(const std::filesystem::path& root) {
+    const auto directory = root / "reprotect";
+    std::filesystem::create_directories(directory);
+    const auto data = (directory / "store.bin").string();
+    {
+        DiskKVStore::Options options;
+        options.path      = data;
+        options.slot_size = kSlot;
+        options.max_slots = 3;
+        DiskKVStore store(options);
+        check(store.upsert_page_reserved(id(1, 100), page(kSlot, 1)), "reserved page one");
+        check(store.upsert_page_reserved(id(2, 100), page(kSlot, 2)), "reserved page two");
+        check(store.upsert_page_reserved(id(3, 100), page(kSlot, 3)), "reserved page three");
+        store.flush_index();
+    }
+    {
+        DiskKVStore::Options options;
+        options.path      = data;
+        options.slot_size = kSlot;
+        options.max_slots = 3;
+        DiskKVStore store(options);
+        check(store.live_slots() == 3, "reopened store kept the three pages");
+        check(store.protect(id(1, 100)) && store.protect(id(2, 100)) &&
+                  store.protect(id(3, 100)),
+              "catalog replay re-protects its records");
+        check(!store.upsert_page(id(9, 100), page(kSlot, 9)),
+              "automatic upsert cannot evict a re-protected page");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -251,13 +334,15 @@ int main() {
         capacity_sizing(root);
         concurrent_reads_survive_eviction(root);
         claimed_reads(root);
+        writer_owned_pages(root);
+        writer_ownership_reprotected_after_reopen(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "disk KV store test: " << error.what() << '\n';
         return 1;
     }
     if (failures != 0) { return 1; }
-    std::cout << "disk KV store: LRU, persistence, corruption, sizing, concurrent and claimed "
-                 "reads ok\n";
+    std::cout << "disk KV store: LRU, persistence, corruption, sizing, concurrent, claimed reads "
+                 "and writer-owned pages ok\n";
     return 0;
 }

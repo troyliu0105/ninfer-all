@@ -77,6 +77,10 @@ struct PrefixIndexConfig {
     // Whether the host tier backs KV block bundles and snapshot tails. Without it the host tier
     // holds state images only: tails and blocks are unbacked and their loss removes dependants.
     bool host_blocks = true;
+    // Capacity of the disk tier's record directory, in records (0: the disk tier is disabled).
+    // Disk-only nodes and snapshots occupy index capacity, so callers enabling it size
+    // max_nodes/max_snapshots accordingly.
+    std::uint32_t disk_capacity_records = 0;
     CacheCostModel cost;
 };
 
@@ -93,6 +97,15 @@ public:
 
     // The snapshot keeps its host image but loses its device image copy.
     virtual void drop_snapshot_device_image(SnapshotRef /*snapshot*/) noexcept {}
+
+    // The index dropped its last reference to a disk block-bundle record (block or snapshot tail).
+    virtual void release_disk_record(std::uint32_t /*disk_ref*/) noexcept {}
+
+    // The snapshot is being removed and its disk records (image parts and any tail record) are
+    // released. `committed` marks a snapshot whose complete disk closure had been published.
+    virtual void release_snapshot_disk_records(SnapshotRef /*snapshot*/,
+                                               std::uint32_t /*disk_ref*/,
+                                               bool /*committed*/) noexcept {}
 };
 
 struct MatchCandidate {
@@ -101,10 +114,16 @@ struct MatchCandidate {
     std::uint32_t path_blocks      = 0; // full blocks up to and including the anchor
     std::uint32_t host_only_blocks = 0; // path blocks without a device copy (needing H2D)
     std::uint32_t filling_blocks   = 0; // path blocks another admission is already restoring
+    std::uint32_t disk_only_blocks = 0; // path blocks whose only copy is a disk record
     bool tail                      = false;
     bool tail_on_device            = false;
     bool image_on_device           = false;
+    bool tail_on_host              = false;
+    bool image_on_host             = false;
+    bool tail_on_disk              = false;
+    bool image_on_disk             = false;
     std::uint64_t restore_bytes    = 0;
+    std::uint64_t disk_read_bytes  = 0; // bytes the disk tier must deliver for this candidate
 };
 
 struct MatchResult {
@@ -137,6 +156,8 @@ struct NodeView {
     CopyState device                   = CopyState::Absent;
     std::uint32_t host_slab            = kNoId;
     CopyState host                     = CopyState::Absent;
+    std::uint32_t disk_ref             = kNoId;
+    CopyState disk                     = CopyState::Absent;
     std::uint32_t pins                 = 0;
     std::uint32_t live_snapshots_below = 0;
 };
@@ -150,6 +171,9 @@ struct SnapshotView {
     std::uint32_t device_slot  = kNoId;
     CopyState host             = CopyState::Absent;
     std::span<const std::uint32_t> host_slabs; // image slabs, then the tail slab when tail_len>0
+    std::uint32_t disk_ref     = kNoId;
+    CopyState disk             = CopyState::Absent;
+    bool disk_committed        = false;
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
@@ -183,6 +207,14 @@ struct PrefixIndexStats {
     std::uint64_t host_snapshot_evictions = 0;
     std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
     std::uint64_t device_slot_evictions   = 0;
+    std::uint32_t disk_resident_blocks    = 0;
+    std::uint32_t disk_committed_snapshots = 0;
+    std::uint64_t disk_record_bytes       = 0;
+    std::uint64_t disk_reads              = 0;
+    std::uint64_t disk_writes             = 0;
+    std::uint64_t disk_demoted_blocks     = 0;
+    std::uint64_t disk_restored_blocks    = 0;
+    std::uint64_t disk_record_evictions   = 0;
     std::uint64_t snapshot_hits           = 0;
     double gdsf_inflation                 = 0.0;
 };
@@ -276,6 +308,44 @@ public:
     // Returns the device id to the backend.
     void abort_tail_device_fill(SnapshotRef snapshot);
 
+    // ---- disk residency (docs/maintainer/hybrid-prefix-cache-disk-tier.md §3, §4, §6)
+    // A pinned node whose bytes are being written to its disk record.
+    void begin_disk_fill(NodeRef node, std::uint32_t disk_ref);
+    void complete_disk_fill(NodeRef node);
+    // Returns the disk record to the backend.
+    void abort_disk_fill(NodeRef node);
+    // Marks a node or snapshot disk-resident (demotion completion). `disk_ref` is the opaque
+    // record id the backend handed out for the fill.
+    void mark_disk_backed(NodeRef node, std::uint32_t disk_ref);
+    // A pinned snapshot whose closure is being written to disk. Complete only after the whole
+    // closure (path, image, tail) landed; it then counts as restartable.
+    void begin_snapshot_disk_fill(SnapshotRef snapshot, std::uint32_t disk_ref);
+    void complete_snapshot_disk_fill(SnapshotRef snapshot);
+    // Returns the disk records to the backend.
+    void abort_snapshot_disk_fill(SnapshotRef snapshot);
+    void mark_snapshot_disk_backed(SnapshotRef snapshot, std::uint32_t disk_ref);
+    // Reserves the node for a queued disk write: a second closure sharing this block reuses
+    // the pending record instead of queueing a duplicate write.
+    void begin_node_disk_fill(NodeRef node, std::uint32_t disk_ref);
+    // A failed or abandoned write returns the node to disk-Absent.
+    void abort_node_disk_fill(NodeRef node);
+    // Returns a committed disk-backed snapshot's Host slabs to the tier: the disk closure
+    // keeps the image, tail and every anchor block durable, so the Host copy is a duplicate.
+    void release_snapshot_host_copy(SnapshotRef snapshot);
+
+    // Reclaims unpinned disk records: committed disk snapshots in GDSF order (a shared ancestor
+    // survives while another committed closure references it), then disk-backed nodes no
+    // committed closure needs. Returns the number of records released. Skipped when the disk
+    // tier is disabled.
+    std::uint32_t evict_disk_entries(std::uint32_t records);
+
+    // Host-pressure demotion candidates: unpinned Host-resident snapshots without a committed
+    // disk closure, lowest GDSF priority first, at most `count`. The tier's cold-data choice
+    // (§4.2 step 3); dead data and disk-backed copies are reclaimed through the ordinary
+    // allocate_slabs path and completion bookkeeping.
+    [[nodiscard]] std::vector<SnapshotRef>
+    collect_demotion_candidates(std::uint32_t count) const;
+
     // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
     // ------------------------------------------------------- Returns a device snapshot slot for a
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
@@ -316,6 +386,20 @@ public:
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
                           SnapshotKind kind, std::uint32_t hits);
 
+    // Rebuild a saved disk tier into a fresh index, the same discipline as the Host restore:
+    // parents before children, anchors before their snapshots, nothing evicted to make room.
+    // A restored block is disk-Resident only (its bytes stay on the disk until a preparation
+    // reads them back). Absent means no node/snapshot entry was free or the entry already exists.
+    [[nodiscard]] std::optional<NodeRef> restore_disk_block(NodeRef parent,
+                                                            std::uint64_t lookup_hash,
+                                                            std::span<const TokenId> tokens,
+                                                            std::uint64_t extra,
+                                                            std::uint32_t disk_ref);
+    [[nodiscard]] std::optional<SnapshotRef>
+    restore_disk_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
+                          SnapshotKind kind, std::uint32_t hits, std::uint32_t disk_ref,
+                          bool committed);
+
     // ---- views
     // ------------------------------------------------------------------------------------
     [[nodiscard]] bool valid(NodeRef node) const noexcept;
@@ -342,6 +426,8 @@ private:
         CopyState device         = CopyState::Absent;
         std::uint32_t host_slab  = kNoId;
         CopyState host           = CopyState::Absent;
+        std::uint32_t disk_ref   = kNoId;
+        CopyState disk           = CopyState::Absent;
         std::uint32_t pins       = 0;
         std::uint32_t live_below = 0;
         // Retained (not superseded) snapshots anchored at or below this node.
@@ -363,6 +449,9 @@ private:
         std::uint32_t device_slot  = kNoId;
         std::vector<std::uint32_t> host_slabs;
         CopyState host                = CopyState::Absent;
+        std::uint32_t disk_ref        = kNoId;
+        CopyState disk                = CopyState::Absent;
+        bool disk_committed           = false;
         std::uint32_t pins            = 0;
         SnapshotKind kind             = SnapshotKind::Tap;
         std::uint32_t hits            = 0;
@@ -449,6 +538,7 @@ private:
     void release_node_storage(std::uint32_t node);
     void drop_node_device_copy(std::uint32_t node);
     void drop_node_host_copy(std::uint32_t node);
+    void drop_node_disk_copy(std::uint32_t node);
     void adjust_live(std::uint32_t anchor, int delta);
     // Every Device residency and slot-state change goes through these so the gauges stats()
     // reports stay O(1): the Engine publishes statistics after every decode round.
@@ -483,6 +573,8 @@ private:
     std::uint32_t node_count_      = 0;
     std::uint32_t snapshot_count_  = 0;
     std::uint32_t device_resident_ = 0;
+    std::uint32_t disk_resident_blocks_     = 0;
+    std::uint32_t disk_committed_snapshots_ = 0;
     std::uint32_t free_slots_      = 0;
     std::uint64_t tick_            = 0;
     double inflation_              = 0.0;

@@ -14,6 +14,8 @@ struct CacheCostModel {
     double token_seconds          = 1.0 / 4000.0;
     double attention_pair_seconds = 0.0;
     double h2d_bytes_per_second   = 50.0e9;
+    // Zero disables the disk tier in ranking: no candidate is ever valued through it.
+    double disk_read_bytes_per_second = 0.0;
     double transfer_batch_seconds = 20.0e-6;
 
     // Prefill of `tokens` tokens appended after `base` reused tokens.
@@ -29,6 +31,17 @@ struct CacheCostModel {
     [[nodiscard]] double restore_seconds(std::uint64_t bytes) const noexcept {
         if (bytes == 0) { return 0.0; }
         return transfer_batch_seconds + static_cast<double>(bytes) / h2d_bytes_per_second;
+    }
+
+    // A restore that moves `host_bytes` over H2D and reads `disk_bytes` from the disk tier. Disk
+    // reads and the H2D copy overlap only after the read delivers; the model charges the batch
+    // once plus both transfers.
+    [[nodiscard]] double restore_seconds(std::uint64_t host_bytes,
+                                         std::uint64_t disk_bytes) const noexcept {
+        if (host_bytes == 0 && disk_bytes == 0) { return 0.0; }
+        return transfer_batch_seconds +
+               static_cast<double>(host_bytes) / h2d_bytes_per_second +
+               static_cast<double>(disk_bytes) / disk_read_bytes_per_second;
     }
 };
 

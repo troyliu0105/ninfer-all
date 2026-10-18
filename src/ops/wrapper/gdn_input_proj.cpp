@@ -1450,11 +1450,36 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 
 namespace {
 
-constexpr std::int32_t kGgufHidden   = 5120;
-constexpr std::int32_t kGgufQkvRows  = 10240;
-constexpr std::int32_t kGgufZRows    = 6144;
-constexpr std::int32_t kGgufQueryKey = 2048;
-constexpr std::int32_t kGgufValue    = 6144;
+// One supported GGUF GDN profile: its hidden width, the q/k/v plane rows (key_width × 2 +
+// value_width), the z rows (value_width), and the query/key and value widths the conv outputs
+// slice. The 27B profile is hidden 5120 with q/k 2048 and value 6144; the 2B profile is
+// hidden 2048 with all three 2048.
+struct GgufGdnProfile {
+    std::int32_t hidden;
+    std::int32_t qkv_rows;
+    std::int32_t z_rows;
+    std::int32_t query_key;
+    std::int32_t value;
+};
+constexpr GgufGdnProfile kGgufGdn27B{5120, 10240, 6144, 2048, 6144};
+constexpr GgufGdnProfile kGgufGdn2B{2048, 6144, 2048, 2048, 2048};
+
+// The profile whose parts exactly cover it; a null result rejects the weights.
+const GgufGdnProfile* gguf_profile(const GgufProjectionWeights& weights) {
+    std::int64_t qkv = 0;
+    std::int64_t z   = 0;
+    std::int32_t k   = 0;
+    for (const auto& part : weights.parts) {
+        if (part.output == 0) { qkv += part.weight.n; } else { z += part.weight.n; }
+        k = part.weight.k;
+    }
+    for (const GgufGdnProfile* profile : {&kGgufGdn27B, &kGgufGdn2B}) {
+        if (k == profile->hidden && qkv == profile->qkv_rows && z == profile->z_rows) {
+            return profile;
+        }
+    }
+    return nullptr;
+}
 
 std::vector<detail::GgufShape> gguf_shapes(const GgufProjectionWeights& weights) {
     std::vector<detail::GgufShape> shapes;
@@ -1466,19 +1491,29 @@ std::vector<detail::GgufShape> gguf_shapes(const GgufProjectionWeights& weights)
 
 // The z rows and the q/k/value channels the parts write, checked once against the fixed profile.
 void require_gguf_gdn(const GgufProjectionWeights& weights) {
-    std::int64_t qkv = 0;
-    std::int64_t z   = 0;
-    for (const auto& part : weights.parts) {
-        detail::require_gguf(part.weight, "gdn_input_proj GGUF part");
-        if (part.weight.k != kGgufHidden || part.output < 0 || part.output > 1 || part.row < 0 ||
-            part.row + part.weight.n > (part.output == 0 ? kGgufQkvRows : kGgufZRows)) {
-            throw std::invalid_argument("gdn_input_proj: GGUF part outside the q/k/v/z profile");
-        }
-        (part.output == 0 ? qkv : z) += part.weight.n;
-    }
-    if (qkv != kGgufQkvRows || z != kGgufZRows) {
+    const GgufGdnProfile* profile = gguf_profile(weights);
+    if (profile == nullptr) {
         throw std::invalid_argument("gdn_input_proj: GGUF parts do not cover q/k/v and z");
     }
+    for (const auto& part : weights.parts) {
+        detail::require_gguf(part.weight, "gdn_input_proj GGUF part");
+        if (part.weight.k != profile->hidden || part.output < 0 || part.output > 1 ||
+            part.row < 0 ||
+            part.row + part.weight.n > (part.output == 0 ? profile->qkv_rows : profile->z_rows)) {
+            throw std::invalid_argument("gdn_input_proj: GGUF part outside the q/k/v/z profile");
+        }
+    }
+}
+
+const GgufGdnProfile* gguf_profile_checked(const GgufProjectionWeights& weights) {
+    const GgufGdnProfile* profile = gguf_profile(weights);
+    if (profile == nullptr) {
+        throw std::invalid_argument("gdn_input_proj: GGUF parts do not cover q/k/v and z");
+    }
+    for (const auto& part : weights.parts) {
+        detail::require_gguf(part.weight, "gdn_input_proj GGUF part");
+    }
+    return profile;
 }
 
 void gguf_gdn_project(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv,
@@ -1500,32 +1535,32 @@ void gguf_gdn_project(const Tensor& x, const GgufProjectionWeights& weights, Ten
 std::size_t gdn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
-    require_gguf_gdn(weights);
+    (void)gguf_profile_checked(weights);
     const auto shapes = gguf_shapes(weights);
     return detail::gguf_project_workspace_bytes(shapes, min_tokens, max_tokens);
 }
 
 void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
-    require_gguf_gdn(weights);
+    const GgufGdnProfile* profile = gguf_profile_checked(weights);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kGgufHidden, cols, "x");
-    require_matrix(qkv, kGgufQkvRows, cols, "qkv");
-    require_matrix(z, kGgufZRows, cols, "z");
+    require_matrix(x, profile->hidden, cols, "x");
+    require_matrix(qkv, profile->qkv_rows, cols, "qkv");
+    require_matrix(z, profile->z_rows, cols, "z");
     gguf_gdn_project(x, weights, qkv, z, workspace, stream);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
     std::int32_t max_width) {
-    require_gguf_gdn(weights);
+    const GgufGdnProfile* profile = gguf_profile_checked(weights);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const auto shapes          = gguf_shapes(weights);
     const std::int32_t batch   = std::max(batch_size, 1);
     const std::size_t project  = detail::gguf_project_workspace_bytes(
         shapes, batch * min_width, batch * max_width);
-    return composed_snapshot_capacity(kGgufQkvRows, batch * max_width, project);
+    return composed_snapshot_capacity(profile->qkv_rows, batch * max_width, project);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& weights,
@@ -1534,21 +1569,21 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& 
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
-    require_gguf_gdn(weights);
-    const ConvGeometry geometry = require_snapshot_input(x, kGgufHidden);
+    const GgufGdnProfile* profile = gguf_profile_checked(weights);
+    const ConvGeometry geometry = require_snapshot_input(x, profile->hidden);
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                              snapshot_base_slots, kGgufQkvRows, geometry);
-    require_conv_tensor(query, kGgufQueryKey, geometry.width, geometry.batch,
+                              snapshot_base_slots, profile->qkv_rows, geometry);
+    require_conv_tensor(query, profile->query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "query");
-    require_conv_tensor(key, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(key, profile->query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "key");
-    require_conv_tensor(value, kGgufValue, geometry.width, geometry.batch,
+    require_conv_tensor(value, profile->value, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "value");
-    require_conv_tensor(z, kGgufZRows, geometry.width, geometry.batch,
+    require_conv_tensor(z, profile->z_rows, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "z");
     compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                             snapshot_base_slots, query, key, value, z, kGgufQueryKey,
-                             kGgufQueryKey, kGgufValue, geometry, ws, stream,
+                             snapshot_base_slots, query, key, value, z, profile->query_key,
+                             profile->query_key, profile->value, geometry, ws, stream,
                              [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                                  gguf_gdn_project(x_flat, weights, projected, z_flat, ws, stream);
                              });
@@ -1557,7 +1592,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
     std::int32_t max_width) {
-    require_gguf_gdn(weights);
+    (void)gguf_profile_checked(weights);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const auto shapes        = gguf_shapes(weights);
     const std::int32_t batch = std::max(batch_size, 1);
@@ -1569,20 +1604,20 @@ void gdn_input_proj_conv_record(const Tensor& x, const GgufProjectionWeights& we
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-    require_gguf_gdn(weights);
-    const ConvGeometry geometry = require_record_input(x, kGgufHidden);
+    const GgufGdnProfile* profile = gguf_profile_checked(weights);
+    const ConvGeometry geometry = require_record_input(x, profile->hidden);
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                            kGgufQkvRows, geometry);
-    require_conv_tensor(conv_record, kGgufQkvRows, geometry.width, geometry.batch,
+                            profile->qkv_rows, geometry);
+    require_conv_tensor(conv_record, profile->qkv_rows, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "conv record");
-    require_conv_tensor(query, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(query, profile->query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "query");
-    require_conv_tensor(key, kGgufQueryKey, geometry.width, geometry.batch,
+    require_conv_tensor(key, profile->query_key, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "key");
-    require_conv_tensor(value, kGgufValue, geometry.width, geometry.batch,
+    require_conv_tensor(value, profile->value, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "value");
-    require_conv_tensor(z, kGgufZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
-                        "z");
+    require_conv_tensor(z, profile->z_rows, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_record", "z");
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);
     compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,

@@ -23,6 +23,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "models/qwen3_5/program/prefix/hybrid_disk.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/output_budget.h"
@@ -869,6 +870,10 @@ public:
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
 
+    [[nodiscard]] bool attach_hybrid_disk_tier(const std::filesystem::path& directory,
+                                               std::uint64_t capacity_bytes,
+                                               std::string fingerprint);
+
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;
     }
@@ -1406,6 +1411,18 @@ private:
 
     // Hybrid prefix cache (null in Legacy mode).
     std::unique_ptr<HybridPrefixCache> hybrid_;
+    // Disk tier (null unless --disk-kv-path enabled the hybrid disk tier).
+    std::unique_ptr<HybridDiskTier> hybrid_disk_;
+    // Staged disk block bytes landed but not yet consumed by a restore batch.
+    std::vector<HybridDiskTier::StagedBlock> staged_blocks_;
+    // Nodes whose staged bytes a landing batch is still reading.
+    std::vector<HybridDiskTier::StagedBlock> staged_inflight_;
+    // The disk tier's image/tail staging buffers a landing batch is still reading.
+    bool image_staged_inflight_ = false;
+    bool tail_staged_inflight_  = false;
+    // The snapshots those staged buffers serve; their index state marks landing.
+    runtime::prefix_cache::SnapshotRef image_staged_snapshot_;
+    runtime::prefix_cache::SnapshotRef tail_staged_snapshot_;
     std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;
     double hybrid_coalesce_wait_seconds_ = 0.0;
@@ -1461,6 +1478,9 @@ private:
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // The disk tier's share of the poll cadence: publishes completions, releases staging a
+    // landed batch no longer reads, and stages the sources the next admission will want.
+    void hybrid_disk_poll();
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
     // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
     void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);

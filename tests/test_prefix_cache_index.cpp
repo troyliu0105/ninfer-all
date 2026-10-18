@@ -31,7 +31,7 @@ void require_throws(F&& f, const std::string& message) {
     throw std::runtime_error("expected an exception: " + message);
 }
 
-class RecordingBackend final : public PrefixIndexBackend {
+class RecordingBackend : public PrefixIndexBackend {
 public:
     void release_device_block(std::uint32_t id) noexcept override {
         released.push_back(id);
@@ -1137,6 +1137,274 @@ void test_restore_plan() {
                    "a block that is its own parent must be rejected");
 }
 
+// ---- disk tier ---------------------------------------------------------------------------------
+
+std::uint64_t config_block_bytes(const PrefixCacheIndex& index) {
+    return index.config().block_bytes;
+}
+
+class DiskBackend final : public RecordingBackend {
+public:
+    void release_disk_record(std::uint32_t ref) noexcept override { disk_released.push_back(ref); }
+
+    void release_snapshot_disk_records(SnapshotRef, std::uint32_t ref,
+                                        bool committed) noexcept override {
+        snapshot_disk_released.emplace_back(ref, committed);
+    }
+
+    std::vector<std::uint32_t> disk_released;
+    std::vector<std::pair<std::uint32_t, bool>> snapshot_disk_released;
+};
+
+PrefixIndexConfig disk_config(std::uint32_t host_slabs = 64) {
+    PrefixIndexConfig config  = small_config(host_slabs);
+    config.disk_capacity_records = 64;
+    // A disk slower than H2D but far cheaper than prefill.
+    config.cost.disk_read_bytes_per_second = 2.0e9;
+    return config;
+}
+
+// A node with only a disk copy stays in the tree, keeps match candidates alive after both
+// volatile copies are gone, and surfaces disk_only_blocks/disk_read_bytes.
+void test_disk_residency_validity() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const std::vector<TokenId> tokens = make_tokens(5 * kBlockTokens, 71);
+    const std::vector<TokenId> cached(tokens.begin(), tokens.begin() + 4 * kBlockTokens);
+    const auto path                   = insert_sequence(index, backend, cached);
+    // The inserting sequence's pins go away: the path becomes evictable.
+    index.release_path(path);
+
+    // Demote blocks 0-1: mark disk-backed, then drop device and host copies.
+    index.pin_node(path[0]);
+    index.begin_node_disk_fill(path[0], 100);
+    index.mark_disk_backed(path[0], 100);
+    index.begin_node_disk_fill(path[1], 101);
+    index.mark_disk_backed(path[1], 101);
+    index.unpin_node(path[0]);
+    require(index.node(path[0]).disk == CopyState::Resident, "block 0 is disk-resident");
+    index.check_invariants();
+
+    // Device eviction of a disk-backed node loses nothing: no subtree removal.
+    require(index.evict_device_blocks(1) >= 1, "device eviction runs");
+    require(index.valid(path[0]) && index.valid(path[1]), "disk-backed nodes survive eviction");
+    require(index.stats().nodes == path.size(), "no node was lost with a disk backup");
+    index.check_invariants();
+
+    // A snapshot anchored past the disk-only blocks stays a valid candidate.
+    const SnapshotRef tap = publish_tap(index, path[3]);
+    const auto hashes     = block_lookup_hashes(tokens, {});
+    const auto match      = index.match(tokens, hashes, {}, tokens.size());
+    require(!match.candidates.empty(), "disk-backed snapshot is still a candidate");
+    const auto& candidate = match.candidates.front();
+    require(candidate.snapshot == tap, "the tap is the deepest candidate");
+    require(candidate.disk_only_blocks >= 1, "disk-only blocks are reported");
+    require(candidate.disk_read_bytes >= config_block_bytes(index),
+            "disk read bytes cover the disk-only blocks");
+    require(candidate.restore_bytes >= candidate.disk_only_blocks * config_block_bytes(index),
+            "restore bytes include disk-only blocks' H2D");
+    // Losing the last volatile copy of block 3 (unbacked) would lose the subtree; blocks 0-1's
+    // disk copies keep them in the tree regardless.
+    index.supersede(tap);
+    index.check_invariants();
+}
+
+// A complete disk closure (path, image) survives host eviction: only the host slabs yield.
+void test_disk_snapshot_closure_survives_host_eviction() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(16), backend);
+    const std::vector<TokenId> tokens = make_tokens(4 * kBlockTokens, 72);
+    const std::vector<TokenId> cached(tokens.begin(), tokens.begin() + 3 * kBlockTokens);
+    const auto path                   = insert_sequence(index, backend, cached);
+
+    // Give the tap a host image, then a disk closure.
+    const SnapshotRef tap = publish_tap(index, path[2]);
+    index.pin_snapshot(tap);
+    require(index.begin_snapshot_host_fill(tap), "host fill opens");
+    index.complete_snapshot_host_fill(tap);
+    for (const NodeRef node : path) {
+        index.pin_node(node);
+        const std::uint32_t record = 200 + static_cast<std::uint32_t>(node.index);
+        index.begin_node_disk_fill(node, record);
+        index.mark_disk_backed(node, record);
+        index.unpin_node(node);
+    }
+    index.pin_snapshot(tap);
+    index.begin_snapshot_disk_fill(tap, 300);
+    index.complete_snapshot_disk_fill(tap);
+    index.unpin_snapshot(tap);
+    require(index.snapshot(tap).disk_committed, "closure is committed");
+    index.check_invariants();
+
+    // Host pressure that once removed the snapshot now only frees its slabs: fill the small
+    // pool (16 slabs) with other blocks' host write-through until the tap's copy yields.
+    const std::vector<TokenId> other = make_tokens(24 * kBlockTokens, 73);
+    const auto other_path            = insert_sequence(index, backend, other);
+    for (const NodeRef node : other_path) {
+        index.pin_node(node);
+        if (!index.begin_host_fill(node).has_value()) {
+            index.unpin_node(node);
+            break;
+        }
+        index.complete_host_fill(node);
+        index.unpin_node(node);
+    }
+    require(index.valid(tap), "the disk-committed snapshot survives host pressure");
+    require(index.snapshot(tap).host != CopyState::Resident ||
+                index.snapshot(tap).disk == CopyState::Resident,
+            "host copy may be gone, disk closure keeps it valid");
+    const auto hashes     = block_lookup_hashes(tokens, {});
+    const auto still      = index.match(tokens, hashes, {}, tokens.size());
+    require(std::any_of(still.candidates.begin(), still.candidates.end(),
+                        [&](const MatchCandidate& candidate) {
+                            return candidate.snapshot == tap;
+                        }),
+            "snapshot remains a match candidate");
+    index.check_invariants();
+}
+
+// Restart reconstruction: parents first, anchors before snapshots, no eviction to make room.
+void test_restore_disk_reconstruction() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const std::vector<TokenId> tokens = make_tokens(3 * kBlockTokens, 74);
+    const auto hashes                 = block_lookup_hashes(tokens, {});
+
+    std::vector<NodeRef> restored;
+    NodeRef parent;
+    for (std::uint32_t b = 0; b < 3; ++b) {
+        const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+        const auto node = index.restore_disk_block(parent, hashes[b], block, 0, 400 + b);
+        require(node.has_value(), "disk block restores");
+        restored.push_back(*node);
+        parent = *node;
+    }
+    require(index.node(restored[0]).disk == CopyState::Resident &&
+                index.node(restored[0]).device == CopyState::Absent,
+            "restored blocks are disk-only");
+    const auto tap = index.restore_disk_snapshot(restored[1], 2 * kBlockTokens, {},
+                                                 SnapshotKind::Tap, 3, 500, true);
+    require(tap.has_value(), "disk snapshot restores");
+    require(index.snapshot(*tap).disk_committed && index.snapshot(*tap).hits == 3,
+            "committed snapshot carries its hits");
+    index.check_invariants();
+
+    // The reconstructed tree matches the same prompt.
+    const auto match = index.match(tokens, hashes, {}, tokens.size());
+    require(!match.candidates.empty(), "reconstructed snapshot is a candidate");
+    require(match.candidates.front().disk_only_blocks == 2,
+            "both path blocks count as disk-only");
+
+    // A duplicate restore marks the existing node disk-backed (its record survives for
+    // shared-prefix replay); a wrong parent still throws.
+    const std::span<const TokenId> block0(tokens.data(), kBlockTokens);
+    require_throws([&] {
+        // A device-only parent (no disk copy) cannot anchor a disk restore.
+        const std::vector<TokenId> device_tokens = make_tokens(kBlockTokens, 99);
+        const auto device_hash  = block_lookup_hashes(device_tokens, {}).front();
+        const InsertResult here = index.insert_block(NodeRef{}, device_hash, device_tokens, 0,
+                                                     backend.allocate());
+        const auto bad = index.restore_disk_block(here.node, hashes[0], block0, 0, 402);
+        (void)bad;
+    }, "a disk block under a disk-absent parent must be refused");
+
+    // Capacity: a full node table refuses without evicting anything.
+    PrefixIndexConfig tiny       = disk_config();
+    tiny.max_nodes               = 8;
+    tiny.disk_capacity_records   = 8;
+    DiskBackend small_backend;
+    PrefixCacheIndex small(tiny, small_backend);
+    std::vector<NodeRef> chain;
+    NodeRef chain_parent;
+    std::uint32_t placed = 0;
+    for (std::uint32_t b = 0; b < 20; ++b) {
+        const std::vector<TokenId> unique = make_tokens(kBlockTokens, 1000 + b);
+        const auto hash                   = block_lookup_hashes(unique, {}).front();
+        const auto node = small.restore_disk_block(chain_parent, hash, unique, 0, 600 + b);
+        if (!node) { break; }
+        chain_parent = *node;
+        chain.push_back(*node);
+        ++placed;
+    }
+    require(placed == 8, "capacity refuses further disk restores");
+    small.check_invariants();
+}
+
+// evict_disk_entries releases the lowest-value committed closure; shared ancestors recorded
+// once survive one branch's eviction.
+void test_disk_victim_reclamation() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const std::vector<TokenId> tokens = make_tokens(4 * kBlockTokens, 75);
+    const auto path                   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) {
+        index.pin_node(node);
+        const std::uint32_t record = 700 + static_cast<std::uint32_t>(node.index);
+        index.begin_node_disk_fill(node, record);
+        index.mark_disk_backed(node, record);
+        index.unpin_node(node);
+    }
+    const SnapshotRef first  = publish_tap(index, path[1]);
+    const SnapshotRef second = publish_tap(index, path[3]);
+    index.pin_snapshot(first);
+    index.begin_snapshot_disk_fill(first, 710);
+    index.complete_snapshot_disk_fill(first);
+    index.unpin_snapshot(first);
+    index.pin_snapshot(second);
+    index.begin_snapshot_disk_fill(second, 711);
+    index.complete_snapshot_disk_fill(second);
+    index.unpin_snapshot(second);
+
+    const std::uint32_t released = index.evict_disk_entries(1);
+    require(released == 1, "one disk closure is reclaimed");
+    require(!backend.snapshot_disk_released.empty(), "backend saw the release");
+    index.check_invariants();
+}
+
+// Demotion candidates: unpinned Host-resident snapshots without a committed disk closure,
+// lowest GDSF priority first; pinned, superseded, disk-committed and Host-absent snapshots
+// never demote.
+void test_demotion_candidates() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config();
+    config.device_snapshot_slots = 4; // three live taps must not reclaim each other's slots
+    PrefixCacheIndex index(config, backend);
+    // Three separate lineages: a deeper tap of the same lineage would supersede the shallower
+    // ones, and a superseded snapshot that loses its last pin leaves the index.
+    const SnapshotRef cold   = [&] {
+        const auto tokens = make_tokens(2 * kBlockTokens, 91);
+        const auto path   = insert_sequence(index, backend, tokens);
+        for (const NodeRef node : path) { backup_node(index, node); }
+        return publish_at(index, backend, path, tokens, 2 * kBlockTokens, SnapshotKind::Tap);
+    }();
+    const SnapshotRef warm = [&] {
+        const auto tokens = make_tokens(2 * kBlockTokens, 92);
+        const auto path   = insert_sequence(index, backend, tokens);
+        for (const NodeRef node : path) { backup_node(index, node); }
+        return publish_at(index, backend, path, tokens, 2 * kBlockTokens, SnapshotKind::Tap);
+    }();
+    const SnapshotRef pinned = [&] {
+        const auto tokens = make_tokens(2 * kBlockTokens, 93);
+        const auto path   = insert_sequence(index, backend, tokens);
+        for (const NodeRef node : path) { backup_node(index, node); }
+        return publish_at(index, backend, path, tokens, 2 * kBlockTokens, SnapshotKind::Tap);
+    }();
+    backup_snapshot(index, cold);
+    backup_snapshot(index, warm);
+    backup_snapshot(index, pinned);
+
+    index.pin_snapshot(pinned);
+    index.pin_snapshot(cold);
+    index.begin_snapshot_disk_fill(cold, 900);
+    index.complete_snapshot_disk_fill(cold);
+    index.unpin_snapshot(cold);
+
+    const auto candidates = index.collect_demotion_candidates(8);
+    require(candidates.size() == 1 && candidates[0] == warm,
+            "only the warm host snapshot is a demotion candidate");
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -1161,6 +1429,11 @@ int main() {
         test_image_only_host_tier();
         test_random_stress();
         test_tap_planner();
+        test_disk_residency_validity();
+        test_disk_snapshot_closure_survives_host_eviction();
+        test_restore_disk_reconstruction();
+        test_disk_victim_reclamation();
+        test_demotion_candidates();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

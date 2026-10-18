@@ -302,10 +302,12 @@ std::string serve_usage_text(const char* argv0) {
            "                                the pool cannot extend ends with length\n"
            "  --concurrent-prefill          admit waiting requests to free lanes while other\n"
            "                                requests prefill\n"
-           "  --disk-kv-path DIR            disk tier: evicted continuations write their KV\n"
-           "                                and states there, per artifact and profile, and\n"
-           "                                survive restarts\n"
-           "  --disk-kv-gib N               disk tier budget (default 64)\n"
+           "  --disk-kv-path DIR            disk tier: the default cache writes evicted\n"
+           "                                continuations' KV and states there, and the\n"
+           "                                hybrid prefix cache (--use-alt-prefix-caching)\n"
+           "                                demotes cold prefixes to it; both per artifact\n"
+           "                                and profile, surviving restarts\n"
+           "  --disk-kv-gib N               disk tier budget in GiB (default 64)\n"
            "  --disk-kv-restore             seed a new request's matching prefix from the\n"
            "                                disk tier\n"
            "  --disk-kv-directstorage       read restores through DirectStorage (Windows\n"
@@ -579,6 +581,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     std::optional<std::size_t> kv_headroom_mib;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
     const char* legacy_cache_flag  = nullptr;
+    // Disk-tier flags are accepted in either cache mode; Hybrid keeps its own checks below.
+    bool disk_kv_flag = false;
     const char* hybrid_option_flag = nullptr;
     bool original_cache_selected   = false;
     bool hybrid_cache_selected     = false;
@@ -884,7 +888,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--disk-kv-path") {
-            legacy_cache_flag                  = "--disk-kv-path";
+            disk_kv_flag                       = true;
             options.context_cache.disk_kv_path = require_value("--disk-kv-path");
             if (options.context_cache.disk_kv_path.empty()) {
                 throw std::invalid_argument("--disk-kv-path must not be empty");
@@ -892,6 +896,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--disk-kv-gib") {
+            disk_kv_flag = true;
             const std::uint64_t gib = parse_u64(require_value("--disk-kv-gib"), "disk-kv-gib");
             if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30U)) {
                 throw std::invalid_argument("--disk-kv-gib must be positive and in range");
@@ -900,10 +905,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--disk-kv-restore") {
+            legacy_cache_flag                = "--disk-kv-restore";
             options.context_cache.disk_kv_restore = true;
             continue;
         }
         if (arg == "--disk-kv-directstorage") {
+            legacy_cache_flag                      = "--disk-kv-directstorage";
             options.context_cache.disk_kv_directstorage = true;
             continue;
         }
@@ -1597,6 +1604,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument(std::string(legacy_cache_flag) +
                                         " configures the checkpoint catalog and cannot be "
                                         "combined with --use-alt-prefix-caching");
+        }
+        if (disk_kv_flag) {
+            const auto& cache = options.context_cache;
+            // A zero capacity keeps the documented 64 GiB default (types.h ContextCacheOptions);
+            // a capacity without a path is rejected by the shared rule below.
+            if (!cache.hybrid.persistent_file.empty()) {
+                throw std::invalid_argument(
+                    "--disk-kv-path cannot be combined with --prefix-cache-file");
+            }
+            std::error_code error;
+            if (!std::filesystem::is_directory(cache.disk_kv_path, error)) {
+                throw std::invalid_argument("--disk-kv-path " + cache.disk_kv_path.string() +
+                                            ": the directory does not exist");
+            }
         }
         if (!options.allow_prefix_reuse) {
             throw std::invalid_argument(

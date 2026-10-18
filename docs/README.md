@@ -54,10 +54,11 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
 
 ## Maintainer references
 
-The references under [`maintainer/`](maintainer/) record current architecture, model, artifact,
-and maintenance contracts. These files are not additional user workflows or installed API
-documentation. Several of them (engine architecture, artifact container, paged KV, ReplaySSM,
-resource scheduling) are written in Chinese, as upstream wrote them.
+The references under [`maintainer/`](maintainer/) record architecture, model, artifact, and
+maintenance contracts; proposed extensions carry an explicit status. These files are not
+additional user workflows or installed API documentation. Several of them (engine architecture,
+artifact container, paged KV, ReplaySSM, resource scheduling) are written in Chinese, as upstream
+wrote them.
 
 [Engine architecture](maintainer/engine-architecture.md) is the single top-level reference. The
 other references own narrower contracts:
@@ -76,6 +77,7 @@ other references own narrower contracts:
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |
 | [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | the default prefix cache of `ninfer-serve`: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
+| [Hybrid disk tier](maintainer/hybrid-prefix-cache-disk-tier.md) | the Hybrid cache's disk tier: Host demotion, three-tier residency, restart reconstruction, bounded asynchronous preparation and performance qualification |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |

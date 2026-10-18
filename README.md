@@ -327,10 +327,11 @@ Prefill of a 4,463-token prompt, in tok/s:
   (`--rope-yarn`, for Qwen3.5, Qwen3.8-Flash-Next and Gemma 4; Flint's full-attention blocks carry
   no rotation and take no scaling).
 - A hybrid prefix cache by default, which shares content-addressed KV blocks and sparse state
-  snapshots across requests on the device and in pinned host memory; or a checkpoint catalog
-  (`--use-original-prefix-caching`) with an optional disk tier that survives restarts
-  (`--disk-kv-path`, `--disk-kv-restore`) and endpoint and branch anchors that let an edited or
-  regenerated turn resume where it left the conversation.
+  snapshots across requests on the device and in pinned host memory, with its own disk tier
+  (`--disk-kv-path`, `--disk-kv-gib`) that demotes cold prefixes and reconstructs them after a
+  restart; or a checkpoint catalog (`--use-original-prefix-caching`) with an optional disk tier
+  that survives restarts (`--disk-kv-path`, `--disk-kv-restore`) and endpoint and branch anchors
+  that let an edited or regenerated turn resume where it left the conversation.
 - Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
   ([quality trades](docs/maintainer/quality-trade-experiments.md)).
 
