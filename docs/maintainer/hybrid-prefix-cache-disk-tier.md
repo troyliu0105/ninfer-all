@@ -160,12 +160,17 @@ MiB it needs — the plan's own `min_budget_bytes` (image segments, tail payload
 one block payload), never a re-derived approximation. Disk capacity is not part of the Host
 budget: the catalog's byte capacity stays real bytes.
 
-The current node bound derives from Device pages plus Host slabs in
-[`create_hybrid_prefix_cache`](../../src/models/qwen3_5/program/prefix/hybrid_program.cpp).
-Disk-only entries invalidate that bound. Derive representable metadata limits from the new
-capacity plan and report their RAM cost. Reaching a limit must reject new retention, not overflow
-an arena or fail an otherwise executable request. Hot victim selection must not scan the entire
-cold catalog as the disk tier grows.
+The node and snapshot descriptor bounds derive from the capacity plan in
+[`create_hybrid_prefix_cache`](../../src/models/qwen3_5/program/prefix/hybrid_program.cpp):
+Device pages plus Host slabs plus, with the tier enabled, the record budgets of
+[`plan_hybrid_disk_records`](../../src/models/qwen3_5/program/prefix/hybrid_host_layout.cpp) —
+one block record per disk-only node and `image_slabs` image segments per committed closure, the
+catalog Store's own arithmetic, with representability (kNoId/2) rejected at startup. A full disk
+tier can therefore never exhaust the index: `insert_block`'s capacity invariant remains a canary
+for descriptor leaks, not a runtime bound, and every restore or publication path already degrades
+(skip or evict) at its own capacity. The descriptors cost host RAM proportional to the tier's
+record count (about 0.5 KiB per node slot, tokens and links included). Hot victim selection must
+not scan the entire cold catalog as the disk tier grows.
 
 ## 4. Host pressure and asynchronous demotion
 

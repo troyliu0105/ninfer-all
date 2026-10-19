@@ -87,4 +87,32 @@ HybridDiskStagingPlan plan_hybrid_disk_staging(const HybridHostLayout& layout,
     return plan;
 }
 
+HybridDiskBudget hybrid_disk_budget(std::uint64_t capacity_bytes) {
+    if (capacity_bytes == 0) { capacity_bytes = std::uint64_t{64} << 30U; }
+    HybridDiskBudget budget;
+    budget.block_bytes = capacity_bytes / 2U;
+    budget.image_bytes = capacity_bytes - budget.block_bytes;
+    return budget;
+}
+
+HybridDiskRecords plan_hybrid_disk_records(const HybridHostLayout& layout,
+                                           std::uint64_t capacity_bytes) {
+    HybridDiskRecords records;
+    if (layout.block_payload_bytes == 0 || layout.slab_bytes == 0 || layout.image_slabs == 0) {
+        throw std::logic_error("hybrid Host layout is empty");
+    }
+    // The index represents at most kNoId/2 of either descriptor; the same bound its constructor
+    // enforces, so the caller can sum the residencies without a second representability rule.
+    const std::uint64_t representable = std::numeric_limits<std::uint32_t>::max() / 2U;
+    const HybridDiskBudget budget     = hybrid_disk_budget(capacity_bytes);
+    const std::uint64_t blocks = budget.block_bytes / layout.block_payload_bytes;
+    const std::uint64_t images = budget.image_bytes / layout.slab_bytes / layout.image_slabs;
+    if (blocks > representable || images > representable) {
+        throw std::overflow_error("hybrid disk record capacity is not representable");
+    }
+    records.blocks = static_cast<std::uint32_t>(blocks);
+    records.images = static_cast<std::uint32_t>(images);
+    return records;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

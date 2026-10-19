@@ -40,7 +40,8 @@ namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
 
-// The index's disk-side accounting bound; the catalog owns the real byte capacity.
+// Marks the index's disk side enabled (restore entry points and reclamation accept it); the
+// catalog owns the real byte capacities and plan_hybrid_disk_records the descriptor budget.
 constexpr std::uint32_t kDiskCapacityRecords = 4096U;
 
 // Blocks one prefetch batch copies (§6.6): about 20 ms of PCIe for 27B INT8, the longest a quote
@@ -119,9 +120,33 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
         throw std::logic_error("hybrid prefix cache options are not normalized");
     }
     pc::PrefixIndexConfig config;
-    // Every node holds a Device page bundle or a Host slab.
-    config.max_nodes             = text_pool.capacity_pages() + slabs + 1U;
-    config.max_snapshots         = device_slots + slabs / host.image_slabs + 1U;
+    // A node descriptor backs a Device page bundle, a Host slab or — with the disk tier — one
+    // catalog block record; a snapshot descriptor a Device slot, a Host image or a committed
+    // disk closure. The tier's record budgets are the third residency's bound, so a full disk
+    // tier can never exhaust the index and `insert_block`'s capacity invariant stays a canary.
+    std::uint64_t max_nodes =
+        static_cast<std::uint64_t>(text_pool.capacity_pages()) + slabs + 1U;
+    std::uint64_t max_snapshots =
+        static_cast<std::uint64_t>(device_slots) + slabs / host.image_slabs + 1U;
+    if (!context_cache.disk_kv_path.empty()) {
+        HybridDiskRecords records;
+        try {
+            records = plan_hybrid_disk_records(host, context_cache.disk_kv_capacity_bytes);
+        } catch (const std::overflow_error&) {
+            throw std::invalid_argument(
+                "the hybrid prefix cache index cannot represent this configuration's cache "
+                "capacity; lower --kv-capacity, --host-cache-mib or --disk-kv-gib");
+        }
+        max_nodes += records.blocks;
+        max_snapshots += records.images;
+    }
+    if (max_nodes > pc::kNoId / 2U || max_snapshots > pc::kNoId / 2U) {
+        throw std::invalid_argument(
+            "the hybrid prefix cache index cannot represent this configuration's cache "
+            "capacity; lower --kv-capacity, --host-cache-mib or --disk-kv-gib");
+    }
+    config.max_nodes             = static_cast<std::uint32_t>(max_nodes);
+    config.max_snapshots         = static_cast<std::uint32_t>(max_snapshots);
     config.host_slabs            = slabs;
     config.image_slabs           = host.image_slabs;
     config.device_snapshot_slots = device_slots;
@@ -183,12 +208,12 @@ bool ProgramImpl::attach_hybrid_disk_tier(const std::filesystem::path& directory
     // A construction failure (unusable directory) throws instead.
     HybridDiskTier::Options options;
     options.directory     = directory;
-    // Zero keeps the documented 64 GiB default (ContextCacheOptions).
-    capacity_bytes = capacity_bytes != 0 ? capacity_bytes : (std::uint64_t{64} << 30U);
     // The bounded catalog splits its capacity between block records and image parts; the disk
-    // capacity is real bytes and is not part of the Host budget.
-    options.block_capacity_bytes = capacity_bytes / 2U;
-    options.image_capacity_bytes = capacity_bytes - options.block_capacity_bytes;
+    // capacity is real bytes and is not part of the Host budget. The same split sizes the
+    // index's descriptors in create_hybrid_prefix_cache, so the two can never drift.
+    const HybridDiskBudget disk = hybrid_disk_budget(capacity_bytes);
+    options.block_capacity_bytes = disk.block_bytes;
+    options.image_capacity_bytes = disk.image_bytes;
     options.staging_blocks       = hybrid_disk_staging_blocks_;
     hybrid_disk_ = std::make_unique<HybridDiskTier>(std::move(options),
                                                     hybrid_->host_layout(), std::move(fingerprint));

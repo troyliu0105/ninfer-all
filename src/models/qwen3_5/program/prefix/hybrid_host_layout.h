@@ -60,4 +60,26 @@ struct HybridDiskStagingPlan {
 [[nodiscard]] HybridDiskStagingPlan plan_hybrid_disk_staging(const HybridHostLayout& layout,
                                                              std::uint64_t budget_bytes);
 
+// How the tier's byte capacity splits between block records and image records. Zero resolves to
+// the documented 64 GiB default (ContextCacheOptions); attach_hybrid_disk_tier and the index's
+// descriptor sizing both resolve their split through this function.
+struct HybridDiskBudget {
+    std::uint64_t block_bytes = 0;
+    std::uint64_t image_bytes = 0; // the remainder, so odd capacities favor images
+};
+
+[[nodiscard]] HybridDiskBudget hybrid_disk_budget(std::uint64_t capacity_bytes);
+
+// Index descriptor capacity the disk tier adds (disk-tier design §3 budgets: disk-only entries
+// occupy index capacity). A node whose only copy is a disk record holds one block-store slot; a
+// disk-committed snapshot closure holds `image_slabs` image-store segments — the catalog Store's
+// own arithmetic, so a full tier can never exhaust the index's node or snapshot slots.
+struct HybridDiskRecords {
+    std::uint32_t blocks = 0; // block records the block half holds
+    std::uint32_t images = 0; // snapshot closures the image half holds
+};
+
+[[nodiscard]] HybridDiskRecords plan_hybrid_disk_records(const HybridHostLayout& layout,
+                                                         std::uint64_t capacity_bytes);
+
 } // namespace ninfer::models::qwen3_5::detail
