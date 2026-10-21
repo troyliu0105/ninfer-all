@@ -695,7 +695,12 @@ def _vision_format(name: str) -> str:
     return Q5
 
 
-def _vision_source(model, sources):
+def vision_source(model, sources):
+    """The `vision` source as HF names: an mmproj GGUF through the model's vision name map.
+
+    Imported lazily so a conversion that does not read a GGUF needs no gguf-py.
+    """
+
     from .sources.gguf_source import GGUFSource, HFAliasSource, qwen35_vision_name_map
 
     mmproj = sources["vision"]
@@ -717,7 +722,7 @@ def _vision_source(model, sources):
 def _companions(model, recipe, sources) -> None:
     """Vision from the mmproj GGUF in the official formats; DFlash2 as the official recipe."""
 
-    vision = _vision_source(model, sources) if "vision" in model.components else None
+    vision = vision_source(model, sources) if "vision" in model.components else None
     for name, parameter in model.parameters.items():
         if name.startswith("vision/"):
             source = model.source(name, vision)
@@ -864,6 +869,7 @@ __all__ = [
     "expected_tensors",
     "gdn_control_source",
     "has_mtp",
+    "vision_source",
     "qwen3_5_2b_gguf",
     "qwen3_8_27b_gguf",
     "q2_native_source",

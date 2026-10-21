@@ -265,7 +265,9 @@ Prefill of a 4,463-token prompt, in tok/s:
   runs from `t2_g128_fp16` weights: 2.125 bits per weight, imported without rounding, with the
   Hadamard rotations fused into the norms and gates and integer activations for its projections.
   The `bonsai2_27b_ternary` recipe adds ProCreations' MTP head and DFlash2 adapter and an exact
-  proposal head.
+  proposal head, and converts both of PrismML's mixes (its default PQ2_0 mix stores the head and
+  token table under Q4_K/Q6_K); `tools.convert.split_mtp` separates an MTP block that travelled
+  inside the model GGUF.
 - **Qwen3.8-Flash-Next.** The 125B-parameter MoE (512 experts, about 6B active) from the GSQ-RCO
   GGUF releases, with its experts on the GPUs, in pinned host memory with a GPU cache
   (`--expert-residency host`) or in the artifact's files read into a GPU cache

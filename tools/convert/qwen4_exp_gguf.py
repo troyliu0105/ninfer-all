@@ -34,7 +34,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 from .gguf_blocks import (
     GGML_Q8_0,
     _dequantize,
-    _vision_source,
+    vision_source,
     block_format,
     block_source,
     dequantize_q8_0,
@@ -713,7 +713,7 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         else:
             raise ValueError("--source mtp must name an MTP GGUF or HF safetensors subset")
     if "vision" in model.components:
-        vision = _vision_source(model, sources)
+        vision = vision_source(model, sources)
         for name, parameter in model.parameters.items():
             if name.startswith("vision/"):
                 formats[name] = parameter.direct_format

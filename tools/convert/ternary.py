@@ -10,18 +10,40 @@ is stored the same way, inverse-rotated; the runtime restores each gathered row 
 hidden-width signs. MTP, Vision, the frontend resources and the DFlash2 adapter come from the
 companions given to `--model` and `--source dflash2`, which share the geometry; `--source mtp`
 replaces the checkpoint's MTP head.
+
+PrismML's quantizer also ships its own default mix of the same model: the same weights in other
+words. `validate` accepts it and `stored_ternary_source` / `control_source` read it:
+
+* the output head and the token table keep their ternary codes under a larger ggml block type
+  (Q6_K and Q4_K in the mixes seen), because the quantizer applies its output-tensor and
+  token-embedding types to those two matrices;
+* the GDN A/B controls are quantized with the main type (PQ2_0) instead of being left BF16.
+
+Nothing else differs, and both forms convert to the same artifact: decoding a larger block type
+recovers the codes exactly and each per-128 scale to within that block format's own rounding,
+and a ternary-quantized control projection is imported at the artifact's BF16 control format. A
+weight the quantizer stored at its `+2` level has no T2 code at all (the artifact's 2-bit codes
+are two's complement); the one output-head row of the releases seen that uses it is stored at `+1`
+and the conversion reports the count.
 """
 
 from __future__ import annotations
 
 from typing import Callable
+import warnings
 
 import numpy as np
 import torch
 
 from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, _optional
-from .sources.gguf import GGUFFile
+from .sources.gguf import (
+    BLOCK_FORMATS,
+    TERNARY_GROUP,
+    TYPE_NAMES,
+    GGUFFile,
+    TernaryBlocks,
+)
 from .sources.logical import EncodedRows, LogicalSource, array_source
 
 T2 = "t2_g128_fp16"
@@ -53,6 +75,26 @@ GDN_CHANNELS = 2 * GDN_KEY_DIM + GDN_VALUE_DIM
 GDN_TAPS = 4
 HADAMARD_BLOCK = 1024
 SIGN_WIDTHS = (HIDDEN, ATTENTION_QUERY_ROWS, INTERMEDIATE)
+
+# GGUF type names that hold ternary rows, and the ggml block types that may hold the same rows
+# under a larger block (the quantizer's own output-tensor and token-embedding types).
+TERNARY_STORAGE = frozenset(("PQ2_0", "PTQ1_0"))
+BLOCK_STORAGE = frozenset(TYPE_NAMES[type_id] for type_id in BLOCK_FORMATS)
+# The two ternary matrices the quantizer re-encodes, and the A/B controls it quantizes.
+MATRIX_STORAGE = {
+    "output.weight": TERNARY_STORAGE | BLOCK_STORAGE,
+    "token_embd.weight": TERNARY_STORAGE | BLOCK_STORAGE,
+}
+CONTROL_STORAGE = frozenset(("BF16",)) | TERNARY_STORAGE
+# The quantizer's 2-bit codes are offset binary: 0, 1, 2 and 3 decode to -1, 0, +1 and +2 times a
+# group's fp16 scale. The artifact's T2 codes are two's complement: -2, -1, 0 and +1. A group whose
+# weights use the +2 level therefore has no exact T2 form.
+TERNARY_LEVELS = (-2, -1, 0, 1)
+# A stored group must sit within this share of its scale from one of those levels, or from the
+# quantizer's +2 level; the block formats seen deviate by under 2%.
+TERNARY_RESIDUAL = 0.25
+# Validation decodes this many rows of a matrix stored under a larger block type.
+TERNARY_SAMPLE_ROWS = 64
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -117,8 +159,80 @@ def expected_tensors() -> dict[str, tuple[tuple[int, ...], str]]:
     return out
 
 
+def _accepted_storage(name: str, kind: str) -> frozenset[str]:
+    """The GGUF types this recipe reads for one canonical role."""
+
+    if name in MATRIX_STORAGE:
+        return MATRIX_STORAGE[name]
+    if kind == "BF16" and name.endswith(("ssm_alpha.weight", "ssm_beta.weight")):
+        return CONTROL_STORAGE
+    return frozenset((kind,))
+
+
+def stored_ternary(values: np.ndarray) -> tuple[TernaryBlocks, int]:
+    """The T2 rows of a ternary matrix another block format stored, and how many weights lost a level.
+
+    The quantizer writes the output-tensor and token-embedding types of its default mix as ggml
+    blocks over an already ternary matrix, so decoding those blocks recovers the codes exactly and
+    each group's scale to within the block format's own rounding. A group whose weights use the
+    quantizer's `+2` level has no exact T2 form (see ``TERNARY_LEVELS``): it keeps the magnitude
+    most of its weights share -- its largest or its median nonzero magnitude, whichever fits the
+    group better -- and its `+2` weights are stored at `+1`, which the second return value counts.
+    Anything else in such a block is refused rather than silently re-quantized.
+    """
+
+    matrix = np.asarray(values, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[1] % TERNARY_GROUP:
+        raise ValueError(f"a ternary matrix needs whole {TERNARY_GROUP}-column groups")
+    if not np.isfinite(matrix).all():
+        raise ValueError("a ternary matrix holds no non-finite values")
+    groups = matrix.reshape(matrix.shape[0], -1, TERNARY_GROUP)
+    magnitudes = np.abs(groups)
+    ordered = np.sort(np.where(magnitudes > 0, magnitudes, np.inf), axis=-1)
+    counts = np.sum(np.isfinite(ordered), axis=-1)
+    median = np.take_along_axis(
+        ordered, np.maximum((counts - 1) // 2, 0)[..., None], axis=-1
+    )[..., 0]
+    median = np.where(counts > 0, median, np.float32(0.0))
+    best: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    for scale in (magnitudes.max(-1), median):
+        divisor = np.maximum(scale, np.float32(1e-30))
+        codes = np.clip(
+            np.rint(groups / divisor[..., None]), TERNARY_LEVELS[0], TERNARY_LEVELS[-1]
+        )
+        error = np.square(groups - codes * scale[..., None]).sum(-1)
+        if best is None:
+            best = (error, scale, codes)
+            continue
+        better = error < best[0]
+        best = (
+            np.where(better, error, best[0]),
+            np.where(better, scale, best[1]),
+            np.where(better[..., None], codes, best[2]),
+        )
+    assert best is not None
+    _, scale, codes = best
+    divisor = np.maximum(scale, np.float32(1e-30))
+    residual = np.abs(groups - codes * scale[..., None])
+    # A value may also sit at the quantizer's +2 level, which the artifact stores at +1.
+    allowed = np.minimum(residual, np.abs(groups - 2.0 * scale[..., None]))
+    limit = np.float32(TERNARY_RESIDUAL) * divisor[..., None]
+    if not np.all(allowed <= limit):
+        worst = float((allowed / limit)[allowed > limit].max()) * TERNARY_RESIDUAL
+        raise ValueError(
+            f"the stored values are not a ternary matrix: a group deviates from its codes by "
+            f"{worst:.3f} of its scale, over {TERNARY_RESIDUAL}"
+        )
+    clipped = int(np.count_nonzero(np.rint(groups / divisor[..., None]) > TERNARY_LEVELS[-1]))
+    return TernaryBlocks(codes.astype(np.int8), scale.astype(np.float16)), clipped
+
+
 def validate(gguf: GGUFFile) -> None:
-    """Refuse any GGUF that is not the registered ternary Bonsai 2 27B layout."""
+    """Refuse any GGUF that is not the registered ternary Bonsai 2 27B layout.
+
+    The quantizer's own default mix of that layout is accepted too: it stores the token table and
+    the output head under a larger ggml block type and the GDN A/B controls as ternary rows.
+    """
 
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
@@ -157,8 +271,20 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if info.shape != shape or info.type_name != kind:
+        if info.shape != shape:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+        accepted = _accepted_storage(name, kind)
+        if info.type_name not in accepted:
+            raise ValueError(
+                f"{gguf.path}: {name} is stored as {info.type_name}; this recipe reads "
+                f"{', '.join(sorted(accepted))}"
+            )
+    for name in MATRIX_STORAGE:
+        info = gguf.tensors[name]
+        if info.type_name in TERNARY_STORAGE:
+            continue
+        # A larger block type must still hold this matrix's ternary rows.
+        stored_ternary(gguf.read_dequantized(name, 0, min(TERNARY_SAMPLE_ROWS, info.shape[0])))
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
         raise ValueError(f"{gguf.path}: the data section is truncated")
@@ -275,6 +401,85 @@ def _direct(values: np.ndarray, dtype: torch.dtype, label: str) -> LogicalSource
     return array_source(torch.from_numpy(np.ascontiguousarray(values)).to(dtype), label)
 
 
+def stored_ternary_source(
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+) -> LogicalSource:
+    """Ternary rows a larger block type stored, as encoded T2 rows.
+
+    The codes come back exactly and each scale to within the block format's own rounding, so the
+    artifact keeps the registered T2 rows and the runtime's per-gather restore; see
+    ``stored_ternary``, which also reports the weights of the quantizer's `+2` level that the T2
+    codes cannot hold.
+    """
+
+    columns = shape[1]
+    kind = gguf.info(tensor).type_name
+    reported = False
+
+    def stored(row_begin: int, row_end: int) -> TernaryBlocks:
+        nonlocal reported
+        values = gguf.read_dequantized(tensor, row_begin, row_end)
+        blocks, clipped = stored_ternary(values.reshape(row_end - row_begin, columns))
+        if clipped and not reported:
+            reported = True
+            warnings.warn(
+                f"{tensor}: {clipped} weights of this piece use the quantizer's +2 level, which "
+                "the artifact's t2_g128_fp16 codes cannot hold; they are stored at +1 of their "
+                "group's scale",
+                stacklevel=2,
+            )
+        return blocks
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        index = select(begin, end)
+        low, high = int(index.min()), int(index.max()) + 1
+        blocks = stored(low, high)
+        return EncodedRows(
+            T2,
+            torch.from_numpy(np.ascontiguousarray(blocks.values[index - low])),
+            torch.from_numpy(np.ascontiguousarray(blocks.scales[index - low])),
+        )
+
+    def values(first: int, last: int) -> torch.Tensor:
+        words = encoded(first, last)
+        return words.codes.float() * words.scales.float().unsqueeze(-1)
+
+    return LogicalSource(
+        shape, f"{tensor}{list(shape)} ({kind} ternary rows)", _flat(values, columns), encoded
+    )
+
+
+def ternary_matrix(
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int]
+) -> LogicalSource:
+    """The registered T2 rows of a ternary matrix, whatever block type stored them."""
+
+    if gguf.info(tensor).type_name in TERNARY_STORAGE:
+        return ternary_source(gguf, tensor, shape, rows())
+    return stored_ternary_source(gguf, tensor, shape, rows())
+
+
+def control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
+    """A GDN A/B control projection at the artifact's BF16 format, grouped order restored.
+
+    The registered layout stores these BF16; the quantizer's default mix quantizes them with the
+    main type instead, so their ternary rows are decoded first. Either way BF16 is the artifact's
+    format, which rounds a decoded scale to its eight mantissa bits.
+    """
+
+    info = gguf.info(tensor)
+    if info.type_name == "BF16":
+        words = untile(gguf.read_bf16_words(tensor), 1)
+        values = torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
+            torch.bfloat16
+        )
+        return array_source(values, tensor)
+    blocks = gguf.read_ternary(tensor)
+    decoded = blocks.values.astype(np.float32) * blocks.scales.astype(np.float32)[:, :, None]
+    grouped = untile(decoded.reshape(info.shape), 1)
+    return array_source(torch.from_numpy(grouped).to(torch.bfloat16), tensor)
+
+
 def _norm(gguf: GGUFFile, tensor: str, offset: bool) -> LogicalSource:
     words = gguf.read_direct(tensor).astype(np.float32)
     return _direct(words - 1.0 if offset else words, torch.bfloat16, tensor)
@@ -286,12 +491,12 @@ def text_sources(
     """Encoded T2 sources and direct sources of every GGUF-backed text parameter."""
 
     encoded = {
-        "text/output_head": ternary_source(
-            gguf, "output.weight", (VOCABULARY, HIDDEN), rows()
+        "text/output_head": ternary_matrix(
+            gguf, "output.weight", (VOCABULARY, HIDDEN)
         ),
         # Stored inverse-rotated: the runtime restores each gathered row as s * FWHT(z).
-        "text/token_embedding": ternary_source(
-            gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
+        "text/token_embedding": ternary_matrix(
+            gguf, "token_embd.weight", (VOCABULARY, HIDDEN)
         ),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
@@ -354,13 +559,7 @@ def text_sources(
             ("a_projection", "ssm_alpha.weight"),
             ("b_projection", "ssm_beta.weight"),
         ):
-            words = untile(gguf.read_bf16_words(g + tensor), 1)
-            direct[d + role] = array_source(
-                torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
-                    torch.bfloat16
-                ),
-                g + tensor,
-            )
+            direct[d + role] = control_source(gguf, g + tensor)
         ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
@@ -399,6 +598,16 @@ def bonsai2_27b_ternary(model, recipe, sources):
     validate(gguf)
     signs = sign_vectors(gguf)
     _optional(model, recipe)
+    if "vision" in model.components and "vision" in sources:
+        # A conversion that keeps only the checkpoint's config and tokenizer carries no vision
+        # weights; the release's mmproj GGUF holds them under the same model.visual.* names. The
+        # formats _optional chose above stay, only the byte source changes.
+        from .gguf_blocks import vision_source
+
+        vision = vision_source(model, sources)
+        for name in model.parameters:
+            if name.startswith("vision/"):
+                recipe.assign(name, source=model.source(name, vision))
     # Against a 2.125-bit target, a Q8 drafter is a large share of every draft step's bytes, so the
     # DFlash2 adapter's feature, output and MLP projections take Q4 (its dynamic-convolution kernel
     # projections and the candidate selector keep the formats _optional gives them).
@@ -440,12 +649,19 @@ def bonsai2_27b_ternary(model, recipe, sources):
 RECIPES = {"bonsai2_27b_ternary": bonsai2_27b_ternary}
 
 __all__ = [
+    "CONTROL_STORAGE",
     "EXPECTED_HEADER",
+    "MATRIX_STORAGE",
     "RECIPES",
+    "TERNARY_STORAGE",
     "attention_rows",
     "bonsai2_27b_ternary",
+    "control_source",
     "expected_tensors",
     "sign_vectors",
+    "stored_ternary",
+    "stored_ternary_source",
+    "ternary_matrix",
     "ternary_source",
     "text_sources",
     "tiled_to_grouped_permutation",

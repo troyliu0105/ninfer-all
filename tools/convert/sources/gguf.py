@@ -170,7 +170,12 @@ class _Cursor:
 
 
 class GGUFFile:
-    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes."""
+    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes.
+
+    ``kv`` and ``tensors`` hold the decoded header; ``kv_spans`` and ``tensor_spans`` hold each
+    entry's byte span in the header, so a tool that rewrites a subset of the file can copy the
+    untouched entries verbatim instead of re-encoding them.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -188,22 +193,33 @@ class GGUFFile:
         (tensor_count,) = cursor.unpack("Q")
         (kv_count,) = cursor.unpack("Q")
         kv: dict[str, Any] = {}
+        kv_spans: dict[str, tuple[int, int]] = {}
         for _ in range(kv_count):
+            begin = cursor.position
             key = cursor.string()
             (type_id,) = cursor.unpack("I")
             kv[key] = cursor.value(type_id)
+            kv_spans[key] = (begin, cursor.position)
         tensors: dict[str, TensorInfo] = {}
+        tensor_spans: dict[str, tuple[int, int, int]] = {}
         for _ in range(tensor_count):
+            begin = cursor.position
             name = cursor.string()
             (rank,) = cursor.unpack("I")
             dims = cursor.unpack("Q" * rank)
             (type_id,) = cursor.unpack("I")
+            offset_at = cursor.position
             (offset,) = cursor.unpack("Q")
             if name in tensors:
                 raise ValueError(f"{self.path}: duplicate tensor {name}")
             # GGUF lists the fastest dimension first; NInfer shapes are row-major.
             tensors[name] = TensorInfo(name, tuple(reversed(dims)), type_id, offset)
+            tensor_spans[name] = (begin, cursor.position, offset_at)
         self.kv = kv
+        # Each header entry's byte span and, for a tensor, the position of its data offset field.
+        # A file that re-lays a subset of the tensors (the MTP split) splices these bytes.
+        self.kv_spans = kv_spans
+        self.tensor_spans = tensor_spans
         self.tensors = tensors
         self.alignment = int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
         self.header_bytes = cursor.position
@@ -302,7 +318,10 @@ class GGUFFile:
     def read_ternary(
         self, name: str, row_begin: int = 0, row_end: int | None = None
     ) -> TernaryBlocks:
-        """Decode rows ``[row_begin, row_end)`` of a PQ2_0 or PTQ1_0 matrix."""
+        """Decode rows ``[row_begin, row_end)`` of a PQ2_0 or PTQ1_0 matrix.
+
+        The rows are flattened matrix-major, as in ``read_blocks``.
+        """
 
         info = self.info(name)
         if info.type_id not in TERNARY_TYPES:
@@ -317,6 +336,34 @@ class GGUFFile:
         if info.type_id == TYPE_PQ2_0:
             return decode_pq2_0(blocks)
         return decode_ptq1_0(blocks)
+
+    def read_dequantized(
+        self, name: str, row_begin: int = 0, row_end: int | None = None
+    ) -> np.ndarray:
+        """Rows ``[row_begin, row_end)`` of a stored block matrix as float32 values.
+
+        Other NInfer readers decode their blocks themselves, but a stored ggml block type is read
+        through the ``gguf`` package's reference decoder (the layouts are intricate and easy to get
+        subtly wrong), so this one read needs gguf-py installed. ggml Q2_0 predates that package
+        and falls back to the equivalent decoder beside the GGUF block recipe.
+        """
+
+        info = self.info(name)
+        if info.type_id not in BLOCK_FORMATS:
+            raise ValueError(f"{name}: {info.type_name} is not a stored block format")
+        rows = self.read_blocks(name, row_begin, row_end)
+        if info.type_name == "Q2_0":
+            from .gguf_blocks import dequantize_q2_0
+
+            return dequantize_q2_0(rows)
+        try:
+            import gguf
+        except ImportError as error:  # pragma: no cover - environment guard
+            raise ImportError(
+                "reading a stored block format requires the 'gguf' package: pip install gguf"
+            ) from error
+        values = gguf.dequantize(rows, gguf.GGMLQuantizationType(info.type_id))
+        return np.ascontiguousarray(values.reshape(rows.shape[0], -1))
 
 
 def decode_pq2_0(blocks: np.ndarray) -> TernaryBlocks:
@@ -444,6 +491,56 @@ def encode_ptq1_0(values: np.ndarray, scales: np.ndarray) -> np.ndarray:
     )
 
 
+def encode_kv_value(value: Any) -> bytes:
+    """Encode one GGUF header value, type tag included, by Python type.
+
+    ``bool``, ``int`` (int32 unless it does not fit, then uint64), ``float`` (float32), ``str``;
+    lists must be homogeneous.
+    """
+
+    if isinstance(value, bool):
+        return struct.pack("<I?", _TYPE_BOOL, value)
+    if isinstance(value, int):
+        if -(2**31) <= value < 2**31:
+            return struct.pack("<Ii", _TYPE_INT32, value)
+        return struct.pack("<IQ", 10, value)
+    if isinstance(value, float):
+        return struct.pack("<If", _TYPE_FLOAT32, value)
+    if isinstance(value, str):
+        data = value.encode("utf-8")
+        return struct.pack("<IQ", _TYPE_STRING, len(data)) + data
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("empty GGUF arrays are not written by this helper")
+        first = value[0]
+        if isinstance(first, bool):
+            element = _TYPE_BOOL
+            body = struct.pack("<" + "?" * len(value), *value)
+        elif isinstance(first, int):
+            element = _TYPE_INT32
+            body = struct.pack("<" + "i" * len(value), *value)
+        elif isinstance(first, float):
+            element = _TYPE_FLOAT32
+            body = struct.pack("<" + "f" * len(value), *value)
+        elif isinstance(first, str):
+            element = _TYPE_STRING
+            body = b"".join(
+                struct.pack("<Q", len(item.encode("utf-8"))) + item.encode("utf-8")
+                for item in value
+            )
+        else:
+            raise TypeError(f"unsupported GGUF array element {type(first)!r}")
+        return struct.pack("<IIQ", _TYPE_ARRAY, element, len(value)) + body
+    raise TypeError(f"unsupported GGUF value {type(value)!r}")
+
+
+def encode_kv_entry(key: str, value: Any) -> bytes:
+    """Encode one ``key value`` GGUF header entry, as the header lays it out."""
+
+    key_bytes = key.encode("utf-8")
+    return struct.pack("<Q", len(key_bytes)) + key_bytes + encode_kv_value(value)
+
+
 def write_gguf(
     path: str | Path,
     kv: dict[str, Any],
@@ -457,49 +554,11 @@ def write_gguf(
     then uint64), ``float`` (float32), ``str``; lists must be homogeneous.
     """
 
-    def encode_value(value: Any) -> bytes:
-        if isinstance(value, bool):
-            return struct.pack("<I?", _TYPE_BOOL, value)
-        if isinstance(value, int):
-            if -(2**31) <= value < 2**31:
-                return struct.pack("<Ii", _TYPE_INT32, value)
-            return struct.pack("<IQ", 10, value)
-        if isinstance(value, float):
-            return struct.pack("<If", _TYPE_FLOAT32, value)
-        if isinstance(value, str):
-            data = value.encode("utf-8")
-            return struct.pack("<IQ", _TYPE_STRING, len(data)) + data
-        if isinstance(value, (list, tuple)):
-            if not value:
-                raise ValueError("empty GGUF arrays are not written by this helper")
-            first = value[0]
-            if isinstance(first, bool):
-                element = _TYPE_BOOL
-                body = struct.pack("<" + "?" * len(value), *value)
-            elif isinstance(first, int):
-                element = _TYPE_INT32
-                body = struct.pack("<" + "i" * len(value), *value)
-            elif isinstance(first, float):
-                element = _TYPE_FLOAT32
-                body = struct.pack("<" + "f" * len(value), *value)
-            elif isinstance(first, str):
-                element = _TYPE_STRING
-                body = b"".join(
-                    struct.pack("<Q", len(item.encode("utf-8"))) + item.encode("utf-8")
-                    for item in value
-                )
-            else:
-                raise TypeError(f"unsupported GGUF array element {type(first)!r}")
-            return struct.pack("<IIQ", _TYPE_ARRAY, element, len(value)) + body
-        raise TypeError(f"unsupported GGUF value {type(value)!r}")
-
     header = bytearray()
     header += GGUF_MAGIC
     header += struct.pack("<IQQ", GGUF_VERSION, len(tensors), len(kv))
     for key, value in kv.items():
-        key_bytes = key.encode("utf-8")
-        header += struct.pack("<Q", len(key_bytes)) + key_bytes
-        header += encode_value(value)
+        header += encode_kv_entry(key, value)
     offset = 0
     payloads: list[bytes] = []
     for name, shape, type_id, raw in tensors:
@@ -529,6 +588,7 @@ def write_gguf(
 __all__ = [
     "BLOCK_GEOMETRY",
     "DEFAULT_ALIGNMENT",
+    "GGUF_MAGIC",
     "GGUFFile",
     "TERNARY_GROUP",
     "TERNARY_TYPES",
@@ -544,6 +604,8 @@ __all__ = [
     "align_up",
     "decode_pq2_0",
     "decode_ptq1_0",
+    "encode_kv_entry",
+    "encode_kv_value",
     "encode_pq2_0",
     "encode_ptq1_0",
     "write_gguf",

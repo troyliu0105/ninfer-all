@@ -72,7 +72,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses; T2 token table restored at the gather; GDN A/B controls in BF16 (the quantizer's own mix stores the head and table under Q4_K/Q6_K and the controls as ternary) | `ternary` (GGUF), `mtp` |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
@@ -202,8 +202,55 @@ tokens, in their own encoding and with the head's rotation, so a draft through `
 scores those tokens exactly as the full head does. It adds 170 MiB to the file and is loaded only
 with `--lm-head-draft`.
 
+`--model` needs only the base checkpoint's configuration and frontend resources, but then the
+vision tower has to come from somewhere: `--source vision=Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
+reads it from the release's mmproj GGUF (under the same `model.visual.*` names, at the formats the
+recipe chose) instead of the checkpoint. `--source mtp=` names the MTP weights; PrismML's releases
+carry that head inside the model's own file, so split it out first -- see below.
+
 A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
 tensor set and Hadamard metadata before reading anything.
+
+#### The quantizer's other mix
+
+PrismML's quantizer also writes the same model in its default PQ2_0 mix, which differs in four
+places: llama.cpp's output-tensor and token-embedding types apply, so the output head is stored as
+`Q6_K` and the token table as `Q4_K`; and the GDN A/B controls are quantized with the main type
+instead of being left BF16. The recipe converts either form. Decoding the larger block type
+recovers every ternary code exactly and each per-128 scale to within that block format's own
+rounding (measured under 2.5% on the releases seen, with the codes identical), so the artifact
+keeps the registered T2 rows, their Uses and the runtime's per-gather restore. A ternary A/B
+control is imported at the artifact's BF16 control format, which rounds its recovered scale to
+eight mantissa bits; that is far inside the 2-bit quantization the source already applied.
+Validation decodes a 64-row sample of a matrix stored under a larger block type and refuses values
+that are not a ternary matrix rather than silently re-quantizing them.
+
+The quantizer's 2-bit codes are offset binary, so a group's fp16 scale multiplies `-1`, `0`, `+1`
+or `+2`. The artifact's `t2_g128_fp16` codes are two's complement: `-2`, `-1`, `0` or `+1`. A
+weight the quantizer stored at `+2` therefore has no exact T2 form. A group that uses that level
+keeps the magnitude most of its weights share -- its largest or its median nonzero magnitude,
+whichever fits the group better -- and stores those weights at `+1`; the conversion warns with the
+count. In the releases seen this affects 421 weights of a single row of the output head, a token id
+past the public token domain, and nothing else. A `PQ2_0` tensor that carries the `+2` code itself
+is refused instead (a rotated projection or a token table of such a mix), because importing its
+codes verbatim would turn `+2` into `-2`.
+
+Either mix may also carry the MTP head as one extra block inside the model file (`blk.64.*`, with
+`qwen35.nextn_predict_layers = 1`). This recipe takes MTP from a companion source under the
+`mtp.*` names, so split that block out first:
+
+```bash
+python3 -m tools.convert.split_mtp --gguf Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  --text Ternary-Bonsai-2-27B-PQ2_0.text.gguf \
+  --mtp Ternary-Bonsai-2-27B.mtp.safetensors
+```
+
+The text GGUF keeps every other tensor's bytes and stored type and the source's own header words,
+and only lowers `qwen35.block_count` (dropping `qwen35.nextn_predict_layers`); the safetensors
+holds the MTP tensors as FP32 under `mtp.fc.weight`, `mtp.layers.0.*` and the rest, which
+`--source mtp=` then reads. A release that quantized its MTP matrices to two bits yields a Q8
+drafter, just like a separately trained MTP head. The tool refuses a block holding tensors its
+name map does not cover, a rotated MTP block, and a file whose layer index it cannot infer.
 
 ### A mixed-precision Qwen3.8-27B GGUF
 
@@ -596,6 +643,12 @@ normal multi-component conversion, though each component needs its own wiring:
   tensors have no prefix. Pass it its own `--source mtp_quantized=mtp-*.gguf`
   and wrap that in its own `HFAliasSource`.
 
+  Some releases fuse the block into the *model's* file instead (PrismML's ternary
+  GGUFs do). `python3 -m tools.convert.split_mtp --gguf MODEL.gguf --text
+  MODEL.text.gguf --mtp MODEL.mtp.safetensors` writes a text-only GGUF of the same
+  weights plus the MTP tensors as FP32 under their `mtp.*` names, which an official
+  recipe reads with `--source mtp=`.
+
 - **Vision** is exported as a separate `mmproj-*.gguf` file (GGUF architecture
   `clip`, not the text model's `qwen35`/`qwen35moe`) covering the ViT tower and
   the projector MLP. `qwen35_vision_name_map(depth, hidden_size=..., patch_size=...,
@@ -613,7 +666,10 @@ normal multi-component conversion, though each component needs its own wiring:
   `--source dflash2=PATH` plus `--components ...,dflash2` -- the same mechanism
   `qwen3_8_27b_nvfp4`'s example in this doc already uses. An override recipe
   only needs to touch `dflash2/*` parameters if you actually have a GGUF export
-  of the draft head to source them from instead.
+  of the draft head to source them from instead. `PATH` is the checkpoint
+  *directory*: the recipe reads its `config.json` for the draft geometry and the
+  release's own format choices decide the artifact's, so a quantized GGUF of the
+  same adapter (llama.cpp's copy) is not a converter input.
 
 All three name maps above were checked against a real checkpoint/GGUF pair on
 this machine the same way `qwen35_linear_attention_name_map` was (see its
