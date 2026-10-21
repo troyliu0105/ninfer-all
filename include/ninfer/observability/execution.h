@@ -201,6 +201,9 @@ struct MaterializationDiagnostics {
     // overlap the request's first prefill pass, so their time is part of its prefill.
     std::uint32_t cached_prefix_tokens = 0;
     std::uint64_t restored_host_bytes  = 0;
+    // `restored_disk_bytes` is the part of that restore the disk tier delivered (staged block
+    // payloads, the snapshot image and the tail bundle); it is a subset of `restored_host_bytes`.
+    std::uint64_t restored_disk_bytes  = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

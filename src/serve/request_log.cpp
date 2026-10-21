@@ -411,6 +411,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"search_boundary_limited", diagnostics.search_boundary_limited},
         {"cached_prefix_tokens", diagnostics.cached_prefix_tokens},
         {"restored_host_bytes", diagnostics.restored_host_bytes},
+        {"restored_disk_bytes", diagnostics.restored_disk_bytes},
     };
 }
 
@@ -1228,6 +1229,25 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
                  {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+        // The disk tier (--disk-kv-path) sub-object appears only once it has moved data or holds
+        // records; it is all zeros otherwise.
+        const std::uint64_t disk_demoted = delta(&RuntimeStats::hybrid_disk_demoted_blocks);
+        const std::uint64_t disk_images  = delta(&RuntimeStats::hybrid_disk_demoted_images);
+        const std::uint64_t disk_restored = delta(&RuntimeStats::hybrid_disk_restored_blocks);
+        const std::uint64_t disk_read    = delta(&RuntimeStats::hybrid_disk_read_bytes);
+        const std::uint64_t disk_write   = delta(&RuntimeStats::hybrid_disk_write_bytes);
+        if (current.hybrid_disk_resident_blocks != 0 ||
+            current.hybrid_disk_committed_snapshots != 0 || disk_demoted != 0 ||
+            disk_images != 0 || disk_restored != 0 || disk_read != 0 || disk_write != 0) {
+            record["context_cache"]["hybrid"]["disk"] =
+                Json{{"resident_blocks", current.hybrid_disk_resident_blocks},
+                     {"committed_snapshots", current.hybrid_disk_committed_snapshots},
+                     {"demoted_blocks", disk_demoted},
+                     {"demoted_images", disk_images},
+                     {"restored_blocks", disk_restored},
+                     {"read_bytes", disk_read},
+                     {"write_bytes", disk_write}};
+        }
     }
     // Qwen3.8-Flash-Next's n-gram table reads: the interval's rows and passes, the latency
     // quantiles as the upper bound of the histogram bucket that holds them, and the device time the

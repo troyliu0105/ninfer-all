@@ -1385,6 +1385,8 @@ private:
         std::optional<DeviceKVPageReservation> text_pages;
         std::optional<DeviceKVPageReservation> backend_pages;
         std::uint64_t restore_bytes = 0;
+        // The part of `restore_bytes` the disk tier delivered (staged blocks, image, tail).
+        std::uint64_t restore_disk_bytes = 0;
         // Names the landing Host restore whose per-layer events the lane's first prefill pass
         // waits on (0 without one).
         std::uint64_t restore_ticket = 0;

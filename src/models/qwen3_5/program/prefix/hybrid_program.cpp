@@ -908,6 +908,7 @@ ProgramImpl::progress_hybrid_materialization(runtime::CancellationFlagView cance
         }
         out.diagnostics.cached_prefix_tokens = transaction.quote->cached_prefix_tokens;
         out.diagnostics.restored_host_bytes  = transaction.restore_bytes;
+        out.diagnostics.restored_disk_bytes  = transaction.restore_disk_bytes;
         out.published.emplace(hybrid_activate(transaction));
     } catch (...) {
         // The abort returns the state slot a landing restore may still be writing.
@@ -1064,6 +1065,15 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     transaction.restore_bytes =
         static_cast<std::uint64_t>(restored) * block_bytes +
         (image_restore ? static_cast<std::uint64_t>(hybrid_->host_layout().image_bytes) : 0U);
+    // The disk tier's share of `restore_bytes`: the disk-only block payloads, plus the snapshot
+    // image and tail bundle when they came from disk staging rather than a Host copy.
+    transaction.restore_disk_bytes = static_cast<std::uint64_t>(disk_only.size()) * block_bytes;
+    if (image_restore && snapshot.host != pc::CopyState::Resident) {
+        transaction.restore_disk_bytes += hybrid_->host_layout().image_bytes;
+    }
+    if (tail_restore && snapshot.host != pc::CopyState::Resident) {
+        transaction.restore_disk_bytes += block_bytes;
+    }
     hybrid_->open_restore(device.stream);
     const auto destination = [&](std::uint32_t columns) {
         HybridBlockPages pages{.text = text_kv_pages->materialize_transfer_destination(

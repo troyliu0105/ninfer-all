@@ -2391,12 +2391,14 @@ environment variable `NINFER_MAT_DEBUG` set, admission also writes its raw input
 `[candgen]` line for each catalogued checkpoint it did or did not turn into a candidate, and
 `[mat-debug]` lines for each identity cost, fast selection, assessed target and denied search step,
 the last with the gain and economic bound behind the denial.
-`cached_prefix_tokens` and `restored_host_bytes` describe a hybrid prefix-cache admission and are `0`
-with the checkpoint catalog. `cached_prefix_tokens` is the longest prompt prefix held as cached KV
-blocks, whether or not it was reusable: reuse also needs a state snapshot inside it, so a gap to
-`prefix_cache_hit_tokens` is prefix lost to snapshot placement. `restored_host_bytes` is what the
-admission copied back from the Host tier; those copies overlap the request's first prefill pass, so
-their time is part of its prefill.
+`cached_prefix_tokens`, `restored_host_bytes` and `restored_disk_bytes` describe a hybrid
+prefix-cache admission and are `0` with the checkpoint catalog. `cached_prefix_tokens` is the
+longest prompt prefix held as cached KV blocks, whether or not it was reusable: reuse also needs
+a state snapshot inside it, so a gap to `prefix_cache_hit_tokens` is prefix lost to snapshot
+placement. `restored_host_bytes` is what the admission copied back from the Host tier; those
+copies overlap the request's first prefill pass, so their time is part of its prefill.
+`restored_disk_bytes` is the part of that restore the disk tier delivered (disk-staged block
+payloads, the snapshot image and the tail bundle); it is `0` without the disk tier.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
@@ -2515,6 +2517,12 @@ planned prefill snapshots published and dropped, and `endpoints_created` end-of-
 Host tier, `host_dead_reclaims` Host slabs reclaimed from KV that no snapshot can reach, and
 `unbacked_node_losses` Device evictions of blocks with no Host copy, which remove them and the
 blocks after them from the cache.
+The `disk` sub-object reports the disk tier (`--disk-kv-path`): `resident_blocks` and
+`committed_snapshots` are end-of-interval gauges; `demoted_blocks`, `demoted_images`,
+`restored_blocks`, `read_bytes` and `write_bytes` are interval deltas of Host→disk demotion and
+disk→Host restore traffic. The periodic pretty throughput line appends `disk demoted N blocks
+(bytes)` and `disk restored N blocks (bytes)` when either moves in the interval, and a request
+whose admission restored disk-staged KV appends `<bytes> from disk` inside its `cache` count.
 
 With Qwen3.8-Flash-Next and its n-gram table, `ngram_table` reports the interval's row reads:
 `rows` the rows the passes addressed (16 a token), `resident_rows` those RAM served

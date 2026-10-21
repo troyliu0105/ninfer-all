@@ -874,6 +874,50 @@ int main() {
     failures += check(throughput_json.at("context_cache").at("captures").at("skipped") == 1,
                       "feasibility-skipped captures must be counted and published");
 
+    // The hybrid disk tier (--disk-kv-path): the `disk` sub-object appears only once it has moved
+    // data, and the pretty line appends demote/restore segments when either moves in the interval.
+    ThroughputReport disk_report;
+    disk_report.interval_seconds = 5.0;
+    disk_report.computed_prefill_tokens = 10;
+    disk_report.previous.hybrid_tree_blocks = 4;
+    disk_report.previous.hybrid_disk_demoted_blocks = 100;
+    disk_report.previous.hybrid_disk_restored_blocks = 4;
+    disk_report.previous.hybrid_disk_read_bytes = 4096;
+    disk_report.previous.hybrid_disk_write_bytes = 8192;
+    disk_report.current.hybrid_tree_blocks = 8;
+    disk_report.current.hybrid_disk_resident_blocks = 64;
+    disk_report.current.hybrid_disk_committed_snapshots = 2;
+    disk_report.current.hybrid_disk_demoted_blocks = 112;
+    disk_report.current.hybrid_disk_demoted_images = 1;
+    disk_report.current.hybrid_disk_restored_blocks = 9;
+    disk_report.current.hybrid_disk_read_bytes = 9216;
+    disk_report.current.hybrid_disk_write_bytes = 12288;
+    const Json disk_json =
+        Json::parse(format_throughput_json("serve-test", 5002, disk_report));
+    const auto& disk = disk_json.at("context_cache").at("hybrid").at("disk");
+    failures += check(
+        disk.at("resident_blocks") == 64 && disk.at("committed_snapshots") == 2 &&
+            disk.at("demoted_blocks") == 12 && disk.at("demoted_images") == 1 &&
+            disk.at("restored_blocks") == 5 && disk.at("read_bytes") == 5120 &&
+            disk.at("write_bytes") == 4096,
+        "hybrid disk sub-object must report interval deltas and gauges");
+    const std::string disk_pretty = render_throughput(disk_report).message;
+    failures += check(
+        disk_pretty.find("disk demoted 12 blocks (4.00 KiB)") != std::string::npos &&
+            disk_pretty.find("disk restored 5 blocks (5.00 KiB)") != std::string::npos,
+        "pretty throughput must name disk demotion and restore traffic");
+    // A hybrid report whose disk tier is idle must omit the `disk` sub-object entirely.
+    ThroughputReport host_only;
+    host_only.interval_seconds = 5.0;
+    host_only.computed_prefill_tokens = 10;
+    host_only.previous.hybrid_tree_blocks = 4;
+    host_only.current.hybrid_tree_blocks = 8;
+    host_only.current.hybrid_host_block_writes = 3;
+    const Json host_only_json =
+        Json::parse(format_throughput_json("serve-test", 5003, host_only));
+    failures += check(!host_only_json.at("context_cache").at("hybrid").contains("disk"),
+                      "an idle disk tier must not publish a `disk` sub-object");
+
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
         ("ninfer-request-log-test-" +
