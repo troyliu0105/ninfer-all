@@ -455,6 +455,15 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
     out << " | host " << product::format_pretty_percent(host_ratio) << " ("
         << product::format_pretty_duration(host_seconds) << ')';
+    // Host KV pressure: the pinned slab pool's occupancy. Absolute gauges, not deltas.
+    if (report.current.hybrid_host_capacity_bytes != 0) {
+        const double host_kv_ratio =
+            static_cast<double>(report.current.hybrid_host_used_bytes) /
+            static_cast<double>(report.current.hybrid_host_capacity_bytes);
+        out << " | host kv " << product::format_pretty_percent(host_kv_ratio) << " ("
+            << product::format_pretty_bytes(report.current.hybrid_host_used_bytes) << '/'
+            << product::format_pretty_bytes(report.current.hybrid_host_capacity_bytes) << ')';
+    }
     // Hybrid prefix cache disk tier: demotions (Host → disk) and restores (disk → Host) in
     // this interval, with the bytes moved.
     const std::uint64_t disk_demoted = report.current.hybrid_disk_demoted_blocks -
