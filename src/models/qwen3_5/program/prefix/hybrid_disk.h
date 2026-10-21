@@ -96,10 +96,16 @@ public:
     HybridDiskTier(const HybridDiskTier&)            = delete;
     HybridDiskTier& operator=(const HybridDiskTier&) = delete;
 
+    struct RestoreSummary {
+        bool ok = false;
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        std::uint64_t kv_bytes  = 0;
+    };
     // Replays the catalog and restores its committed closures into `index` (parents first,
-    // anchors before their snapshots, nothing evicted to make room). Returns false when the
+    // anchors before their snapshots, nothing evicted to make room). `ok` is false when the
     // catalog was foreign (already wiped empty; the caller proceeds without disk content).
-    [[nodiscard]] bool restore_into(pc::PrefixCacheIndex& index);
+    [[nodiscard]] RestoreSummary restore_into(pc::PrefixCacheIndex& index);
 
     // ---- demotion (Engine worker) ----------------------------------------------------------------
     // One bounded step of Host-pressure demotion: no I/O, only victim selection and job

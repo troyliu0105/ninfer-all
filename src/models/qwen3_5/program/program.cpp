@@ -719,8 +719,9 @@ HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::
     return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 
-bool Program::attach_hybrid_disk_tier(const std::filesystem::path& directory,
-                                      std::uint64_t capacity_bytes, std::string fingerprint) {
+LoadSummary::DiskTierRestore Program::attach_hybrid_disk_tier(
+    const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+    std::string fingerprint) {
     return impl_->attach_hybrid_disk_tier(directory, capacity_bytes, std::move(fingerprint));
 }
 

@@ -1277,9 +1277,9 @@ public:
     // wiped and reported false — the tier then runs empty; `fingerprint` matches the
     // Host-tier file's. A zero `capacity_bytes` selects the 64 GiB default. An unusable
     // directory throws (the Engine fails to start rather than silently losing the tier).
-    [[nodiscard]] bool attach_hybrid_disk_tier(const std::filesystem::path& directory,
-                                               std::uint64_t capacity_bytes,
-                                               std::string fingerprint);
+    [[nodiscard]] LoadSummary::DiskTierRestore attach_hybrid_disk_tier(
+        const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+        std::string fingerprint);
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

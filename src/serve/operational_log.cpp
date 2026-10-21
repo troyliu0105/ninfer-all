@@ -635,6 +635,18 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           product::format_pretty_bytes(memory.host_kv_page_group_bytes),
                           *cache.max_long_anchors_per_continuation);
         }
+        if (cache.disk_kv_path.empty() == false) {
+            const auto& disk = service.load_summary().disk_tier;
+            if (disk.status == ninfer::LoadSummary::DiskTierRestore::Status::Replayed) {
+                logger_->info(
+                    "disk cache | replayed {} blocks, {} snapshots | {} KV",
+                    product::format_pretty_count(disk.blocks),
+                    product::format_pretty_count(disk.snapshots),
+                    product::format_pretty_bytes(disk.kv_bytes));
+            } else {
+                logger_->info("disk cache | foreign catalog wiped, starting empty");
+            }
+        }
     } else {
         logger_->info("context cache | root only");
     }

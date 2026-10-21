@@ -195,10 +195,10 @@ void ProgramImpl::set_hybrid_cost(const pc::CacheCostModel& cost) {
     if (hybrid_) { hybrid_->set_cost(hybrid_cost_); }
 }
 
-bool ProgramImpl::attach_hybrid_disk_tier(const std::filesystem::path& directory,
-                                           std::uint64_t capacity_bytes,
-                                           std::string fingerprint) {
-    if (hybrid_ == nullptr) { return false; }
+LoadSummary::DiskTierRestore ProgramImpl::attach_hybrid_disk_tier(
+    const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+    std::string fingerprint) {
+    if (hybrid_ == nullptr) { return {}; }
     if (hybrid_disk_staging_blocks_ == 0) {
         // create_hybrid_prefix_cache reserved the staging out of the Host budget when the path
         // was configured; a tier with no block slot could never stage a block read.
@@ -219,7 +219,14 @@ bool ProgramImpl::attach_hybrid_disk_tier(const std::filesystem::path& directory
                                                     hybrid_->host_layout(), std::move(fingerprint));
     // The index's disk release callbacks must reach the catalog before anything can drop a record.
     hybrid_->attach_disk_tier(hybrid_disk_.get());
-    return hybrid_disk_->restore_into(hybrid_->index());
+    const auto restored = hybrid_disk_->restore_into(hybrid_->index());
+    LoadSummary::DiskTierRestore result;
+    result.status = restored.ok ? LoadSummary::DiskTierRestore::Status::Replayed
+                                : LoadSummary::DiskTierRestore::Status::ForeignWiped;
+    result.blocks    = restored.blocks;
+    result.snapshots = restored.snapshots;
+    result.kv_bytes  = restored.kv_bytes;
+    return result;
 }
 
 namespace {

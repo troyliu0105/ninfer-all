@@ -93,10 +93,11 @@ HybridDiskTier::HybridDiskTier(Options options, const HybridHostLayout& host,
 
 HybridDiskTier::~HybridDiskTier() { shutdown(); }
 
-bool HybridDiskTier::restore_into(PrefixCacheIndex& index) {
+HybridDiskTier::RestoreSummary HybridDiskTier::restore_into(PrefixCacheIndex& index) {
+    RestoreSummary summary;
     if (!catalog_->open()) {
         catalog_->wipe();
-        return false;
+        return summary;
     }
     // Replayed ids are parents-first by construction: a record's finish_block preceded any
     // dependent commit, and the catalog replays in id order.
@@ -116,6 +117,7 @@ bool HybridDiskTier::restore_into(PrefixCacheIndex& index) {
         if (!node) { break; } // node capacity: deeper entries cannot restore either
         restored.emplace(block.id, *node);
     }
+    std::uint64_t restored_snapshots = 0;
     for (const PrefixDiskCatalog::ReplayedSnapshot& snapshot : catalog_->replayed_snapshots()) {
         NodeRef anchor;
         if (snapshot.identity.anchor != PrefixDiskCatalog::kNoRecord) {
@@ -129,8 +131,13 @@ bool HybridDiskTier::restore_into(PrefixCacheIndex& index) {
             anchor, snapshot.identity.frontier,
             std::span<const TokenId>(snapshot.identity.tail.data(), snapshot.identity.tail_len),
             snapshot.identity.kind, snapshot.identity.hits, snapshot.id, true);
+        ++restored_snapshots;
     }
-    return true;
+    summary.ok        = true;
+    summary.blocks    = restored.size();
+    summary.snapshots = restored_snapshots;
+    summary.kv_bytes  = summary.blocks * host_.block_payload_bytes;
+    return summary;
 }
 
 // ---- record reclamation (Engine worker) ------------------------------------------------------------

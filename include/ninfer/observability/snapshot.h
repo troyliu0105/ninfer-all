@@ -354,8 +354,16 @@ struct LoadSummary {
 
     // The hybrid disk tier's catalog at startup: replayed, or foreign/damaged and wiped
     // (the Engine proceeded without its disk content).
-    enum class DiskTierRestore : std::uint8_t { NotConfigured, Replayed, ForeignWiped };
-    DiskTierRestore disk_tier = DiskTierRestore::NotConfigured;
+    struct DiskTierRestore {
+        enum class Status : std::uint8_t { NotConfigured, Replayed, ForeignWiped };
+        Status status = Status::NotConfigured;
+        // Blocks and snapshots restored into the index from the replayed catalog.
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        // KV bytes the restored blocks represent (blocks × block_payload_bytes).
+        std::uint64_t kv_bytes  = 0;
+    };
+    DiskTierRestore disk_tier;
 };
 
 } // namespace ninfer

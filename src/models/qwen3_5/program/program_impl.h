@@ -870,9 +870,9 @@ public:
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
 
-    [[nodiscard]] bool attach_hybrid_disk_tier(const std::filesystem::path& directory,
-                                               std::uint64_t capacity_bytes,
-                                               std::string fingerprint);
+    [[nodiscard]] LoadSummary::DiskTierRestore attach_hybrid_disk_tier(
+        const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+        std::string fingerprint);
 
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;

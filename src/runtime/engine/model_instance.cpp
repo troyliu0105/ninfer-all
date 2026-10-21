@@ -810,7 +810,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                                         device, options.startup_observer,
                                                         std::move(experts));
     LoadSummary::PrefixCacheRestore restore;
-    LoadSummary::DiskTierRestore disk_restore = LoadSummary::DiskTierRestore::NotConfigured;
+    LoadSummary::DiskTierRestore disk_restore;
     if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
         // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
@@ -838,11 +838,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         }
         if (!resolved.context_cache.disk_kv_path.empty()) {
             // The disk tier's directory is artifact-scoped (artifact_scoped_disk_tier).
-            const bool disk_ok = instance->program->attach_hybrid_disk_tier(
+            disk_restore = instance->program->attach_hybrid_disk_tier(
                 resolved.context_cache.disk_kv_path, resolved.context_cache.disk_kv_capacity_bytes,
                 hybrid_cache_fingerprint(options, signature));
-            disk_restore = disk_ok ? LoadSummary::DiskTierRestore::Replayed
-                                   : LoadSummary::DiskTierRestore::ForeignWiped;
         }
     }
     instance->inject_pinned_grafts();
