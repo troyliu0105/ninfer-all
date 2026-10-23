@@ -17,7 +17,7 @@ case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
     if [[ "${1:-}" == --native ]]; then
       base="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .target_commitish)" || base=''
     else
-      repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+      repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
       base="$(docker buildx imagetools inspect "ghcr.io/$repository:latest" \
         --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base=''
     fi ;;
