@@ -87,6 +87,18 @@ public:
     bool upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
                      std::vector<DiskKVIdentity>* evicted = nullptr);
 
+    // The caller-controlled reclamation mode the Hybrid prefix-cache tier needs. The page is
+    // owned by its writer: the automatic LRU path (upsert_page and its eviction) never removes
+    // it, and it leaves the store only through evict(). No automatic eviction runs here either:
+    // false — changing nothing — when no free slot exists (the caller backpressures) or the
+    // payload write fails.
+    bool upsert_page_reserved(const DiskKVIdentity& id, std::span<const std::byte> bytes);
+    // Marks a live page writer-owned. A store rebuilt from a slot scan loses the marks, so a
+    // catalog that replays its records re-protects them. False when the page is not live.
+    bool protect(const DiskKVIdentity& id);
+    // Free slots an upsert_page_reserved can still take.
+    [[nodiscard]] std::uint32_t free_slot_count() const;
+
     // Copies the page into `destination` (slot_size bytes) after checking identity and CRC, and
     // refreshes its LRU stamp. The copy and CRC run outside the store lock; eviction skips a slot
     // while it is being read.
@@ -111,6 +123,19 @@ public:
     bool touch(const DiskKVIdentity& id);
     // Drops the page if it is live and not being read.
     bool evict(const DiskKVIdentity& id);
+    // Drops the page exactly like evict() — an absent or claimed page is left alone — but leaves
+    // the index publication to the next flush_index(): a caller reclaiming a batch of pages (the
+    // disk catalog recovering orphans) pays one index rewrite instead of one per page. A crash
+    // before that flush is safe because every index row is re-validated against its slot header on
+    // open.
+    void evict_deferred(const DiskKVIdentity& id);
+    // Makes the index cover pages the data file holds but never published: a crash between a
+    // payload write and the deferred index publication leaves written slots unlisted, and its bytes
+    // are then unreachable even though they are intact. Every candidate slot's payload is
+    // CRC-checked before it is trusted (the rule of a lost-index rebuild); a slot whose identity is
+    // already live, or whose bytes are torn, stays free. Publishes the result and returns the
+    // number of pages adopted. Free after a rebuild from a slot scan, which already covered them.
+    std::uint32_t adopt_unlisted_pages();
     [[nodiscard]] std::vector<DiskKVIdentity> live_identities() const;
 
     // Publishes pending index changes (atomic replacement, not a durability barrier).
@@ -169,6 +194,8 @@ private:
     void clear_slot(std::uint32_t slot) noexcept;
     // Evicts the least recently used live slot nobody is reading. Caller holds mutex_.
     std::optional<DiskKVIdentity> evict_one_lru_locked();
+    // Shared body of evict() and evict_deferred().
+    bool evict_impl(const DiskKVIdentity& id, bool persist);
     // Payloads move through positioned reads and writes, not the mapping: a store larger than
     // memory makes mapped copies fault page by page, and a mapped write into a sparse slot on a
     // full disk raises SIGBUS where a positioned write returns an error, which a pure cache turns
@@ -194,6 +221,9 @@ private:
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
     std::vector<std::uint32_t> free_slots_;
     std::vector<std::uint32_t> readers_;
+    // Slots held by writer-owned pages (upsert_page_reserved): excluded from LRU eviction and
+    // from an index scan's live set until their writer evicts them.
+    std::vector<bool> writer_owned_;
     // Live slots by (LRU stamp, slot), so eviction takes the coldest slot without reading every
     // header under the lock; rebuilt from the slot headers on open. lru_stamps_ holds each slot's
     // key, kNoStamp while the slot is not live.

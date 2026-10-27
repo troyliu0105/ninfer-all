@@ -15,6 +15,7 @@
 #include "core/host_kv_arena.h"
 #include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
@@ -845,7 +846,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.features.masked_draft()) {
         {
-            const auto* draft                  = &*parameters.model.config().draft;
+            const auto* draft = &*parameters.model.config().draft;
+            // The fused context materialization reads one shared Q8 row-split parent per layer; a
+            // stored GGUF adapter takes the layer-by-layer route, whose budget is this one.
+            const auto context_kv_fused = [&] {
+                if (!draft->dflash2.has_value()) { return false; }
+                for (const auto& block : parameters.draft->layers) {
+                    const auto q8 = [](const execution::LinearParameters& p) {
+                        return p.weight.qtype == QType::Q8_G32_FP16 &&
+                               p.weight.layout == QuantLayout::RowSplit;
+                    };
+                    if (!q8(block.context_key) || !q8(block.context_value)) { return false; }
+                }
+                return !parameters.draft->layers.empty();
+            };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {
                 const auto tokens = width * batch;
@@ -862,8 +876,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::dflash_context(layout, config, *draft, local_width * batch);
                     linear_scratch(layout, parameters.draft->feature_projection,
                                    local_width * batch, local_width * batch);
-                    scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
-                                        batch, local_width, local_width));
+                    if (context_kv_fused()) {
+                        scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
+                                            batch, local_width, local_width));
+                        return finish(layout);
+                    }
+                    // Layer by layer: the layer's own roots, then its two context projections.
+                    const std::int32_t columns = local_width * batch;
+                    auto layer = layout.scope();
+                    (void)workspace::dflash_context_layer(layout, config, *draft, columns);
+                    for (const auto& block : parameters.draft->layers) {
+                        linear_scratch(layout, block.context_key, columns, columns);
+                        linear_scratch(layout, block.context_value, columns, columns);
+                    }
                     return finish(layout);
                 }
                 (void)workspace::dflash_context(layout, config, *draft, tokens);
@@ -878,23 +903,39 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
+                const auto qkv_scratch = [&] {
+                    for (const auto& block : parameters.draft->layers) {
+                        if (const auto* parts = std::get_if<ops::PartProjectionWeights>(
+                                &block.query_key_value)) {
+                            scratch(layout, ops::attn_input_proj_workspace_capacity_bytes(
+                                                *parts, tokens, tokens));
+                        }
+                    }
+                };
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
-                    const auto prepare = [&] {
+                    // Each layer's own projection decides its transient budget: the adapter's
+                    // stored block types differ, and a GGUF conv adds its coefficient plane.
+                    const auto conv_prepare = [&](bool mlp) {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
-                        scratch(layout,
-                                ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                                    width, width, batch, batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& conv = mlp ? *block.mlp_conv : *block.attention_conv;
+                            scratch(layout,
+                                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                                        conv.kernel_projection.weight,
+                                        conv.kernel_projection.policy, width, width, batch, batch));
+                        }
                     };
                     {
                         auto attention = layout.scope();
-                        prepare();
+                        conv_prepare(false);
                         matrix(layout, DType::BF16, dimension(draft->attention.query_width()),
                                tokens);
                         matrix(layout, DType::BF16, dimension(draft->attention.key_width()),
                                tokens);
                         matrix(layout, DType::BF16, dimension(draft->attention.key_width()),
                                tokens);
+                        qkv_scratch();
                         matrix(layout, DType::BF16, dimension(draft->attention.query_width()),
                                tokens);
                         scratch(layout, ops::sliding_window_attention_workspace_capacity_bytes(
@@ -903,14 +944,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                              dimension(draft->attention.num_key_value_heads)},
                                             dimension(draft->sliding_window.value_or(0)),
                                             {0, plan.capacity}, width, width, batch));
-                        scratch(layout,
-                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                    dimension(draft->attention.query_width()), width, width, batch,
-                                    batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        block.output.weight, block.output.policy, width, width,
+                                        batch, batch));
+                        }
                     }
                     {
                         auto mlp = layout.scope();
-                        prepare();
+                        conv_prepare(true);
                         matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
                         for (const auto& block : parameters.draft->layers) {
                             const auto& p = block.mlp.gate_up;
@@ -920,10 +963,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                     p.weight.qtype, p.weight.n, p.weight.k,
                                                     p.policy, tokens, tokens)));
                         }
-                        scratch(
-                            layout,
-                            ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                dimension(draft->intermediate_size), width, width, batch, batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            scratch(
+                                layout,
+                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                    block.mlp.down.weight, block.mlp.down.policy, width, width,
+                                    batch, batch));
+                        }
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
@@ -943,12 +989,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
                                    mask_columns, mask_columns);
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
+                                        parameters.draft->selector->predecessor_codebook,
+                                        parameters.draft->selector->successor_codebook,
                                         proposal_drafts, proposal_drafts, batch, batch));
                     return finish(layout);
                 }
                 {
                     auto attention = layout.scope();
                     (void)workspace::dflash_attention(layout, config, *draft, tokens);
+                    qkv_scratch();
                     scratch(layout,
                             std::max(ops::sliding_window_attention_workspace_capacity_bytes(
                                          {dimension(draft->attention.head_dim),

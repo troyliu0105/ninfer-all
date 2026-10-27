@@ -35,4 +35,51 @@ struct HybridHostLayout {
 [[nodiscard]] std::uint32_t hybrid_host_slabs(const HybridHostLayout& layout,
                                               std::uint64_t budget_bytes);
 
+// Block payloads the disk tier's staging may hold (docs/maintainer/hybrid-prefix-cache-disk-tier.md
+// §3: "a bounded number of KV copy batches"). The tier's streaming cadence needs far fewer.
+inline constexpr std::uint32_t kHybridDiskMaxStagingBlocks = 256;
+
+// How the advertised Host budget splits between the disk tier's pinned staging and the slab pool
+// (§3 budgets). Staging is one whole StateImage in its physical slab segments, one block payload
+// for the snapshot tail, and up to `kHybridDiskMaxStagingBlocks` block payloads — but the block
+// batch takes only what the budget leaves after the slab pool's own minimum geometry
+// (`hybrid_host_slabs`), so enabling the disk tier never rejects a Host budget that satisfies the
+// slab minimum on its own. `staging_blocks == 0` means the budget cannot hold a single block
+// payload beside that minimum: the caller must reject the configuration rather than open a disk
+// tier that could never stage a block read.
+struct HybridDiskStagingPlan {
+    std::uint32_t staging_blocks    = 0;
+    std::uint64_t staging_bytes     = 0; // rounded physical bytes the tier pins
+    std::uint64_t slab_budget_bytes = 0; // what remains for the slab pool
+    // The smallest Host budget that yields one block payload of staging beside the slab pool's
+    // own minimum geometry. A budget at or below it returns `staging_blocks == 0`, and the
+    // caller reports this figure instead of re-deriving the geometry.
+    std::uint64_t min_budget_bytes  = 0;
+};
+
+[[nodiscard]] HybridDiskStagingPlan plan_hybrid_disk_staging(const HybridHostLayout& layout,
+                                                             std::uint64_t budget_bytes);
+
+// How the tier's byte capacity splits between block records and image records. Zero resolves to
+// the documented 64 GiB default (ContextCacheOptions); attach_hybrid_disk_tier and the index's
+// descriptor sizing both resolve their split through this function.
+struct HybridDiskBudget {
+    std::uint64_t block_bytes = 0;
+    std::uint64_t image_bytes = 0; // the remainder, so odd capacities favor images
+};
+
+[[nodiscard]] HybridDiskBudget hybrid_disk_budget(std::uint64_t capacity_bytes);
+
+// Index descriptor capacity the disk tier adds (disk-tier design §3 budgets: disk-only entries
+// occupy index capacity). A node whose only copy is a disk record holds one block-store slot; a
+// disk-committed snapshot closure holds `image_slabs` image-store segments — the catalog Store's
+// own arithmetic, so a full tier can never exhaust the index's node or snapshot slots.
+struct HybridDiskRecords {
+    std::uint32_t blocks = 0; // block records the block half holds
+    std::uint32_t images = 0; // snapshot closures the image half holds
+};
+
+[[nodiscard]] HybridDiskRecords plan_hybrid_disk_records(const HybridHostLayout& layout,
+                                                         std::uint64_t capacity_bytes);
+
 } // namespace ninfer::models::qwen3_5::detail

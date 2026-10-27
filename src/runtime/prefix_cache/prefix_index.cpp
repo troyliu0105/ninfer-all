@@ -124,9 +124,12 @@ std::optional<NodeRef> PrefixCacheIndex::find_child(NodeRef parent, std::uint64_
 }
 
 bool PrefixCacheIndex::snapshot_valid(const Snapshot& snapshot) const noexcept {
-    const bool image = snapshot.device_slot != kNoId || snapshot.host == CopyState::Resident;
+    const bool image = snapshot.device_slot != kNoId || snapshot.host == CopyState::Resident ||
+                       snapshot.disk == CopyState::Resident;
     const bool tail  = snapshot.tail_len == 0 || snapshot.tail_device_copy == CopyState::Resident ||
-                       (config_.host_blocks && snapshot.host == CopyState::Resident);
+                       (config_.host_blocks && snapshot.host == CopyState::Resident) ||
+                       (snapshot.tail_len != 0 && snapshot.disk == CopyState::Resident &&
+                        snapshot.disk_committed);
     return image && tail;
 }
 
@@ -152,6 +155,7 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
 
     std::vector<std::uint32_t> host_only;
     std::vector<std::uint32_t> filling;
+    std::vector<std::uint32_t> disk_only;
     NodeRef parent;
     for (std::uint32_t block = 0; block < max_blocks && block < block_hashes.size(); ++block) {
         const std::uint64_t extra = block_extras.empty() ? 0ULL : block_extras[block];
@@ -162,8 +166,19 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         const Node& node                    = nodes_[child->index];
         const std::uint32_t prior_host_only = host_only.empty() ? 0U : host_only.back();
         const std::uint32_t prior_filling   = filling.empty() ? 0U : filling.back();
-        host_only.push_back(prior_host_only + (node.device == CopyState::Absent ? 1U : 0U));
+        const std::uint32_t prior_disk_only = disk_only.empty() ? 0U : disk_only.back();
+        host_only.push_back(prior_host_only +
+                            (node.device == CopyState::Absent &&
+                                     node.host == CopyState::Resident
+                                 ? 1U
+                                 : 0U));
         filling.push_back(prior_filling + (node.device == CopyState::Filling ? 1U : 0U));
+        disk_only.push_back(prior_disk_only +
+                            (node.device == CopyState::Absent &&
+                                     node.host != CopyState::Resident &&
+                                     node.disk == CopyState::Resident
+                                 ? 1U
+                                 : 0U));
         result.path.push_back(*child);
         parent = *child;
     }
@@ -180,13 +195,32 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         candidate.path_blocks      = path_blocks;
         candidate.host_only_blocks = path_blocks == 0 ? 0U : host_only[path_blocks - 1U];
         candidate.filling_blocks   = path_blocks == 0 ? 0U : filling[path_blocks - 1U];
+        candidate.disk_only_blocks = path_blocks == 0 ? 0U : disk_only[path_blocks - 1U];
         candidate.tail             = snapshot.tail_len != 0;
         candidate.tail_on_device   = snapshot.tail_device_copy == CopyState::Resident;
         candidate.image_on_device  = snapshot.device_slot != kNoId;
+        candidate.image_on_host    = snapshot.host == CopyState::Resident;
+        candidate.tail_on_host     =
+            config_.host_blocks && snapshot.host == CopyState::Resident;
+        candidate.image_on_disk    = snapshot.disk == CopyState::Resident;
+        candidate.tail_on_disk =
+            snapshot.tail_len != 0 && snapshot.disk == CopyState::Resident &&
+            snapshot.disk_committed;
+        // H2D still moves every object that lacks a device copy, whatever its source tier;
+        // disk-only objects additionally pay the disk read.
         candidate.restore_bytes =
-            static_cast<std::uint64_t>(candidate.host_only_blocks) * config_.block_bytes +
+            static_cast<std::uint64_t>(candidate.host_only_blocks +
+                                       candidate.disk_only_blocks) * config_.block_bytes +
             (candidate.image_on_device ? 0ULL : config_.image_bytes) +
             (candidate.tail && !candidate.tail_on_device ? config_.block_bytes : 0ULL);
+        candidate.disk_read_bytes =
+            static_cast<std::uint64_t>(candidate.disk_only_blocks) * config_.block_bytes +
+            (candidate.image_on_disk && !candidate.image_on_device && !candidate.image_on_host
+                 ? config_.image_bytes
+                 : 0ULL) +
+            (candidate.tail_on_disk && !candidate.tail_on_device && !candidate.tail_on_host
+                 ? config_.block_bytes
+                 : 0ULL);
         result.candidates.push_back(candidate);
     };
     for (const std::uint32_t snapshot : root_snapshots_) { consider(snapshot, 0); }
@@ -210,7 +244,7 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
     for (std::size_t i = 0; i < match.candidates.size(); ++i) {
         const MatchCandidate& candidate = match.candidates[i];
         const double seconds =
-            config_.cost.restore_seconds(candidate.restore_bytes) +
+            config_.cost.restore_seconds(candidate.restore_bytes, candidate.disk_read_bytes) +
             config_.cost.prefill_seconds(candidate.frontier, prompt_tokens - candidate.frontier);
         const bool better = seconds < best.predicted_seconds ||
                             (seconds == best.predicted_seconds && best.candidate &&
@@ -352,7 +386,9 @@ void PrefixCacheIndex::refresh_node(std::uint32_t index) {
     const Node& node = nodes_[index];
     const bool lru   = node.occupied && node.device == CopyState::Resident && node.pins == 0;
     const std::uint8_t list =
-        lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
+        lru ? (node.host == CopyState::Resident || node.disk == CopyState::Resident ? kBacked
+                                                                                    : kUnbacked)
+            : kNoList;
     if (lru_links_[index].list != list) {
         if (lru_links_[index].list != kNoList) { lru_remove(index); }
         if (list != kNoList) { lru_append(index, list); }
@@ -373,7 +409,8 @@ void PrefixCacheIndex::refresh_tail(std::uint32_t index) {
     const std::uint32_t entry = config_.max_nodes + index;
     const bool lru    = snapshot.occupied && snapshot.tail_len != 0 &&
                         snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0;
-    const bool backed = config_.host_blocks && snapshot.host == CopyState::Resident;
+    const bool backed = (config_.host_blocks && snapshot.host == CopyState::Resident) ||
+                        (snapshot.disk == CopyState::Resident && snapshot.disk_committed);
     const std::uint8_t list = lru ? (backed ? kBacked : kUnbacked) : kNoList;
     if (lru_links_[entry].list != list) {
         if (lru_links_[entry].list != kNoList) { lru_remove(entry); }
@@ -462,6 +499,16 @@ void PrefixCacheIndex::adjust_live(std::uint32_t anchor, int delta) {
     }
 }
 
+void PrefixCacheIndex::adjust_undisked(std::uint32_t anchor, int delta) {
+    for (std::uint32_t current = anchor; current != kNoId; current = nodes_[current].parent) {
+        Node& node = nodes_[current];
+        if (delta < 0 && node.undisked_below == 0) {
+            invariant("prefix cache uncommitted snapshot count underflow");
+        }
+        node.undisked_below = delta < 0 ? node.undisked_below - 1U : node.undisked_below + 1U;
+    }
+}
+
 void PrefixCacheIndex::set_device(Node& node, CopyState state) noexcept {
     if (node.device == CopyState::Resident) { --device_resident_; }
     if (state == CopyState::Resident) { ++device_resident_; }
@@ -514,8 +561,11 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     set_device(node, CopyState::Resident);
     node.host_slab      = kNoId;
     node.host           = CopyState::Absent;
+    node.disk_ref       = kNoId;
+    node.disk           = CopyState::Absent;
     node.pins           = 1;
     node.live_below     = 0;
+    node.undisked_below = 0;
     node.retained_below = 0;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
@@ -530,9 +580,11 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
 
 void PrefixCacheIndex::begin_device_fill(NodeRef ref, std::uint32_t device_id) {
     Node& node = require(ref);
-    if (node.device != CopyState::Absent || node.host != CopyState::Resident || node.pins == 0 ||
-        device_id == kNoId) {
-        invariant("prefix cache device fill requires a pinned host-only node");
+    // The source is the Host tier (host-Resident) or staged disk bytes (disk-Resident).
+    if (node.device != CopyState::Absent ||
+        (node.host != CopyState::Resident && node.disk != CopyState::Resident) ||
+        node.pins == 0 || device_id == kNoId) {
+        invariant("prefix cache device fill requires a pinned node with a source");
     }
     set_device(node, CopyState::Filling);
     node.device_id = device_id;
@@ -584,6 +636,19 @@ void PrefixCacheIndex::drop_node_host_copy(std::uint32_t index) {
     refresh_node(index);
 }
 
+void PrefixCacheIndex::drop_node_disk_copy(std::uint32_t index) {
+    Node& node = nodes_[index];
+    if (node.disk != CopyState::Resident) {
+        invariant("prefix cache drops a non-resident disk record");
+    }
+    const std::uint32_t ref = node.disk_ref;
+    node.disk               = CopyState::Absent;
+    node.disk_ref           = kNoId;
+    --disk_resident_blocks_;
+    refresh_node(index);
+    backend_->release_disk_record(ref);
+}
+
 std::uint32_t PrefixCacheIndex::evict_device_blocks(std::uint32_t blocks) {
     return evict_device_entries(blocks, true);
 }
@@ -594,17 +659,45 @@ std::uint32_t PrefixCacheIndex::evict_backed_device_blocks(std::uint32_t blocks)
 
 std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked) {
     std::uint32_t released = 0;
+    // Entries whose subtree a pin still holds: re-listed after the scan (refresh_node puts
+    // each back on its list), never re-popped inside it — the scan terminates.
+    std::vector<std::uint32_t> deferred;
     while (released < blocks) {
         std::uint32_t entry = lru_pop(kBacked);
         if (entry == kNoId && unbacked) { entry = lru_pop(kUnbacked); }
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];
-            if (node.host == CopyState::Resident) {
+            if (node.host == CopyState::Resident || node.disk == CopyState::Resident) {
+                // Either backup survives the device copy: nothing loses its last copy.
                 drop_node_device_copy(entry);
                 ++counters_.device_block_evictions;
                 ++released;
             } else {
+                // A subtree a demotion still pins (a snapshot awaiting its disk closure, or a
+                // block whose write is queued) keeps its nodes: defer the entry back to the
+                // LRU tail and evict a different one.
+                bool pinned_below = nodes_[entry].pins != 0;
+                std::vector<std::uint32_t> probe{entry};
+                for (std::size_t i = 0; i < probe.size() && !pinned_below; ++i) {
+                    for (const std::uint32_t snapshot : nodes_[probe[i]].snapshots) {
+                        if (snapshots_[snapshot].pins != 0) {
+                            pinned_below = true;
+                            break;
+                        }
+                    }
+                    for (const std::uint32_t child : nodes_[probe[i]].children) {
+                        if (nodes_[child].pins != 0) {
+                            pinned_below = true;
+                            break;
+                        }
+                        probe.push_back(child);
+                    }
+                }
+                if (pinned_below) {
+                    deferred.push_back(entry);
+                    continue;
+                }
                 // Unbacked: the node loses its only copy together with its (unpinned) subtree.
                 std::uint32_t pages = 0;
                 std::vector<std::uint32_t> stack{entry};
@@ -631,7 +724,9 @@ std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool 
             Snapshot& snapshot        = snapshots_[index];
             ++counters_.device_block_evictions;
             ++released;
-            if (config_.host_blocks && snapshot.host == CopyState::Resident) {
+            if ((config_.host_blocks && snapshot.host == CopyState::Resident) ||
+                (snapshot.disk == CopyState::Resident && snapshot.disk_committed)) {
+                // A committed disk closure backs the tail as well as the image.
                 const std::uint32_t id    = snapshot.tail_device;
                 snapshot.tail_device      = kNoId;
                 snapshot.tail_device_copy = CopyState::Absent;
@@ -642,6 +737,7 @@ std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool 
             }
         }
     }
+    for (const std::uint32_t entry : deferred) { refresh_node(entry); }
     return released;
 }
 
@@ -660,8 +756,10 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         if (dead_head_ != kNoId) {
             const std::uint32_t victim = dead_head_;
             ++counters_.host_dead_reclaims;
-            if (nodes_[victim].device == CopyState::Absent) {
-                // The dead node has no other copy; its subtree is dead and unpinned too.
+            if (nodes_[victim].device == CopyState::Absent &&
+                nodes_[victim].disk != CopyState::Resident) {
+                // The dead node has no other copy anywhere; its subtree is dead and unpinned
+                // too. A disk-backed node keeps its subtree: the record still serves reuse.
                 remove_subtree(victim);
             } else {
                 drop_node_host_copy(victim);
@@ -691,6 +789,12 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         if (chosen.device_slot != kNoId &&
             (chosen.tail_len == 0 || chosen.tail_device_copy == CopyState::Resident)) {
             // Still complete on the Device: only its host copy yields its slabs.
+            for (const std::uint32_t slab : chosen.host_slabs) { free_slab(slab); }
+            chosen.host_slabs.clear();
+            chosen.host = CopyState::Absent;
+            refresh_tail(victim);
+        } else if (chosen.disk == CopyState::Resident && chosen.disk_committed) {
+            // Still complete on the Disk: the committed closure keeps image and tail alive.
             for (const std::uint32_t slab : chosen.host_slabs) { free_slab(slab); }
             chosen.host_slabs.clear();
             chosen.host = CopyState::Absent;
@@ -774,10 +878,13 @@ void PrefixCacheIndex::abort_snapshot_host_fill(SnapshotRef ref) {
 
 void PrefixCacheIndex::begin_tail_device_fill(SnapshotRef ref, std::uint32_t device_id) {
     Snapshot& snapshot = require(ref);
-    if (!config_.host_blocks || snapshot.tail_len == 0 ||
-        snapshot.tail_device_copy != CopyState::Absent || snapshot.host != CopyState::Resident ||
-        snapshot.pins == 0 || device_id == kNoId) {
-        invariant("prefix cache tail fill requires a pinned host-backed tail");
+    // The source is the Host tier's tail slab or a committed disk closure's staged tail bytes
+    // (the same pair begin_device_fill accepts for a block).
+    const bool host_source = config_.host_blocks && snapshot.host == CopyState::Resident;
+    const bool disk_source = snapshot.disk == CopyState::Resident && snapshot.disk_committed;
+    if (snapshot.tail_len == 0 || snapshot.tail_device_copy != CopyState::Absent ||
+        (!host_source && !disk_source) || snapshot.pins == 0 || device_id == kNoId) {
+        invariant("prefix cache tail fill requires a pinned snapshot tail with a source");
     }
     snapshot.tail_device      = device_id;
     snapshot.tail_device_copy = CopyState::Filling;
@@ -803,6 +910,272 @@ void PrefixCacheIndex::abort_tail_device_fill(SnapshotRef ref) {
     snapshot.tail_device_copy = CopyState::Absent;
     refresh_tail(ref.index);
     backend_->release_device_block(id);
+}
+
+// ---- disk residency ---------------------------------------------------------------------------
+
+void PrefixCacheIndex::begin_disk_fill(NodeRef ref, std::uint32_t disk_ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Absent || node.pins == 0 || disk_ref == kNoId) {
+        invariant("prefix cache disk fill requires a pinned node without a disk copy");
+    }
+    node.disk      = CopyState::Filling;
+    node.disk_ref  = disk_ref;
+}
+
+void PrefixCacheIndex::complete_disk_fill(NodeRef ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Filling) { invariant("prefix cache disk fill not open"); }
+    node.disk = CopyState::Resident;
+    ++disk_resident_blocks_;
+    ++counters_.disk_writes;
+    refresh_node(ref.index);
+}
+
+void PrefixCacheIndex::abort_disk_fill(NodeRef ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Filling) { invariant("prefix cache disk fill not open"); }
+    const std::uint32_t id = node.disk_ref;
+    node.disk              = CopyState::Absent;
+    node.disk_ref          = kNoId;
+    refresh_node(ref.index);
+    backend_->release_disk_record(id);
+}
+
+void PrefixCacheIndex::mark_disk_backed(NodeRef ref, std::uint32_t disk_ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Filling || disk_ref == kNoId) {
+        invariant("prefix cache marks a node disk-backed once");
+    }
+    node.disk     = CopyState::Resident;
+    node.disk_ref = disk_ref;
+    ++disk_resident_blocks_;
+    refresh_node(ref.index);
+}
+
+void PrefixCacheIndex::begin_node_disk_fill(NodeRef ref, std::uint32_t disk_ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Absent || disk_ref == kNoId) {
+        invariant("prefix cache node disk fill requires a disk-Absent node");
+    }
+    node.disk     = CopyState::Filling;
+    node.disk_ref = disk_ref;
+}
+
+void PrefixCacheIndex::abort_node_disk_fill(NodeRef ref) {
+    Node& node = require(ref);
+    if (node.disk != CopyState::Filling) {
+        invariant("prefix cache node disk fill not open");
+    }
+    node.disk     = CopyState::Absent;
+    node.disk_ref = kNoId;
+    refresh_node(ref.index);
+}
+
+void PrefixCacheIndex::begin_snapshot_disk_fill(SnapshotRef ref, std::uint32_t disk_ref) {
+    Snapshot& snapshot = require(ref);
+    if (snapshot.disk != CopyState::Absent || snapshot.pins == 0 || disk_ref == kNoId) {
+        invariant("prefix cache snapshot disk fill requires a pinned snapshot");
+    }
+    snapshot.disk     = CopyState::Filling;
+    snapshot.disk_ref = disk_ref;
+}
+
+void PrefixCacheIndex::complete_snapshot_disk_fill(SnapshotRef ref) {
+    Snapshot& snapshot = require(ref);
+    if (snapshot.disk != CopyState::Filling) {
+        invariant("prefix cache snapshot disk fill not open");
+    }
+    snapshot.disk          = CopyState::Resident;
+    snapshot.disk_committed = true;
+    ++disk_committed_snapshots_;
+    ++counters_.disk_writes;
+    if (snapshot.anchor != kNoId) { adjust_undisked(snapshot.anchor, -1); }
+    refresh_tail(ref.index);
+}
+
+void PrefixCacheIndex::abort_snapshot_disk_fill(SnapshotRef ref) {
+    Snapshot& snapshot = require(ref);
+    if (snapshot.disk != CopyState::Filling) {
+        invariant("prefix cache snapshot disk fill not open");
+    }
+    const std::uint32_t id = snapshot.disk_ref;
+    snapshot.disk          = CopyState::Absent;
+    snapshot.disk_ref      = kNoId;
+    refresh_tail(ref.index);
+    backend_->release_disk_record(id);
+}
+
+void PrefixCacheIndex::mark_snapshot_disk_backed(SnapshotRef ref, std::uint32_t disk_ref) {
+    Snapshot& snapshot = require(ref);
+    if (snapshot.disk != CopyState::Filling || disk_ref == kNoId) {
+        invariant("prefix cache marks a snapshot disk-backed once");
+    }
+    snapshot.disk          = CopyState::Resident;
+    snapshot.disk_ref      = disk_ref;
+    snapshot.disk_committed = true;
+    ++disk_committed_snapshots_;
+    if (snapshot.anchor != kNoId) { adjust_undisked(snapshot.anchor, -1); }
+    refresh_tail(ref.index);
+}
+
+void PrefixCacheIndex::release_snapshot_host_copy(SnapshotRef ref) {
+    Snapshot& snapshot = require(ref);
+    if (snapshot.host != CopyState::Resident || !snapshot.disk_committed) { return; }
+    // Block slabs along the anchor chain stay until their own disk records commit; only the
+    // image and tail slabs this snapshot owns are released here.
+    for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
+    snapshot.host_slabs.clear();
+    snapshot.host = CopyState::Absent;
+    refresh_tail(ref.index);
+    ++counters_.disk_host_releases;
+}
+
+std::uint32_t PrefixCacheIndex::evict_disk_entries(std::uint32_t records) {
+    if (config_.disk_capacity_records == 0) { return 0; }
+    std::uint32_t released = 0;
+    while (released < records) {
+        // Lowest-GDSF unpinned committed disk snapshot.
+        std::uint32_t victim = kNoId;
+        for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
+            const Snapshot& snapshot = snapshots_[i];
+            if (!snapshot.occupied || snapshot.pins != 0 || snapshot.disk != CopyState::Resident ||
+                !snapshot.disk_committed) {
+                continue;
+            }
+            if (victim == kNoId || snapshot.priority < snapshots_[victim].priority ||
+                (snapshot.priority == snapshots_[victim].priority &&
+                 snapshot.last_hit_tick < snapshots_[victim].last_hit_tick)) {
+                victim = i;
+            }
+        }
+        if (victim == kNoId) { break; }
+        const std::uint32_t anchor = snapshots_[victim].anchor;
+        remove_snapshot(victim);
+        ++counters_.disk_record_evictions;
+        ++released;
+
+        // Blocks the closure exclusively kept: below the anchor along the unbranched chain.
+        // Each yields its record when a volatile copy keeps the node valid; a disk-only node
+        // is removed with its (dead) subtree instead, as the Host dead-reclaim does.
+        std::vector<std::uint32_t> chain;
+        for (std::uint32_t current = anchor; current != kNoId;) {
+            const Node& node = nodes_[current];
+            if (!node.snapshots.empty() || node.children.size() > 1U) { break; }
+            chain.push_back(current);
+            if (node.children.empty()) { break; }
+            current = node.children.front();
+        }
+        for (auto it = chain.rbegin(); it != chain.rend() && released < records; ++it) {
+            const std::uint32_t index = *it;
+            const Node& node           = nodes_[index];
+            if (node.snapshots.empty() && node.live_below == 0 && node.pins == 0 &&
+                node.disk == CopyState::Resident) {
+                if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
+                    // Everything below was in this dead subtree: stop after removing it.
+                    remove_subtree(index);
+                    ++counters_.disk_record_evictions;
+                    ++released;
+                    break;
+                } else {
+                    drop_node_disk_copy(index);
+                    ++counters_.disk_record_evictions;
+                    ++released;
+                }
+            }
+        }
+    }
+    return released;
+}
+
+std::uint32_t PrefixCacheIndex::release_disk_record_range(std::uint32_t count) {
+    if (config_.disk_capacity_records == 0 || count == 0) { return 0; }
+    std::uint32_t released = 0;
+    // Deepest chain-first: a deep unbranched chain carries the most exclusive records, and a
+    // shallower shared block keeps serving every other closure that anchors through it.
+    std::vector<std::uint32_t> chain;
+    for (std::uint32_t root : root_children_) {
+        chain.clear();
+        for (std::uint32_t current = root; current != kNoId;) {
+            const Node& node = nodes_[current];
+            if (!node.snapshots.empty() || node.children.size() > 1U) { break; }
+            chain.push_back(current);
+            if (node.children.empty()) { break; }
+            current = node.children.front();
+        }
+        for (auto it = chain.rbegin(); it != chain.rend() && released < count; ++it) {
+            const std::uint32_t index = *it;
+            const Node& node           = nodes_[index];
+            if (node.live_below != 0 || node.pins != 0 || !node.snapshots.empty() ||
+                node.disk != CopyState::Resident) {
+                continue;
+            }
+            if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
+                continue; // disk-only: the record is the node's only copy, keep it
+            }
+            drop_node_disk_copy(index);
+            ++counters_.disk_record_evictions;
+            ++released;
+        }
+    }
+    return released;
+}
+
+std::uint32_t PrefixCacheIndex::release_redundant_host_copies(std::span<const NodeRef> nodes) {
+    std::uint32_t released = 0;
+    for (const NodeRef ref : nodes) {
+        if (!valid(ref)) { continue; }
+        Node& node = nodes_[ref.index];
+        if (node.host != CopyState::Resident || node.pins != 0) { continue; }
+        // A live snapshot anchored below without a committed disk closure still needs this
+        // node's bytes as a restore source; with the closure committed the record serves.
+        if (node.undisked_below != 0) { continue; }
+        drop_node_host_copy(ref.index);
+        ++released;
+    }
+    return released;
+}
+
+std::vector<SnapshotRef> PrefixCacheIndex::collect_demotion_candidates(
+    std::uint32_t count) const {
+    // Superseded snapshots are certain dead content: demoting them releases the Host slabs and
+    // keeps the content restartable, so they come first, oldest supersession first. Retained
+    // snapshots may still take hits and demote by GDSF value only once the superseded ones are
+    // exhausted. (The tier applies its own superseded grace window; this order puts the truly
+    // coldest content ahead of every retained one regardless.)
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> superseded;
+    std::vector<std::pair<double, std::uint32_t>> ranked;
+    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
+        const Snapshot& snapshot = snapshots_[i];
+        if (!snapshot.occupied || snapshot.pins != 0 ||
+            snapshot.host != CopyState::Resident ||
+            snapshot.disk == CopyState::Resident) {
+            // Resident includes uncommitted: a closure whose writes are still in flight
+            // never re-enters the queue, or its second closure would wait forever on
+            // records no new write will complete.
+            continue;
+        }
+        if (snapshot.superseded) {
+            superseded.emplace_back(snapshot.superseded_tick, i);
+        } else {
+            ranked.emplace_back(snapshot.priority, i);
+        }
+    }
+    std::sort(superseded.begin(), superseded.end());
+    std::sort(ranked.begin(), ranked.end());
+    std::vector<SnapshotRef> out;
+    out.reserve(std::min<std::size_t>(superseded.size() + ranked.size(), count));
+    for (const auto& [tick, index] : superseded) {
+        (void)tick;
+        if (out.size() >= count) { return out; }
+        out.push_back(ref_of_snapshot(index));
+    }
+    for (const auto& [priority, index] : ranked) {
+        (void)priority;
+        if (out.size() >= count) { break; }
+        out.push_back(ref_of_snapshot(index));
+    }
+    return out;
 }
 
 // ---- snapshots ---------------------------------------------------------------------------------
@@ -839,7 +1212,8 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
                 owner.superseded_tick < snapshots_[slot_owner_[superseded]].superseded_tick) {
                 superseded = slot;
             }
-        } else if (owner.host != CopyState::Resident) {
+        } else if (owner.host != CopyState::Resident &&
+                   !(owner.disk == CopyState::Resident && owner.disk_committed)) {
             const Snapshot* best = unbacked == kNoId ? nullptr : &snapshots_[slot_owner_[unbacked]];
             if (best == nullptr || owner.priority < best->priority ||
                 (owner.priority == best->priority && owner.last_hit_tick < best->last_hit_tick)) {
@@ -953,6 +1327,9 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     snapshot.device_slot      = device_slot;
     snapshot.host_slabs.clear();
     snapshot.host            = CopyState::Absent;
+    snapshot.disk_ref        = kNoId;
+    snapshot.disk            = CopyState::Absent;
+    snapshot.disk_committed  = false;
     snapshot.pins            = 0;
     snapshot.kind            = kind;
     snapshot.hits            = 0;
@@ -967,6 +1344,7 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     if (anchor.valid()) {
         adjust_live(anchor_index, +1);
         adjust_retained(anchor_index, +1);
+        adjust_undisked(anchor_index, +1); // an unpublished closure is not disk-committed
     }
     link_snapshot(index);
     std::vector<std::uint32_t> dependents;
@@ -1167,6 +1545,20 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     unlink_snapshot(index);
     snapshot.superseded      = false;
     snapshot.superseded_tick = 0;
+    // Whether this snapshot's disk closure had been published; a removal of an uncommitted
+    // snapshot stops holding the volatile copies its resume would have needed.
+    const bool committed_before_removal =
+        snapshot.disk == CopyState::Resident && snapshot.disk_committed;
+    if (snapshot.disk != CopyState::Absent) {
+        // The backend reclaims the snapshot's disk closure (image parts and any tail record).
+        const std::uint32_t disk_ref    = snapshot.disk_ref;
+        const bool committed            = committed_before_removal;
+        snapshot.disk_ref               = kNoId;
+        snapshot.disk                   = CopyState::Absent;
+        snapshot.disk_committed         = false;
+        if (committed) { --disk_committed_snapshots_; }
+        backend_->release_snapshot_disk_records(ref_of_snapshot(index), disk_ref, committed);
+    }
     backend_->release_snapshot(ref_of_snapshot(index));
     std::vector<std::uint32_t>& anchored =
         snapshot.anchor != kNoId ? nodes_[snapshot.anchor].snapshots : root_snapshots_;
@@ -1190,7 +1582,12 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     ++snapshot.generation;
     free_snapshots_.push_back(index);
     --snapshot_count_;
-    if (anchor != kNoId) { adjust_live(anchor, -1); }
+    if (anchor != kNoId) {
+        adjust_live(anchor, -1);
+        // A snapshot that leaves without a committed closure no longer holds the volatile copies
+        // its resume would have needed.
+        if (!committed_before_removal) { adjust_undisked(anchor, -1); }
+    }
     if (release_tail) { backend_->release_device_block(tail_device); }
     for (const std::uint32_t other : dependents) { update_priority(other); }
     if (retained_above != kNoId) { update_priority(retained_above); }
@@ -1202,6 +1599,13 @@ void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
         invariant("prefix cache removes a pinned or transferring node");
     }
     if (node.host == CopyState::Resident) { free_slab(node.host_slab); }
+    if (node.disk == CopyState::Resident) {
+        const std::uint32_t disk_ref = node.disk_ref;
+        node.disk_ref                = kNoId;
+        node.disk                    = CopyState::Absent;
+        --disk_resident_blocks_;
+        backend_->release_disk_record(disk_ref);
+    }
     node.host      = CopyState::Absent;
     node.host_slab = kNoId;
     lru_remove(index);
@@ -1243,6 +1647,7 @@ void PrefixCacheIndex::remove_subtree(std::uint32_t root) {
         node.occupied       = false;
         node.parent         = kNoId;
         node.live_below     = 0;
+        node.undisked_below = 0;
         node.retained_below = 0;
         ++node.generation;
         free_nodes_.push_back(index);
@@ -1261,6 +1666,8 @@ NodeView PrefixCacheIndex::node(NodeRef ref) const {
     view.device               = node.device;
     view.host_slab            = node.host_slab;
     view.host                 = node.host;
+    view.disk_ref             = node.disk_ref;
+    view.disk                 = node.disk;
     view.pins                 = node.pins;
     view.live_snapshots_below = node.live_below;
     return view;
@@ -1277,10 +1684,14 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.device_slot      = snapshot.device_slot;
     view.host             = snapshot.host;
     view.host_slabs       = snapshot.host_slabs;
+    view.disk_ref         = snapshot.disk_ref;
+    view.disk             = snapshot.disk;
+    view.disk_committed   = snapshot.disk_committed;
     view.pins             = snapshot.pins;
     view.kind             = snapshot.kind;
     view.hits             = snapshot.hits;
     view.superseded       = snapshot.superseded;
+    view.superseded_tick  = snapshot.superseded_tick;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
@@ -1367,8 +1778,11 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     node.device_id      = kNoId;
     node.host_slab      = slab.front();
     node.host           = CopyState::Resident;
+    node.disk_ref       = kNoId;
+    node.disk           = CopyState::Absent;
     node.pins           = 0;
     node.live_below     = 0;
+    node.undisked_below = 0;
     node.retained_below = 0;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
@@ -1423,6 +1837,9 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.device_slot      = kNoId;
     snapshot.host_slabs       = std::move(slabs);
     snapshot.host             = CopyState::Resident;
+    snapshot.disk_ref         = kNoId;
+    snapshot.disk             = CopyState::Absent;
+    snapshot.disk_committed   = false;
     snapshot.pins             = 0;
     snapshot.kind             = kind;
     snapshot.hits             = hits;
@@ -1435,6 +1852,136 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     if (anchor.valid()) {
         adjust_live(anchor_index, +1);
         adjust_retained(anchor_index, +1);
+        adjust_undisked(anchor_index, +1); // a restored Host snapshot has no disk closure
+    }
+    link_snapshot(index);
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(index, dependents);
+    revalue_around(index, dependents);
+    refresh_tail(index);
+    return ref_of_snapshot(index);
+}
+
+std::optional<NodeRef> PrefixCacheIndex::restore_disk_block(NodeRef parent,
+                                                            std::uint64_t lookup_hash,
+                                                            std::span<const TokenId> tokens,
+                                                            std::uint64_t extra,
+                                                            std::uint32_t disk_ref) {
+    if (config_.disk_capacity_records == 0 || tokens.size() != kBlockTokens ||
+        disk_ref == kNoId) {
+        throw std::invalid_argument(
+            "prefix cache disk restore requires the disk tier and a full block");
+    }
+    const std::uint32_t parent_index = parent.valid() ? parent.index : kNoId;
+    if (parent.valid() && nodes_[parent_index].disk != CopyState::Resident) {
+        invariant("prefix cache restored disk block has no disk-resident parent");
+    }
+    if (const std::optional<NodeRef> existing = find_child(parent, lookup_hash, tokens, extra)) {
+        // The same identity reached the index through another path (a shared prefix whose
+        // earlier records replayed into an existing node): the catalog record still backs
+        // this block, so mark the copy instead of building a duplicate node. A restored
+        // snapshot below requires its whole anchor chain disk-resident.
+        Node& node = nodes_[existing->index];
+        if (node.disk == CopyState::Absent) {
+            node.disk     = CopyState::Resident;
+            node.disk_ref = disk_ref;
+            ++disk_resident_blocks_;
+            ++counters_.disk_restored_blocks;
+            refresh_node(existing->index);
+        }
+        return existing;
+    }
+    if (free_nodes_.empty()) { return std::nullopt; }
+    const std::uint32_t index = free_nodes_.back();
+    free_nodes_.pop_back();
+    Node& node    = nodes_[index];
+    node.occupied = true;
+    node.parent   = parent_index;
+    node.depth    = parent.valid() ? nodes_[parent_index].depth + 1U : 0U;
+    node.hash     = lookup_hash;
+    node.extra    = extra;
+    std::copy(tokens.begin(), tokens.end(), node.tokens.begin());
+    node.children.clear();
+    node.snapshots.clear();
+    node.device_id = kNoId;
+    node.device    = CopyState::Absent;
+    node.host_slab = kNoId;
+    node.host      = CopyState::Absent;
+    node.disk_ref  = disk_ref;
+    node.disk      = CopyState::Resident;
+    node.pins      = 0;
+    node.live_below     = 0;
+    node.undisked_below = 0;
+    node.retained_below = 0;
+    if (parent.valid()) {
+        nodes_[parent_index].children.push_back(index);
+    } else {
+        root_children_.push_back(index);
+    }
+    children_.emplace(child_key(parent_index, lookup_hash), index);
+    ++node_count_;
+    ++disk_resident_blocks_;
+    ++counters_.disk_restored_blocks;
+    refresh_node(index);
+    return ref_of_node(index);
+}
+
+std::optional<SnapshotRef> PrefixCacheIndex::restore_disk_snapshot(NodeRef anchor,
+                                                                   std::uint32_t frontier,
+                                                                   std::span<const TokenId> tail,
+                                                                   SnapshotKind kind,
+                                                                   std::uint32_t hits,
+                                                                   std::uint32_t disk_ref,
+                                                                   bool committed) {
+    if (config_.disk_capacity_records == 0 || tail.size() >= kBlockTokens) {
+        throw std::invalid_argument("prefix cache restored disk snapshot is inconsistent");
+    }
+    const std::uint32_t anchor_index = anchor.valid() ? anchor.index : kNoId;
+    const std::uint32_t base = anchor.valid() ? (require(anchor).depth + 1U) * kBlockTokens : 0U;
+    if (frontier == 0 || frontier != base + static_cast<std::uint32_t>(tail.size()) ||
+        (anchor.valid() && nodes_[anchor_index].disk != CopyState::Resident)) {
+        throw std::invalid_argument("prefix cache restored snapshot does not match its anchor");
+    }
+    std::vector<std::uint32_t>& anchored =
+        anchor.valid() ? nodes_[anchor_index].snapshots : root_snapshots_;
+    for (const std::uint32_t existing : anchored) {
+        const Snapshot& other = snapshots_[existing];
+        if (other.tail_len == tail.size() &&
+            std::equal(tail.begin(), tail.end(), other.tail.begin())) {
+            return std::nullopt;
+        }
+    }
+    if (free_snapshots_.empty()) { return std::nullopt; }
+    const std::uint32_t index = free_snapshots_.back();
+    free_snapshots_.pop_back();
+    Snapshot& snapshot = snapshots_[index];
+    snapshot.occupied  = true;
+    snapshot.anchor    = anchor_index;
+    snapshot.frontier  = frontier;
+    snapshot.tail_len  = static_cast<std::uint32_t>(tail.size());
+    std::copy(tail.begin(), tail.end(), snapshot.tail.begin());
+    snapshot.tail_device      = kNoId;
+    snapshot.tail_device_copy = CopyState::Absent;
+    snapshot.device_slot      = kNoId;
+    snapshot.host_slabs.clear();
+    snapshot.host       = CopyState::Absent;
+    snapshot.disk_ref   = disk_ref;
+    snapshot.disk       = CopyState::Resident;
+    snapshot.disk_committed = committed;
+    snapshot.pins       = 0;
+    snapshot.kind       = kind;
+    snapshot.hits       = hits;
+    snapshot.last_hit_tick  = ++tick_;
+    snapshot.priority_base = inflation_;
+    snapshot.superseded      = false;
+    snapshot.superseded_tick = 0;
+    if (committed) { ++disk_committed_snapshots_; }
+    anchored.push_back(index);
+    ++snapshot_count_;
+    if (anchor.valid()) {
+        adjust_live(anchor_index, +1);
+        adjust_retained(anchor_index, +1);
+        if (!committed) { adjust_undisked(anchor_index, +1); }
     }
     link_snapshot(index);
     std::vector<std::uint32_t> dependents;
@@ -1533,11 +2080,18 @@ PrefixIndexStats PrefixCacheIndex::stats() const noexcept {
     stats.device_evictable_blocks = device_evictable_blocks();
     stats.device_resident_blocks  = device_resident_;
     stats.free_device_slots       = free_slots_;
+    stats.disk_resident_blocks     = disk_resident_blocks_;
+    stats.disk_committed_snapshots = disk_committed_snapshots_;
+    stats.disk_record_bytes        = static_cast<std::uint64_t>(disk_resident_blocks_) *
+                                     config_.block_bytes +
+                                     static_cast<std::uint64_t>(disk_committed_snapshots_) *
+                                         config_.image_bytes;
     return stats;
 }
 
 void PrefixCacheIndex::check_invariants() const {
     std::vector<std::uint32_t> live(nodes_.size(), 0);
+    std::vector<std::uint32_t> undisked(nodes_.size(), 0);
     std::vector<std::uint32_t> slab_uses(config_.host_slabs, 0);
     std::uint32_t occupied_nodes = 0;
     for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
@@ -1556,8 +2110,17 @@ void PrefixCacheIndex::check_invariants() const {
         } else if (node.depth != 0) {
             invariant("root child has nonzero depth");
         }
-        if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
+        if (node.device == CopyState::Absent && node.host == CopyState::Absent &&
+            node.disk == CopyState::Absent) {
             invariant("node has no copy");
+        }
+        if (node.disk != CopyState::Absent) {
+            if (node.disk_ref == kNoId) { invariant("disk-resident node has no record id"); }
+            if (node.disk == CopyState::Filling && node.pins == 0) {
+                invariant("disk fill without a pin");
+            }
+        } else if (node.disk_ref != kNoId) {
+            invariant("node holds a disk record id without a disk copy");
         }
         if (node.host != CopyState::Absent) {
             if (node.host_slab >= config_.host_slabs) { invariant("node slab out of range"); }
@@ -1565,7 +2128,10 @@ void PrefixCacheIndex::check_invariants() const {
         }
         const bool lru = node.device == CopyState::Resident && node.pins == 0;
         const std::uint8_t list =
-            lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
+            lru ? (node.host == CopyState::Resident || node.disk == CopyState::Resident
+                       ? kBacked
+                       : kUnbacked)
+                : kNoList;
         if (lru_links_[i].list != list) { invariant("node LRU membership is inconsistent"); }
         const bool dead =
             node.host == CopyState::Resident && node.live_below == 0 && node.pins == 0;
@@ -1589,9 +2155,23 @@ void PrefixCacheIndex::check_invariants() const {
         if (!snapshot.occupied) { continue; }
         ++occupied_snapshots;
         if (!snapshot_valid(snapshot)) { invariant("indexed snapshot is not valid"); }
+        if (snapshot.disk != CopyState::Absent) {
+            if (snapshot.disk_ref == kNoId) {
+                invariant("disk-resident snapshot has no record id");
+            }
+            if (snapshot.disk_committed && snapshot.disk != CopyState::Resident) {
+                invariant("disk-committed snapshot is not disk-resident");
+            }
+            if (snapshot.disk == CopyState::Filling && snapshot.pins == 0) {
+                invariant("snapshot disk fill without a pin");
+            }
+        } else if (snapshot.disk_ref != kNoId || snapshot.disk_committed) {
+            invariant("snapshot holds disk state without a disk copy");
+        }
         for (std::uint32_t current = snapshot.anchor; current != kNoId;
              current               = nodes_[current].parent) {
             ++live[current];
+            if (!snapshot.disk_committed) { ++undisked[current]; }
             if (!snapshot.superseded) { ++retained[current]; }
         }
         if (snapshot.ancestor != find_ancestor(i)) {
@@ -1626,6 +2206,9 @@ void PrefixCacheIndex::check_invariants() const {
         if (nodes_[i].occupied && nodes_[i].live_below != live[i]) {
             invariant("live snapshot count is inconsistent");
         }
+        if (nodes_[i].occupied && nodes_[i].undisked_below != undisked[i]) {
+            invariant("uncommitted snapshot count is inconsistent");
+        }
         if (nodes_[i].occupied && nodes_[i].retained_below != retained[i]) {
             invariant("retained snapshot count is inconsistent");
         }
@@ -1641,6 +2224,22 @@ void PrefixCacheIndex::check_invariants() const {
             ++counted[list];
         }
         if (counted[list] != lru_[list].count) { invariant("LRU count mismatch"); }
+    }
+    std::uint32_t disk_blocks = 0;
+    for (const Node& node : nodes_) {
+        if (node.occupied && node.disk == CopyState::Resident) { ++disk_blocks; }
+    }
+    if (disk_blocks != disk_resident_blocks_) {
+        invariant("disk-resident block gauge mismatch");
+    }
+    std::uint32_t disk_closures = 0;
+    for (const Snapshot& snapshot : snapshots_) {
+        if (snapshot.occupied && snapshot.disk == CopyState::Resident && snapshot.disk_committed) {
+            ++disk_closures;
+        }
+    }
+    if (disk_closures != disk_committed_snapshots_) {
+        invariant("disk-committed snapshot gauge mismatch");
     }
 }
 

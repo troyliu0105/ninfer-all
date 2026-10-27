@@ -13,6 +13,10 @@ This document is the authority for the Hybrid mode. §0–§11 describe the desi
 marking the parts of the original design that were not built; §12–§15 cover optional features,
 tests, configuration and risks.
 
+The [disk-tier extension](hybrid-prefix-cache-disk-tier.md) adds a third Disk residency for cold
+retention and restart reconstruction. It is implemented for the Hybrid path; the two-tier behavior
+and option contracts described here are unchanged when `--disk-kv-path` is absent.
+
 Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4),
@@ -21,7 +25,10 @@ and every speculative backend (none, MTP, DFlash, DFlash2).
 In this line the mode runs on one device: pipeline stages (`--devices` with more than one entry)
 are rejected with it, and so are the checkpoint catalog's own policies (`--auto-long-anchors`,
 `--auto-prefix-grid`, `--context-cache-policy`, `--release-diverged-checkpoints`,
-`--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the disk tier). Host
+`--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the Legacy disk
+switches `--disk-kv-restore` and `--disk-kv-directstorage`). The Hybrid disk tier
+(`--disk-kv-path` with `--disk-kv-gib`) is the one disk form it accepts; see its own reference.
+Host
 restores and snapshot copies take the rank-stream form of the KV and StateImage copy routines, and a
 Vision prefill uses the concurrent overlay window when one is configured. The measurements below are the original
 author's on an RTX 5090.
@@ -65,6 +72,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §7.7 endpoint snapshots at finish and consistent abort | implemented |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
+| disk tier (third residency) | implemented for the extension path (`--disk-kv-path`/`--disk-kv-gib` in Hybrid open their own catalog): Host-pressure demotion, one-tree Device/Host/Disk sourcing and restart reconstruction — see [the disk-tier design](hybrid-prefix-cache-disk-tier.md); demotion/preparation lifecycle verified by the real-engine scenarios, not host-only unit tests |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |

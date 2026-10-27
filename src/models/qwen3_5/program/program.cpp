@@ -720,6 +720,12 @@ HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::
     return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 
+LoadSummary::DiskTierRestore Program::attach_hybrid_disk_tier(
+    const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+    std::string fingerprint) {
+    return impl_->attach_hybrid_disk_tier(directory, capacity_bytes, std::move(fingerprint));
+}
+
 std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
     return impl_->hybrid_shutdown_save();
 }

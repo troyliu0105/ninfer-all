@@ -56,6 +56,9 @@ std::string disk_profile_directory(KvCacheStorage storage, std::size_t main_stri
 } // namespace
 
 void ProgramImpl::open_disk_tier(const SequencePlanImpl& plan) {
+    // The Hybrid mode owns its own disk tier (attach_hybrid_disk_tier): this Legacy bridge
+    // must not pin its staging arena or nest its directories beside the Hybrid catalog.
+    if (context_cache.mode == ContextCacheMode::Hybrid) { return; }
     if (plan.context_cache.disk_kv_path.empty() || !context_cache.enabled) { return; }
     const HostKVPageLayout main_layout =
         plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());

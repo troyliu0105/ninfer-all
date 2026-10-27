@@ -293,6 +293,17 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_snapshot_evictions    = 0;
     std::uint64_t host_dead_reclaims         = 0;
     std::uint64_t unbacked_node_losses       = 0;
+    // Disk tier (absent when the tier is off: zeros).
+    std::uint32_t disk_resident_blocks       = 0;
+    std::uint32_t disk_committed_snapshots   = 0;
+    std::uint64_t disk_demoted_blocks        = 0;
+    std::uint64_t disk_demoted_images        = 0;
+    std::uint64_t disk_restored_blocks       = 0;
+    std::uint64_t disk_read_bytes            = 0;
+    std::uint64_t disk_write_bytes           = 0;
+    std::uint64_t disk_queue_rejects       = 0;
+    std::uint64_t disk_failed_closures     = 0;
+    std::uint64_t disk_evicted_records     = 0;
 };
 
 class RequestBasePlan {
@@ -1267,6 +1278,14 @@ public:
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
+    // Enables the disk tier under `directory` with the given capacity bound, replaying its
+    // catalog into the hybrid index before the first request. A foreign or damaged catalog is
+    // wiped and reported false — the tier then runs empty; `fingerprint` matches the
+    // Host-tier file's. A zero `capacity_bytes` selects the 64 GiB default. An unusable
+    // directory throws (the Engine fails to start rather than silently losing the tier).
+    [[nodiscard]] LoadSummary::DiskTierRestore attach_hybrid_disk_tier(
+        const std::filesystem::path& directory, std::uint64_t capacity_bytes,
+        std::string fingerprint);
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

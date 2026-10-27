@@ -315,6 +315,49 @@ int main() {
         failures += check(rejected, "a Host budget below one snapshot was accepted");
     }
 
+    // The disk tier's descriptor budget mirrors the catalog's own record arithmetic (disk-tier
+    // design §3 budgets): one block record per disk-only node, image_slabs image segments per
+    // committed closure. With a 2 MiB block payload and slab, a 32 GiB tier adds 16 GiB / 2 MiB =
+    // 8192 node slots and (16 GiB / 2 MiB) / 3 = 2730 snapshot slots, so a full tier can never
+    // exhaust the index's descriptors and insert_block's capacity invariant stays a canary.
+    {
+        using ninfer::models::qwen3_5::detail::hybrid_disk_budget;
+        using ninfer::models::qwen3_5::detail::plan_hybrid_disk_records;
+        ninfer::models::qwen3_5::detail::HybridHostLayout layout;
+        layout.block_payload_bytes = 2ULL << 20;
+        layout.slab_bytes          = 2ULL << 20;
+        layout.image_slabs         = 3;
+        const ninfer::models::qwen3_5::detail::HybridDiskBudget half =
+            hybrid_disk_budget(32ULL << 30);
+        failures += check(half.block_bytes == 16ULL << 30 && half.image_bytes == 16ULL << 30,
+                          "the disk budget did not split the capacity in half");
+        const ninfer::models::qwen3_5::detail::HybridDiskBudget odd =
+            hybrid_disk_budget((3ULL << 30) + 1U);
+        failures += check(odd.image_bytes == odd.block_bytes + 1U,
+                          "an odd capacity must leave its remainder to images");
+        const ninfer::models::qwen3_5::detail::HybridDiskBudget none = hybrid_disk_budget(0);
+        failures += check(none.block_bytes == 32ULL << 30 && none.image_bytes == 32ULL << 30,
+                          "a zero capacity did not select the 64 GiB default");
+        const ninfer::models::qwen3_5::detail::HybridDiskRecords records =
+            plan_hybrid_disk_records(layout, 32ULL << 30);
+        failures += check(records.blocks == 8192U,
+                          "the disk block half did not buy one node slot per block record");
+        failures += check(records.images == 2730U,
+                          "the disk image half did not buy one snapshot slot per closure");
+        bool rejected = false;
+        try {
+            layout.block_payload_bytes = 1ULL << 20;
+            (void)plan_hybrid_disk_records(layout, 1ULL << 53);
+        } catch (const std::overflow_error&) { rejected = true; }
+        failures += check(rejected, "an unrepresentable record budget was accepted");
+        layout.block_payload_bytes = 0;
+        rejected                   = false;
+        try {
+            (void)plan_hybrid_disk_records(layout, 32ULL << 30);
+        } catch (const std::logic_error&) { rejected = true; }
+        failures += check(rejected, "an empty Host layout was accepted");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
