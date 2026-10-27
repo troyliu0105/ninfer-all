@@ -28,9 +28,8 @@
 #
 #   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
 #
-#   * Debian multiarch CUDA 12.9 and 13.4 builds of every target, then CTest. They use the
-#     release toolchains and read the latest available native compiler snapshot without waiting
-#     for its producer. CI never uploads compiler caches.
+#   * the sm_86 build of every target in the toolchain container, then CTest, staging the image
+#     binaries (docker/stage-dist.sh) for the publishing workflow that follows.
 #
 # CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
 # Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
@@ -337,91 +336,86 @@ jobs:
         run: bash tests/test_docker_build_cache.sh docker
 
   cuda:
-    name: CUDA ${{ matrix.cuda }} multiarch build and tests (no GPU)
+    name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
     needs: build-inputs
     if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    container: debian:13-slim
     timeout-minutes: 350
     permissions:
       contents: read
-    defaults:
-      run:
-        shell: bash
-    env:
-      HF_HUB_DISABLE_TELEMETRY: '1'
-      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
-      CCACHE_MAXSIZE: 8Gi
-      CCACHE_COMPILERCHECK: content
-      CCACHE_DEPEND: "true"
-      CCACHE_COMPRESSLEVEL: "5"
-      DEBIAN_FRONTEND: noninteractive
-      LANG: C.UTF-8
-      LC_ALL: C.UTF-8
-      LC_CTYPE: C.UTF-8
-      ARCHS: ${{ matrix.archs }}
-      CUDA_VERSION: ${{ matrix.cuda }}
+      packages: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - cuda: '12.9.2'
-            archs: '70;75;80;86;89'
-          - cuda: '13.4.3'
-            archs: '75;80;86;89;120a'
+        arch: ['86']
     steps:
-      - name: Reserve time for tests and diagnostics
-        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
-      - name: Install checkout tools
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
+      # to spare, so nothing is deleted to make space; the free space is logged.
+      - name: Cache location
+        run: |
+          # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
+          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          df -h /
       - uses: actions/checkout@v7
-      - name: Install Debian build dependencies and official CUDA Toolkit
-        run: .github/scripts/install-linux-release-tools.sh
-      - id: compiler-cache
-        name: Install pinned object cache
-        run: python3.11 .github/scripts/install-compiler-cache.py
-      - name: Install cache client and CTest Python dependency
-        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0 jinja2
-      - name: Read available native snapshot (optional)
-        timeout-minutes: 10
-        continue-on-error: true
-        env:
-          # Reuse the bucket token only for restore. Fork PRs receive no secret.
-          HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
-          CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }}-shared-v1 --source-ref "$CACHE_SOURCE_REF" --optional
-      - name: Verify object-cache reuse and CUDA invalidation
-        timeout-minutes: 10
-        run: python3.11 .github/scripts/check-compiler-cache.py
-      - name: Configure release products and tests
-        run: .github/scripts/configure-linux-build.sh ON
-      - name: Check compiler resource budget
-        id: capacity
-        run: python3.11 .github/scripts/check-build-capacity.py --jobs 4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Published once per change of the toolchain stage (by the build-cache job) and pulled after
+      # that; a run that finds it missing builds it for itself.
+      - name: Toolchain image
+        run: .github/scripts/toolchain-image.sh
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ccache-sm${{ matrix.arch }}-
+      # A step timeout below the job's, so that a cold build which runs out of time still saves
+      # its ccache and the next run continues from there.
       - name: Build every target
         id: build
-        timeout-minutes: 305
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
-      - name: Run CTest
-        timeout-minutes: 15
+        timeout-minutes: 320
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # The stub lets binaries load without a driver; GPU tests skip with exit 77.
-          mkdir -p /tmp/stub
-          ln -s "$CUDA_PATH/lib64/stubs/libcuda.so" /tmp/stub/libcuda.so.1
-          LD_LIBRARY_PATH=/tmp/stub ctest --test-dir build-release --output-on-failure -j
-      - name: Record local cache counters
-        if: always() && steps.compiler-cache.outcome == 'success'
-        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
-      - name: Preserve build diagnostics
+          mkdir -p "$CCACHE_HOST_DIR"
+          docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
+            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=4G -e NINFER_CUDA_ARCH=${{ matrix.arch }} \
+            -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci ninfer-toolchain:ci bash -c \
+            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
+            > build-ci.log 2>&1 &
+          build=$!
+          .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
+          tail -n +1 -f build-ci.log --pid="$build" &
+          wait "$build"
+      - name: Report the build status
         if: always()
-        uses: actions/upload-artifact@v7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/build-progress.sh finish "build progress (sm_${{ matrix.arch }})" "${{ steps.build.outcome }}"
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
         with:
-          name: ci-logs-cuda-${{ matrix.cuda }}
-          path: |
-            build-release/*.log
-            build-release/cache-stats.json
-            build-release/cache-progress.jsonl
-            build-release/Testing/Temporary/LastTest.log
-            build-cache-check/cache-stats.json
-          if-no-files-found: ignore
-          retention-days: 7
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+      - name: Run CTest
+        run: |
+          # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,
+          # and every test that needs a device skips itself.
+          docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-ci \
+            ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
+              LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'
+      - name: Stage the image binaries
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
+            docker/stage-dist.sh build-ci ${{ matrix.arch }} dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-sm${{ matrix.arch }}
+          path: dist/
+          # Only the publishing run that follows reads them.
+          retention-days: 1

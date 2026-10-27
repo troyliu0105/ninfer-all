@@ -150,6 +150,10 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.pressure_maximal_fallback_selections ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.engine_recoveries != report.previous.engine_recoveries ||
+           report.current.hybrid_disk_demoted_blocks !=
+               report.previous.hybrid_disk_demoted_blocks ||
+           report.current.hybrid_disk_restored_blocks !=
+               report.previous.hybrid_disk_restored_blocks ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||
            report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||

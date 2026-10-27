@@ -18,7 +18,7 @@ case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
       base="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .target_commitish)" || base=''
     else
       repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-      base="$(docker buildx imagetools inspect "ghcr.io/$repository:cuda13.4" \
+      base="$(docker buildx imagetools inspect "ghcr.io/$repository:latest" \
         --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base=''
     fi ;;
   push:*) base="$(git rev-parse --verify --quiet 'HEAD^1')" || base='' ;;

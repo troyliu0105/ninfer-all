@@ -283,6 +283,10 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
     }
+    if (metrics.materialization.restored_disk_bytes != 0) {
+        out << ", " << product::format_pretty_bytes(metrics.materialization.restored_disk_bytes)
+            << " from disk";
+    }
     out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
         << product::format_pretty_duration(metrics.total_seconds);
     if (metrics.engine_timing.queue_wait_seconds >= 0.01) {
@@ -451,6 +455,33 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
     out << " | host " << product::format_pretty_percent(host_ratio) << " ("
         << product::format_pretty_duration(host_seconds) << ')';
+    // Host KV pressure: the pinned slab pool's occupancy. Absolute gauges, not deltas.
+    if (report.current.hybrid_host_capacity_bytes != 0) {
+        const double host_kv_ratio =
+            static_cast<double>(report.current.hybrid_host_used_bytes) /
+            static_cast<double>(report.current.hybrid_host_capacity_bytes);
+        out << " | host kv " << product::format_pretty_percent(host_kv_ratio) << " ("
+            << product::format_pretty_bytes(report.current.hybrid_host_used_bytes) << '/'
+            << product::format_pretty_bytes(report.current.hybrid_host_capacity_bytes) << ')';
+    }
+    // Hybrid prefix cache disk tier: demotions (Host → disk) and restores (disk → Host) in
+    // this interval, with the bytes moved.
+    const std::uint64_t disk_demoted = report.current.hybrid_disk_demoted_blocks -
+                                       report.previous.hybrid_disk_demoted_blocks;
+    const std::uint64_t disk_restored = report.current.hybrid_disk_restored_blocks -
+                                       report.previous.hybrid_disk_restored_blocks;
+    if (disk_demoted != 0) {
+        out << " | disk demoted " << product::format_pretty_count(disk_demoted) << " blocks ("
+            << product::format_pretty_bytes(
+                   report.current.hybrid_disk_write_bytes - report.previous.hybrid_disk_write_bytes)
+            << ')';
+    }
+    if (disk_restored != 0) {
+        out << " | disk restored " << product::format_pretty_count(disk_restored) << " blocks ("
+            << product::format_pretty_bytes(
+                   report.current.hybrid_disk_read_bytes - report.previous.hybrid_disk_read_bytes)
+            << ')';
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
@@ -612,6 +643,18 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           product::format_pretty_bytes(memory.host_state_image_bytes),
                           product::format_pretty_bytes(memory.host_kv_page_group_bytes),
                           *cache.max_long_anchors_per_continuation);
+        }
+        if (cache.disk_kv_path.empty() == false) {
+            const auto& disk = service.load_summary().disk_tier;
+            if (disk.status == ninfer::LoadSummary::DiskTierRestore::Status::Replayed) {
+                logger_->info(
+                    "disk cache | replayed {} blocks, {} snapshots | {} KV",
+                    product::format_pretty_count(disk.blocks),
+                    product::format_pretty_count(disk.snapshots),
+                    product::format_pretty_bytes(disk.kv_bytes));
+            } else {
+                logger_->info("disk cache | foreign catalog wiped, starting empty");
+            }
         }
     } else {
         logger_->info("context cache | root only");

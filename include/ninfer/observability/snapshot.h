@@ -207,6 +207,17 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_snapshot_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;
     std::uint64_t hybrid_unbacked_node_losses    = 0;
+    // Hybrid disk tier (zeros when the tier is off).
+    std::uint32_t hybrid_disk_resident_blocks    = 0;
+    std::uint32_t hybrid_disk_committed_snapshots = 0;
+    std::uint64_t hybrid_disk_demoted_blocks     = 0;
+    std::uint64_t hybrid_disk_demoted_images     = 0;
+    std::uint64_t hybrid_disk_restored_blocks    = 0;
+    std::uint64_t hybrid_disk_read_bytes         = 0;
+    std::uint64_t hybrid_disk_write_bytes        = 0;
+    std::uint64_t hybrid_disk_queue_rejects      = 0;
+    std::uint64_t hybrid_disk_failed_closures    = 0;
+    std::uint64_t hybrid_disk_evicted_records    = 0;
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.
     std::uint64_t engine_recoveries = 0;
@@ -348,6 +359,19 @@ struct LoadSummary {
         std::uint64_t required_host_bytes = 0;
         std::uint64_t host_bytes          = 0;
     } prefix_cache;
+
+    // The hybrid disk tier's catalog at startup: replayed, or foreign/damaged and wiped
+    // (the Engine proceeded without its disk content).
+    struct DiskTierRestore {
+        enum class Status : std::uint8_t { NotConfigured, Replayed, ForeignWiped };
+        Status status = Status::NotConfigured;
+        // Blocks and snapshots restored into the index from the replayed catalog.
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        // KV bytes the restored blocks represent (blocks × block_payload_bytes).
+        std::uint64_t kv_bytes  = 0;
+    };
+    DiskTierRestore disk_tier;
 };
 
 } // namespace ninfer
