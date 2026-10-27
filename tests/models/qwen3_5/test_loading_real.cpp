@@ -82,8 +82,13 @@ void check_native_inputs(const qwen::Model& model) {
         return ops::prepare_linear_weight(model.rotated_input(id));
     };
     const auto dense = [&](const qwen::DenseWeights& weights) {
-        (void)ops::prepare_linear_swiglu_weight(model.rotated_input(weights.gate),
-                                                model.rotated_input(weights.up));
+        const std::array inputs{model.rotated_input(weights.gate), model.rotated_input(weights.up)};
+        if (ops::joins(inputs)) {
+            (void)ops::prepare_linear_swiglu_weight(inputs[0], inputs[1]);
+        } else {
+            (void)ops::prepare_linear_weight(inputs[0]);
+            (void)ops::prepare_linear_weight(inputs[1]);
+        }
         (void)linear(weights.down);
     };
     const auto block = [&](const qwen::BlockWeights& weights, bool mtp = false) {
@@ -92,7 +97,7 @@ void check_native_inputs(const qwen::Model& model) {
                 const std::array bank{
                     model.rotated_input(attention->query), model.rotated_input(attention->key),
                     model.rotated_input(attention->gate), model.rotated_input(attention->value)};
-                (void)ops::prepare_linear_weight(bank);
+                if (ops::joins(bank)) { (void)ops::prepare_linear_weight(bank); }
                 for (const auto& input : bank) { (void)ops::prepare_linear_weight(input); }
             } else {
                 (void)ops::prepare_attn_input_proj_weights(
@@ -156,9 +161,8 @@ void check_native_inputs(const qwen::Model& model) {
             (void)ops::prepare_attn_input_proj_weights(model.rotated_input(a.query),
                                                        model.rotated_input(a.key),
                                                        model.rotated_input(a.value));
-            const std::array kv{model.rotated_input(a.context_key),
-                                model.rotated_input(a.context_value)};
-            (void)ops::prepare_linear_weight(kv);
+            (void)linear(a.context_key);
+            (void)linear(a.context_value);
             (void)linear(a.output);
             dense(layer.mlp);
             if (layer.attention_conv) { (void)linear(layer.attention_conv->kernel_projection); }

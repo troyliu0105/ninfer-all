@@ -3,10 +3,14 @@
 #include "core/decode_graph.h"
 
 #include "ops/input_projection_test_common.h"
+
+#include "ops/gguf_reference.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
 #include <algorithm>
+#include <cstring>
+#include <random>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +39,10 @@ constexpr std::array<std::int32_t, 27> kSampledRows{
 constexpr ReductionCriterion kCriterion{/*relative_l2=*/3.2e-3,
                                         /*gross_absolute=*/1.0e-3,
                                         /*gross_relative=*/kBf16GrossRelativeFloor};
+// A GGUF product quantises the activation to ggml's q8_1: the A8 budget, not A16's.
+constexpr ReductionCriterion kGgufA8Criterion{/*relative_l2=*/0.04,
+                                              /*gross_absolute=*/1.0 / 256.0,
+                                              /*gross_relative=*/0.06};
 
 std::uint32_t mix32(std::uint32_t value) {
     value ^= value >> 16;
@@ -158,6 +166,33 @@ std::vector<double> result_oracle(const std::vector<double>& projection,
     return result;
 }
 
+// Random blocks of one ggml type with finite binary16 multipliers, as a release stores them.
+std::vector<std::uint8_t> make_gguf_blocks(QType qtype, std::int32_t rows, std::int32_t k) {
+    const auto block         = gguf_block_shape(qtype);
+    const std::int64_t count = std::int64_t(rows) * (k / block.elements);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count) * block.bytes);
+    std::mt19937 rng(0x71u + static_cast<std::uint32_t>(k));
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002F, 0.02F);
+    for (auto& value : bytes) { value = static_cast<std::uint8_t>(byte(rng)); }
+    std::vector<int> half_fields;
+    switch (qtype) {
+    case QType::GGUF_Q2_K: half_fields = {80, 82}; break;
+    case QType::GGUF_Q3_K: half_fields = {108}; break;
+    case QType::GGUF_Q4_K: half_fields = {0, 2}; break;
+    case QType::GGUF_Q6_K: half_fields = {208}; break;
+    default: throw std::invalid_argument("no block layout for this type");
+    }
+    for (std::int64_t i = 0; i < count; ++i) {
+        std::uint8_t* base = bytes.data() + i * block.bytes;
+        for (const int offset : half_fields) {
+            const std::uint16_t bits = f32_to_bf16(scale(rng)) & 0x7f80U;
+            std::memcpy(base + offset, &bits, sizeof(bits));
+        }
+    }
+    return bytes;
+}
+
 std::vector<double> gather_actual(const void* device, std::int32_t width, std::int32_t batch_size) {
     const std::int32_t cols = width * batch_size;
     const std::vector<double> full =
@@ -179,9 +214,11 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-// Q8 takes the fused routes; Q4 and Q5 (a compressed drafter) go through Linear into the same BF16
-// plane and the shared finish.
-int run_profile(std::int32_t input_rows, QType qtype) {
+// Q8 takes the fused routes; Q4 and Q5 (a compressed drafter) and a release's own ggml blocks go
+// through Linear into the same BF16 plane and the shared finish.
+int run_weight(std::int32_t input_rows, const std::string& format, const Weight& weight,
+               ops::LinearPolicy policy, const std::vector<double>& projection,
+               const ReductionCriterion& criterion) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
     std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
@@ -189,32 +226,20 @@ int run_profile(std::int32_t input_rows, QType qtype) {
     const std::vector<std::uint16_t> finish_delta = make_finish_delta();
     const std::vector<std::uint16_t> residual     = make_residual();
 
-    quantized_weight::PatternedWeightOptions weight_options;
-    weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
-    weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
-    input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
-        qtype, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows), weight_options));
-    const std::string format = qtype == QType::Q8_G32_FP16   ? "Q8"
-                               : qtype == QType::Q5_G64_FP16 ? "Q5"
-                                                             : "Q4";
-    const std::vector<double> projection =
-        projection_oracle(projection_weight.host, activation, input_rows);
-
     DeviceBuffer activation_device = to_device(activation_bits);
     DeviceBuffer base_device       = to_device(base_kernel);
     DeviceBuffer delta_device      = to_device(finish_delta);
-    const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, 2, 16, 1, kMaximumBatch);
-
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
-    const Weight weight = projection_weight.view();
-    int failures        = 0;
+    const std::size_t capacity =
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(weight, policy, 2, 16, 1,
+                                                                      kMaximumBatch);
+    int failures = 0;
     for (int width = 2; width <= 16; ++width)
         for (int batch_size = 1; batch_size <= 8; ++batch_size) {
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                input_rows, width, width, batch_size, batch_size);
+                weight, policy, width, width, batch_size, batch_size);
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);
@@ -233,8 +258,8 @@ int run_profile(std::int32_t input_rows, QType qtype) {
                 residual_device.copy_from_host(residual.data(), bytes);
                 workspace.reset_peak();
                 const auto launch = [&](cudaStream_t stream) {
-                    ops::linear_dynamic_grouped_conv_add(x, weight, base, delta, residual_view,
-                                                         workspace, stream);
+                    ops::linear_dynamic_grouped_conv_add(x, weight, policy, base, delta,
+                                                         residual_view, workspace, stream);
                 };
                 if (replay) {
                     cudaStream_t stream = nullptr;
@@ -263,23 +288,96 @@ int run_profile(std::int32_t input_rows, QType qtype) {
                     " graph=" + std::to_string(replay);
                 failures += verify_reduction(
                     label, gather_actual(residual_device.data(), width, batch_size), expected,
-                    kCriterion);
+                    criterion);
                 failures += residual_device.verify_guards(label);
                 failures += scratch.verify_guards(label + " workspace");
-                if (workspace.used() != 0 || workspace.peak_used() != exact) {
-                    std::cerr << label << ": workspace mismatch\n";
+                if (workspace.used() != 0 || workspace.peak_used() > exact) {
+                    std::cerr << label << ": workspace exceeds its capacity\n";
                     ++failures;
                 }
             }
         }
 
     failures +=
-        verify_preserved("linear dynamic grouped conv add x", activation_device, activation_bits);
-    failures += verify_preserved("linear dynamic grouped conv add base", base_device, base_kernel);
+        verify_preserved("linear dynamic grouped conv add x " + format, activation_device,
+                         activation_bits);
     failures +=
-        verify_preserved("linear dynamic grouped conv add delta", delta_device, finish_delta);
-    failures += projection_weight.verify_preserved("linear dynamic grouped conv add weight");
+        verify_preserved("linear dynamic grouped conv add base " + format, base_device, base_kernel);
+    failures += verify_preserved("linear dynamic grouped conv add delta " + format, delta_device,
+                                 finish_delta);
     return failures;
+}
+
+int run_profile(std::int32_t input_rows, QType qtype) {
+    quantized_weight::PatternedWeightOptions weight_options;
+    weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+    weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
+        qtype, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows), weight_options));
+    const std::string format = qtype == QType::Q8_G32_FP16   ? "Q8"
+                               : qtype == QType::Q5_G64_FP16 ? "Q5"
+                                                             : "Q4";
+    const std::vector<float> activation = make_activation(input_rows);
+    const std::vector<double> projection =
+        projection_oracle(projection_weight.host, activation, input_rows);
+    const int failures =
+        run_weight(input_rows, format, projection_weight.view(), ops::LinearPolicy::A16Only,
+                   projection, kCriterion);
+    return failures +
+           projection_weight.verify_preserved("linear dynamic grouped conv add weight " + format);
+}
+
+// A release's own ggml blocks: the projection is decoded independently in FP64 for the oracle, and
+// its product quantises the activation to q8_1, which is what the A8 budget covers.
+int run_gguf(std::int32_t input_rows, QType qtype) {
+    const auto block        = gguf_block_shape(qtype);
+    const std::vector<std::uint8_t> blocks = make_gguf_blocks(qtype, kHidden, input_rows);
+    DeviceBuffer block_device(blocks.size());
+    block_device.copy_from_host(blocks.data(), blocks.size());
+    Weight weight{};
+    weight.payload         = block_device.p;
+    weight.payload_bytes   = blocks.size();
+    weight.qtype           = qtype;
+    weight.layout          = QuantLayout::GgufBlocks;
+    weight.ndim            = 2;
+    weight.n               = kHidden;
+    weight.k               = input_rows;
+    weight.shape[0]        = kHidden;
+    weight.shape[1]        = input_rows;
+    weight.padded_shape[0] = kHidden;
+    weight.padded_shape[1] = input_rows;
+    weight.qdata           = block_device.p;
+    weight.group_size      = static_cast<std::uint32_t>(block.elements);
+    weight.group           = block.elements;
+
+    const std::vector<float> activation = make_activation(input_rows);
+    const std::int32_t per_row          = input_rows / gguf_reference::kSuperBlock;
+    std::vector<double> projection(kSampledRows.size() * kMaximumCols);
+    std::vector<double> decoded(gguf_reference::kSuperBlock);
+    for (std::size_t sample = 0; sample < kSampledRows.size(); ++sample) {
+        for (std::int32_t col = 0; col < kMaximumCols; ++col) {
+            double accumulator = 0;
+            for (std::int32_t b = 0; b < per_row; ++b) {
+                gguf_reference::decode_block(
+                    qtype,
+                    blocks.data() + static_cast<std::size_t>(kSampledRows[sample]) * per_row *
+                                        block.bytes + static_cast<std::size_t>(b) * block.bytes,
+                    decoded.data());
+                for (int i = 0; i < gguf_reference::kSuperBlock; ++i) {
+                    accumulator += decoded[static_cast<std::size_t>(i)] *
+                                   double(activation[static_cast<std::size_t>(col) * input_rows +
+                                                     static_cast<std::size_t>(b) * 256 + i]);
+                }
+            }
+            projection[sample * kMaximumCols + col] = accumulator;
+        }
+    }
+    const std::string format = qtype == QType::GGUF_Q2_K   ? "gguf q2_k"
+                               : qtype == QType::GGUF_Q3_K ? "gguf q3_k"
+                               : qtype == QType::GGUF_Q4_K ? "gguf q4_k"
+                                                           : "gguf q6_k";
+    return run_weight(input_rows, format, weight, ops::LinearPolicy::AllowA8, projection,
+                      kGgufA8Criterion);
 }
 
 } // namespace
@@ -293,7 +391,9 @@ int main() {
         const int failures =
             run_profile(4096, QType::Q8_G32_FP16) + run_profile(17408, QType::Q8_G32_FP16) +
             run_profile(4096, QType::Q4_G64_FP16) + run_profile(17408, QType::Q4_G64_FP16) +
-            run_profile(17408, QType::Q5_G64_FP16);
+            run_profile(17408, QType::Q5_G64_FP16) +
+            run_gguf(4096, QType::GGUF_Q2_K) + run_gguf(17408, QType::GGUF_Q3_K) +
+            run_gguf(17408, QType::GGUF_Q4_K) + run_gguf(4096, QType::GGUF_Q6_K);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

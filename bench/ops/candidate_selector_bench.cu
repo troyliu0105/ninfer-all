@@ -29,6 +29,24 @@ constexpr std::int32_t kCodebookRows     = 248320;
 constexpr std::int32_t kTokenDomain      = 248077;
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
+// One codebook as the Op reads it: [rows, 256] BF16 words in row-major order.
+Weight codebook_weight(void* data) {
+    Weight weight{};
+    weight.payload         = data;
+    weight.payload_bytes   = static_cast<std::uint64_t>(kCodebookRows) * kRank * sizeof(std::uint16_t);
+    weight.qtype           = QType::BF16;
+    weight.shape[0]        = kCodebookRows;
+    weight.shape[1]        = kRank;
+    weight.padded_shape[0] = kCodebookRows;
+    weight.padded_shape[1] = kRank;
+    weight.ndim            = 2;
+    weight.qdata           = data;
+    weight.n               = kCodebookRows;
+    weight.k               = kRank;
+    weight.layout          = QuantLayout::Contiguous;
+    return weight;
+}
+
 enum class Mode : std::uint8_t {
     Greedy,
     Stochastic,
@@ -138,14 +156,14 @@ struct Fixture {
     }
 
     void tensors(std::int32_t batch_size, Tensor& ids, Tensor& unary, Tensor& hidden,
-                 Tensor& anchor, Tensor& predecessor, Tensor& successor, Tensor& positions,
+                 Tensor& anchor, Weight& predecessor, Weight& successor, Tensor& positions,
                  Tensor& draft, Tensor& q) {
         ids         = Tensor(candidate_ids.p, DType::I32, {kCandidates, kSteps, batch_size});
         unary       = Tensor(unary_scores.p, DType::FP32, {kCandidates, kSteps, batch_size});
         hidden      = Tensor(projected_hidden.p, DType::BF16, {kRank, kSteps, batch_size});
         anchor      = Tensor(anchors.p, DType::I32, {batch_size});
-        predecessor = Tensor(predecessor_codebook.p, DType::BF16, {kRank, kCodebookRows});
-        successor   = Tensor(successor_codebook.p, DType::BF16, {kRank, kCodebookRows});
+        predecessor = codebook_weight(predecessor_codebook.p);
+        successor   = codebook_weight(successor_codebook.p);
         positions   = Tensor(base_positions.p, DType::I32, {batch_size});
         draft       = Tensor(drafts.p, DType::I32, {kSteps, batch_size});
         q           = Tensor(proposal_q.p, DType::FP32, {kCandidates, kSteps, batch_size});
@@ -159,8 +177,8 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
     Tensor unary;
     Tensor hidden;
     Tensor anchor;
-    Tensor predecessor;
-    Tensor successor;
+    Weight predecessor;
+    Weight successor;
     Tensor positions;
     Tensor draft;
     Tensor q;
@@ -168,9 +186,9 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
                     draft, q);
     const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.p);
 
-    const auto route    = ops::detail::candidate_selector_path_route(fixture.kSteps, batch_size);
+    const auto route    = ops::detail::candidate_selector_path_plan(fixture.kSteps, batch_size, false);
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
-        fixture.kSteps, fixture.kSteps, batch_size, batch_size);
+        predecessor, successor, fixture.kSteps, fixture.kSteps, batch_size, batch_size);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
     TimedGraph graph;
     graph.capture(stream, [&](cudaStream_t s) {

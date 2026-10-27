@@ -100,6 +100,32 @@ def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+# Byte offsets of each stored ggml type's binary16 multipliers inside one block. A block whose
+# multiplier is not finite represents no weight at all: that source copy is corrupt there,
+# and an artifact built from it would carry NaN or unbounded rows.
+SCALE_OFFSETS = {
+    "Q4_0": (0,),
+    "Q5_0": (0,),
+    "Q8_0": (0,),
+    "Q2_K": (80, 82),
+    "Q3_K": (108,),
+    "Q4_K": (0, 2),
+    "Q5_K": (0, 2),
+    "Q6_K": (208,),
+    "IQ1_S": (0,),
+    "IQ2_XXS": (0,),
+    "IQ2_XS": (0,),
+    "IQ2_S": (0,),
+    "IQ3_XXS": (0,),
+    "IQ3_S": (0,),
+    "IQ4_NL": (0,),
+    "IQ4_XS": (0,),
+    "Q2_0": (0,),
+    "PQ2_0": (0,),
+    "PTQ1_0": (0,),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class TensorInfo:
     name: str
@@ -127,7 +153,12 @@ class TensorInfo:
 
 @dataclass(frozen=True, slots=True)
 class TernaryBlocks:
-    """Decoded ternary rows: ``values`` in ``{-1, 0, +1}`` and one scale per 128."""
+    """Decoded ternary rows and one scale per 128.
+
+    ``values`` are the quantizer's four levels ``{-1, 0, +1, +2}``: a ternary matrix uses the first
+    three, and a consumer that must produce the artifact's two-bit two's complement codes has no
+    code for ``+2`` (see ``tools.convert.ternary``).
+    """
 
     values: np.ndarray  # int8 [rows, groups, 128]
     scales: np.ndarray  # float16 [rows, groups]
@@ -177,7 +208,12 @@ class _Cursor:
 
 
 class GGUFFile:
-    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes."""
+    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes.
+
+    ``kv`` and ``tensors`` hold the decoded header; ``kv_spans`` and ``tensor_spans`` hold each
+    entry's byte span in the header, so a tool that rewrites a subset of the file can copy the
+    untouched entries verbatim instead of re-encoding them.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -195,22 +231,33 @@ class GGUFFile:
         (tensor_count,) = cursor.unpack("Q")
         (kv_count,) = cursor.unpack("Q")
         kv: dict[str, Any] = {}
+        kv_spans: dict[str, tuple[int, int]] = {}
         for _ in range(kv_count):
+            begin = cursor.position
             key = cursor.string()
             (type_id,) = cursor.unpack("I")
             kv[key] = cursor.value(type_id)
+            kv_spans[key] = (begin, cursor.position)
         tensors: dict[str, TensorInfo] = {}
+        tensor_spans: dict[str, tuple[int, int, int]] = {}
         for _ in range(tensor_count):
+            begin = cursor.position
             name = cursor.string()
             (rank,) = cursor.unpack("I")
             dims = cursor.unpack("Q" * rank)
             (type_id,) = cursor.unpack("I")
+            offset_at = cursor.position
             (offset,) = cursor.unpack("Q")
             if name in tensors:
                 raise ValueError(f"{self.path}: duplicate tensor {name}")
             # GGUF lists the fastest dimension first; NInfer shapes are row-major.
             tensors[name] = TensorInfo(name, tuple(reversed(dims)), type_id, offset)
+            tensor_spans[name] = (begin, cursor.position, offset_at)
         self.kv = kv
+        # Each header entry's byte span and, for a tensor, the position of its data offset field.
+        # A file that re-lays a subset of the tensors (the MTP split) splices these bytes.
+        self.kv_spans = kv_spans
+        self.tensor_spans = tensor_spans
         self.tensors = tensors
         self.alignment = int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
         self.header_bytes = cursor.position
@@ -309,7 +356,10 @@ class GGUFFile:
     def read_ternary(
         self, name: str, row_begin: int = 0, row_end: int | None = None
     ) -> TernaryBlocks:
-        """Decode rows ``[row_begin, row_end)`` of a PQ2_0 or PTQ1_0 matrix."""
+        """Decode rows ``[row_begin, row_end)`` of a PQ2_0 or PTQ1_0 matrix.
+
+        The rows are flattened matrix-major, as in ``read_blocks``.
+        """
 
         info = self.info(name)
         if info.type_id not in TERNARY_TYPES:
@@ -325,9 +375,86 @@ class GGUFFile:
             return decode_pq2_0(blocks)
         return decode_ptq1_0(blocks)
 
+    def non_finite_scales(self, name: str) -> tuple[int, int]:
+        """How many of a tensor's blocks hold a non-finite multiplier, and the first such block.
+
+        Only the stored scale words are read, so this costs one pass over a few bytes per block.
+        Types whose layout this module does not state report zero.
+        """
+
+        info = self.info(name)
+        offsets = SCALE_OFFSETS.get(info.type_name)
+        if not offsets:
+            return 0, -1
+        block_bytes = BLOCK_GEOMETRY[info.type_id][1]
+        blocks = np.asarray(self.tensor_bytes(name)).reshape(-1, block_bytes)
+        bad = np.zeros(blocks.shape[0], dtype=bool)
+        for offset in offsets:
+            words = blocks[:, offset : offset + 2].copy().view("<f2").reshape(-1)
+            bad |= ~np.isfinite(words)
+        if info.type_name == "IQ1_M":
+            # Its multiplier is the top nibble of each of four word-aligned scale entries,
+            # reassembled into a binary16 word (ggml-quants.c's dequantize_row_iq1_m).
+            scale = blocks[:, 32:40].copy().view("<u2").reshape(-1, 4)
+            word = (
+                (scale[:, 0] >> 12)
+                | ((scale[:, 1] >> 8) & 0x00F0)
+                | ((scale[:, 2] >> 4) & 0x0F00)
+                | (scale[:, 3] & 0xF000)
+            ).astype("<u2")
+            bad |= ~np.isfinite(word.view("<f2"))
+        count = int(np.count_nonzero(bad))
+        return count, (int(np.argmax(bad)) if count else -1)
+
+    def require_finite_scales(self, names) -> None:
+        """Refuse a tensor set whose stored multipliers include a non-finite one."""
+
+        for name in names:
+            count, first = self.non_finite_scales(name)
+            if count:
+                info = self.info(name)
+                per_row = info.shape[-1] // BLOCK_GEOMETRY[info.type_id][0] if info.shape else 1
+                raise ValueError(
+                    f"{self.path}: {name} ({info.type_name}) holds {count} blocks with a "
+                    f"non-finite multiplier, the first at row {first // max(per_row, 1)} of "
+                    f"{info.shape[0] if info.shape else 0}; the source data is corrupt there"
+                )
+
+    def read_dequantized(
+        self, name: str, row_begin: int = 0, row_end: int | None = None
+    ) -> np.ndarray:
+        """Rows ``[row_begin, row_end)`` of a stored block matrix as float32 values.
+
+        Other NInfer readers decode their blocks themselves, but a stored ggml block type is read
+        through the ``gguf`` package's reference decoder (the layouts are intricate and easy to get
+        subtly wrong), so this one read needs gguf-py installed. ggml Q2_0 predates that package
+        and falls back to the equivalent decoder beside the GGUF block recipe.
+        """
+
+        info = self.info(name)
+        if info.type_id not in BLOCK_FORMATS:
+            raise ValueError(f"{name}: {info.type_name} is not a stored block format")
+        rows = self.read_blocks(name, row_begin, row_end)
+        if info.type_name == "Q2_0":
+            from .gguf_blocks import dequantize_q2_0
+
+            return dequantize_q2_0(rows)
+        try:
+            import gguf
+        except ImportError as error:  # pragma: no cover - environment guard
+            raise ImportError(
+                "reading a stored block format requires the 'gguf' package: pip install gguf"
+            ) from error
+        values = gguf.dequantize(rows, gguf.GGMLQuantizationType(info.type_id))
+        return np.ascontiguousarray(values.reshape(rows.shape[0], -1))
+
 
 def decode_pq2_0(blocks: np.ndarray) -> TernaryBlocks:
-    """Decode ``[rows, groups, 34]`` PQ2_0 blocks: binary16 ``d`` then 32 code bytes."""
+    """Decode ``[rows, groups, 34]`` PQ2_0 blocks: binary16 ``d`` then 32 code bytes.
+
+    The two-bit codes are offset binary, so the values are ``code - 1``: ``-1``, ``0``, ``+1`` and
+    the quantizer's fourth level ``+2``.
+    """
 
     if blocks.ndim != 3 or blocks.shape[-1] != 34:
         raise ValueError(f"PQ2_0 blocks must be [rows, groups, 34], got {blocks.shape}")
@@ -339,8 +466,6 @@ def decode_pq2_0(blocks: np.ndarray) -> TernaryBlocks:
     # element j lives in byte j // 4 at bits 2 * (j % 4)
     codes = np.stack([(packed >> (2 * bit)) & 3 for bit in range(4)], axis=-1)
     codes = codes.reshape(blocks.shape[0], blocks.shape[1], TERNARY_GROUP)
-    if codes.max(initial=0) > 2:
-        raise ValueError("PQ2_0 block holds code 3 (+2), which is not ternary")
     values = (codes.astype(np.int16) - 1).astype(np.int8)
     return TernaryBlocks(values, np.ascontiguousarray(scales))
 
@@ -451,6 +576,56 @@ def encode_ptq1_0(values: np.ndarray, scales: np.ndarray) -> np.ndarray:
     )
 
 
+def encode_kv_value(value: Any) -> bytes:
+    """Encode one GGUF header value, type tag included, by Python type.
+
+    ``bool``, ``int`` (int32 unless it does not fit, then uint64), ``float`` (float32), ``str``;
+    lists must be homogeneous.
+    """
+
+    if isinstance(value, bool):
+        return struct.pack("<I?", _TYPE_BOOL, value)
+    if isinstance(value, int):
+        if -(2**31) <= value < 2**31:
+            return struct.pack("<Ii", _TYPE_INT32, value)
+        return struct.pack("<IQ", 10, value)
+    if isinstance(value, float):
+        return struct.pack("<If", _TYPE_FLOAT32, value)
+    if isinstance(value, str):
+        data = value.encode("utf-8")
+        return struct.pack("<IQ", _TYPE_STRING, len(data)) + data
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("empty GGUF arrays are not written by this helper")
+        first = value[0]
+        if isinstance(first, bool):
+            element = _TYPE_BOOL
+            body = struct.pack("<" + "?" * len(value), *value)
+        elif isinstance(first, int):
+            element = _TYPE_INT32
+            body = struct.pack("<" + "i" * len(value), *value)
+        elif isinstance(first, float):
+            element = _TYPE_FLOAT32
+            body = struct.pack("<" + "f" * len(value), *value)
+        elif isinstance(first, str):
+            element = _TYPE_STRING
+            body = b"".join(
+                struct.pack("<Q", len(item.encode("utf-8"))) + item.encode("utf-8")
+                for item in value
+            )
+        else:
+            raise TypeError(f"unsupported GGUF array element {type(first)!r}")
+        return struct.pack("<IIQ", _TYPE_ARRAY, element, len(value)) + body
+    raise TypeError(f"unsupported GGUF value {type(value)!r}")
+
+
+def encode_kv_entry(key: str, value: Any) -> bytes:
+    """Encode one ``key value`` GGUF header entry, as the header lays it out."""
+
+    key_bytes = key.encode("utf-8")
+    return struct.pack("<Q", len(key_bytes)) + key_bytes + encode_kv_value(value)
+
+
 def write_gguf(
     path: str | Path,
     kv: dict[str, Any],
@@ -464,49 +639,11 @@ def write_gguf(
     then uint64), ``float`` (float32), ``str``; lists must be homogeneous.
     """
 
-    def encode_value(value: Any) -> bytes:
-        if isinstance(value, bool):
-            return struct.pack("<I?", _TYPE_BOOL, value)
-        if isinstance(value, int):
-            if -(2**31) <= value < 2**31:
-                return struct.pack("<Ii", _TYPE_INT32, value)
-            return struct.pack("<IQ", 10, value)
-        if isinstance(value, float):
-            return struct.pack("<If", _TYPE_FLOAT32, value)
-        if isinstance(value, str):
-            data = value.encode("utf-8")
-            return struct.pack("<IQ", _TYPE_STRING, len(data)) + data
-        if isinstance(value, (list, tuple)):
-            if not value:
-                raise ValueError("empty GGUF arrays are not written by this helper")
-            first = value[0]
-            if isinstance(first, bool):
-                element = _TYPE_BOOL
-                body = struct.pack("<" + "?" * len(value), *value)
-            elif isinstance(first, int):
-                element = _TYPE_INT32
-                body = struct.pack("<" + "i" * len(value), *value)
-            elif isinstance(first, float):
-                element = _TYPE_FLOAT32
-                body = struct.pack("<" + "f" * len(value), *value)
-            elif isinstance(first, str):
-                element = _TYPE_STRING
-                body = b"".join(
-                    struct.pack("<Q", len(item.encode("utf-8"))) + item.encode("utf-8")
-                    for item in value
-                )
-            else:
-                raise TypeError(f"unsupported GGUF array element {type(first)!r}")
-            return struct.pack("<IIQ", _TYPE_ARRAY, element, len(value)) + body
-        raise TypeError(f"unsupported GGUF value {type(value)!r}")
-
     header = bytearray()
     header += GGUF_MAGIC
     header += struct.pack("<IQQ", GGUF_VERSION, len(tensors), len(kv))
     for key, value in kv.items():
-        key_bytes = key.encode("utf-8")
-        header += struct.pack("<Q", len(key_bytes)) + key_bytes
-        header += encode_value(value)
+        header += encode_kv_entry(key, value)
     offset = 0
     payloads: list[bytes] = []
     for name, shape, type_id, raw in tensors:
@@ -536,6 +673,7 @@ def write_gguf(
 __all__ = [
     "BLOCK_GEOMETRY",
     "DEFAULT_ALIGNMENT",
+    "GGUF_MAGIC",
     "GGUFFile",
     "TERNARY_GROUP",
     "TERNARY_TYPES",
@@ -551,6 +689,8 @@ __all__ = [
     "align_up",
     "decode_pq2_0",
     "decode_ptq1_0",
+    "encode_kv_entry",
+    "encode_kv_value",
     "encode_pq2_0",
     "encode_ptq1_0",
     "write_gguf",

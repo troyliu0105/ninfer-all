@@ -98,7 +98,7 @@ void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& po
                                                std::uint32_t max_visible_keys,
                                                WorkspaceArena& workspace, Tensor& out,
                                                cudaStream_t stream) {
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         launch_fast_for<Geometry>(q, positions, valid_columns, table_rows, scale, cache,
                                   max_visible_keys, workspace, out, stream);
     });

@@ -181,6 +181,16 @@ void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tens
                      Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& workspace,
                      cudaStream_t stream);
 
+/**
+ * Three-output drafter form: the parts land in the same output slots as above (0 = q, 2 = k,
+ * 3 = v; nothing lands in the gate slot). A DFlash2 adapter keeps its Q/K/V in GGUF parents of
+ * different block types and has no output gate, so the fused four-output profile does not apply.
+ * Size the transient storage with attn_input_proj_workspace_capacity_bytes(weights, min_tokens,
+ * max_tokens).
+ */
+void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tensor& q, Tensor& k,
+                     Tensor& v, WorkspaceArena& workspace, cudaStream_t stream);
+
 [[nodiscard]] std::size_t attn_input_proj_workspace_capacity_bytes(
     const PartProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);
 

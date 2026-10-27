@@ -645,6 +645,25 @@ void require_part_attention(const PartProjectionWeights& weights, std::int32_t h
     }
 }
 
+// The three-output drafter form: no part may land in the gate slot, and q/k/v must be covered.
+void require_part_attention_qkv(const PartProjectionWeights& weights, std::int32_t hidden,
+                                std::int32_t query_rows, std::int32_t kv_rows) {
+    const bool gguf = detail::gguf_parts(weights);
+    std::array<std::int64_t, 4> covered{};
+    for (const auto& part : weights.parts) {
+        if (gguf) { detail::require_gguf(part.weight, "attn_input_proj GGUF part"); }
+        const std::int32_t limit = part.output < 2 ? query_rows : kv_rows;
+        if (part.weight.k != hidden || part.output < 0 || part.output > 3 ||
+            part.output == 1 || part.row < 0 || part.row + part.weight.n > limit) {
+            throw std::invalid_argument("attn_input_proj: part outside the q/k/v profile");
+        }
+        covered[part.output] += part.weight.n;
+    }
+    if (covered[0] != query_rows || covered[2] != kv_rows || covered[3] != kv_rows) {
+        throw std::invalid_argument("attn_input_proj: parts do not cover q/k/v");
+    }
+}
+
 } // namespace
 
 std::size_t attn_input_proj_workspace_capacity_bytes(const PartProjectionWeights& weights,
@@ -667,6 +686,23 @@ void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tens
     require_matrix(v, kv_rows, cols, "v");
     require_part_attention(weights, x.ne[0], query_rows, kv_rows);
     Tensor* const outputs[] = {&q, &gate, &k, &v};
+    detail::project_parts(x, weights, outputs, workspace, stream);
+}
+
+void attn_input_proj(const Tensor& x, const PartProjectionWeights& weights, Tensor& q, Tensor& k,
+                     Tensor& v, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    const std::int32_t query_rows = q.ne[0];
+    const std::int32_t kv_rows    = k.ne[0];
+    require_matrix(x, x.ne[0], cols, "x");
+    require_matrix(q, query_rows, cols, "q");
+    require_matrix(k, kv_rows, cols, "k");
+    require_matrix(v, kv_rows, cols, "v");
+    require_part_attention_qkv(weights, x.ne[0], query_rows, kv_rows);
+    // The gate slot stays empty: a drafter has no output gate, and require_part_attention
+    // proved no part lands there.
+    Tensor* const outputs[] = {&q, nullptr, &k, &v};
     detail::project_parts(x, weights, outputs, workspace, stream);
 }
 

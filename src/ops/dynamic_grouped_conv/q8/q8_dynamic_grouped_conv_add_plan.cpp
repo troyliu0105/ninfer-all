@@ -33,6 +33,16 @@ std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     return resolve_plan(input_rows, max_width, max_batch).workspace_bytes;
 }
 
+std::size_t materialized_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    const Weight& weight, LinearPolicy policy, int min_width, int max_width, int min_batch,
+    int max_batch) {
+    const Plan plan = resolve_plan(weight.k, max_width, max_batch);
+    // Linear's plan is computed over the whole width interval, not only its widest point.
+    return plan.workspace_bytes +
+           linear_workspace_capacity_bytes(weight.qtype, 5120, weight.k, policy,
+                                           min_width * min_batch, max_width * max_batch);
+}
+
 const char* q8_linear_dynamic_grouped_conv_add_route_name(int input_rows, int width, int batch) {
     switch (resolve_plan(input_rows, width, batch).schedule) {
     case Q8DynamicConvAddSchedule::TiledMma:
@@ -56,14 +66,15 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
 }
 
 void materialized_linear_dynamic_grouped_conv_add_dispatch(
-    const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,
-    const Tensor& finish_delta, Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    const Tensor& x, const Weight& projection_weight, LinearPolicy policy,
+    const Tensor& base_kernel, const Tensor& finish_delta, Tensor& residual,
+    WorkspaceArena& workspace, cudaStream_t stream) {
     const Plan plan           = resolve_plan(x.ne[0], x.ne[1], x.ne[2]);
     auto scope                = workspace.scope();
     const DeviceSpan storage  = workspace.alloc_bytes(plan.workspace_bytes);
     const std::int32_t tokens = x.ne[1] * x.ne[2];
     Tensor projected(storage.data, DType::BF16, {5120, tokens});
-    linear(x.view({x.ne[0], tokens}), projection_weight, projected, stream);
+    linear(x.view({x.ne[0], tokens}), projection_weight, projected, policy, workspace, stream);
     dynamic_grouped_conv_finish_launch(projected, base_kernel, finish_delta, residual, x.ne[1],
                                        stream);
 }

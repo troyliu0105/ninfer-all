@@ -1,9 +1,14 @@
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
+#include "ninfer/ops/rmsnorm.h"
 
+#include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -50,6 +55,28 @@ void require_kernel_projection_weight(const Weight& weight) {
     }
 }
 
+// A GGUF kernel projection is the same [1280,5120] matrix in its stored blocks.
+void require_gguf_projection_weight(const Weight& weight, const char* op) {
+    detail::require_gguf(weight, op);
+    if (weight.n != kCoefficientRows || weight.k != kHidden || weight.ndim != 2 ||
+        weight.layout != QuantLayout::GgufBlocks || weight.shape[0] != kCoefficientRows ||
+        weight.shape[1] != kHidden || weight.padded_shape[0] != kCoefficientRows ||
+        weight.padded_shape[1] != kHidden || !aligned_to(weight.qdata, 16)) {
+        throw std::invalid_argument(std::string(op) + ": invalid GGUF projection weight");
+    }
+}
+
+// The finish projection is [5120, C] in its stored blocks.
+void require_gguf_finish_weight(const Weight& weight, std::int32_t input_rows, const char* op) {
+    detail::require_gguf(weight, op);
+    if (weight.n != kHidden || weight.k != input_rows || weight.ndim != 2 ||
+        weight.layout != QuantLayout::GgufBlocks || weight.shape[0] != kHidden ||
+        weight.shape[1] != input_rows || weight.padded_shape[0] != kHidden ||
+        weight.padded_shape[1] != input_rows || !aligned_to(weight.qdata, 16)) {
+        throw std::invalid_argument(std::string(op) + ": invalid GGUF projection weight");
+    }
+}
+
 std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
     const std::uint64_t rows       = kHidden;
     const std::uint64_t columns    = static_cast<std::uint64_t>(input_rows);
@@ -74,11 +101,14 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
 }
 
 // A row-split projection of any other format goes through Linear, which validates its registered
-// format and shape; the fused routes are Q8's.
+// format and shape; the fused routes are Q8's. A GGUF matrix reaches Linear the same way and keeps
+// its own block format.
 bool materialized_projection(const Weight& weight, std::int32_t input_rows) {
-    return weight.qtype != QType::Q8_G32_FP16 && weight.layout == QuantLayout::RowSplit &&
-           weight.ndim == 2 && weight.n == kHidden && weight.k == input_rows &&
-           weight.qdata != nullptr && weight.payload != nullptr;
+    if (weight.qtype == QType::Q8_G32_FP16 || weight.ndim != 2 || weight.n != kHidden ||
+        weight.k != input_rows || weight.qdata == nullptr || weight.payload == nullptr) {
+        return false;
+    }
+    return weight.layout == QuantLayout::RowSplit || weight.layout == QuantLayout::GgufBlocks;
 }
 
 struct Range {
@@ -133,13 +163,15 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
                         const Tensor& base_kernel, const Weight& kernel_projection_weight,
                         const Tensor& prepared, const Tensor& finish_delta,
                         const WorkspaceArena& workspace) {
-    constexpr std::size_t kWeightBytes =
-        static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+    const std::size_t weight_bytes =
+        is_gguf(kernel_projection_weight.qtype)
+            ? static_cast<std::size_t>(kernel_projection_weight.payload_bytes)
+            : static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
     const std::array<Range, 7> ranges{{
         {residual.data, residual.bytes(), "residual"},
         {norm_weight.data, norm_weight.bytes(), "norm_weight"},
         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
-        {kernel_projection_weight.qdata, kWeightBytes, "kernel_projection_weight"},
+        {kernel_projection_weight.qdata, weight_bytes, "kernel_projection_weight"},
         {prepared.data, prepared.bytes(), "prepared"},
         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
         {workspace.base(), workspace.capacity(), "workspace"},
@@ -157,16 +189,76 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
 
 } // namespace
 
+namespace {
+
+void require_profile(std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
+                     std::int32_t max_batch_size, const char* op) {
+    if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch_size < 1 ||
+        max_batch_size > 8 || min_batch_size > max_batch_size) {
+        throw std::invalid_argument(std::string(op) + ": invalid W/B interval");
+    }
+}
+
+// The GGUF route normalizes into `prepared` and projects those rows into the coefficient plane the
+// shared reduce kernel reads; both planes are live at once.
+std::size_t gguf_prepare_bytes(const Weight& weight, std::int32_t min_width,
+                               std::int32_t max_width, std::int32_t min_batch_size,
+                               std::int32_t max_batch_size) {
+    const auto tokens_max = max_width * max_batch_size;
+    const auto tokens_min = min_width * min_batch_size;
+    std::size_t widest    = 0;
+    for (std::int32_t width = min_width; width <= max_width; ++width) {
+        for (std::int32_t batch = min_batch_size; batch <= max_batch_size; ++batch) {
+            const auto tokens = width * batch;
+            widest            = std::max(widest, std::size_t(kCoefficientRows) * tokens *
+                                                    sizeof(float));
+        }
+    }
+    const detail::GgufShape shape{weight.qtype, weight.n, weight.k};
+    return widest + detail::gguf_project_workspace_bytes({&shape, 1}, tokens_min, tokens_max);
+}
+
+void gguf_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
+                  const Tensor& base_kernel, const Weight& weight, Tensor& prepared,
+                  Tensor& finish_delta, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1] * residual.ne[2];
+    auto scope                = workspace.scope();
+    auto* coefficients        = static_cast<float*>(
+        workspace.alloc_bytes(std::size_t(kCoefficientRows) * tokens * sizeof(float)).data);
+    // The normalized operand of the GGUF coefficient product is exactly what the reduce kernel
+    // then combines with the base kernel, so the one plane serves both steps.
+    ops::rmsnorm(residual, norm_weight, eps, false, prepared, stream);
+    detail::GgufProduct product;
+    product.weight   = &weight;
+    product.f32      = coefficients;
+    product.f32_rows = kCoefficientRows;
+    detail::gguf_project(prepared.view({kHidden, tokens}), {&product, 1}, workspace, stream);
+    detail::bf16_dynamic_grouped_conv_prepare_reduce_launch(
+        {16, tokens, 1}, base_kernel, coefficients, prepared, finish_delta, stream);
+}
+
+} // namespace
+
 std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size) {
+    const Weight& kernel_projection_weight, LinearPolicy policy, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    require_profile(min_width, max_width, min_batch_size, max_batch_size,
+                    "dynamic grouped conv prepare workspace");
+    if (is_gguf(kernel_projection_weight.qtype)) {
+        require_gguf_projection_weight(kernel_projection_weight,
+                                       "dynamic grouped conv prepare");
+        return gguf_prepare_bytes(kernel_projection_weight, min_width, max_width, min_batch_size,
+                                  max_batch_size);
+    }
+    require_kernel_projection_weight(kernel_projection_weight);
     return detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
         min_width, max_width, min_batch_size, max_batch_size);
 }
 
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
-                                          const Weight& kernel_projection_weight, Tensor& prepared,
+                                          const Weight& kernel_projection_weight,
+                                          LinearPolicy policy, Tensor& prepared,
                                           Tensor& finish_delta, WorkspaceArena& workspace,
                                           cudaStream_t stream) {
     const std::int32_t batch_size = residual.ne[2];
@@ -187,28 +279,43 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     require_tensor(prepared, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "prepared");
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kPrepareOp,
                    "finish_delta");
-    require_kernel_projection_weight(kernel_projection_weight);
     require_nonoverlap(residual, norm_weight, base_kernel, kernel_projection_weight, prepared,
                        finish_delta, workspace);
-
+    if (is_gguf(kernel_projection_weight.qtype)) {
+        require_gguf_projection_weight(kernel_projection_weight, kPrepareOp);
+        gguf_prepare(residual, norm_weight, eps, base_kernel, kernel_projection_weight, prepared,
+                     finish_delta, workspace, stream);
+        return;
+    }
+    require_kernel_projection_weight(kernel_projection_weight);
     detail::bf16_dynamic_grouped_conv_prepare_dispatch(residual, norm_weight, eps, base_kernel,
                                                        kernel_projection_weight, prepared,
                                                        finish_delta, workspace, stream);
 }
 
-std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_t input_rows,
-                                                                     std::int32_t min_width,
-                                                                     std::int32_t max_width,
-                                                                     std::int32_t min_batch_size,
-                                                                     std::int32_t max_batch_size) {
+std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    const Weight& projection_weight, LinearPolicy policy, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    require_profile(min_width, max_width, min_batch_size, max_batch_size,
+                    "linear dynamic grouped conv add workspace");
+    const std::int32_t input_rows = projection_weight.k;
+    if (input_rows != 4096 && input_rows != 17408) {
+        throw std::invalid_argument(
+            "linear dynamic grouped conv add workspace: C must be 4096 or 17408");
+    }
+    if (materialized_projection(projection_weight, input_rows)) {
+        return detail::materialized_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            projection_weight, policy, min_width, max_width, min_batch_size, max_batch_size);
+    }
+    require_finish_projection_weight(projection_weight, input_rows);
     return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
         input_rows, min_width, max_width, min_batch_size, max_batch_size);
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
-                                     const Tensor& base_kernel, const Tensor& finish_delta,
-                                     Tensor& residual, WorkspaceArena& workspace,
-                                     cudaStream_t stream) {
+                                     LinearPolicy policy, const Tensor& base_kernel,
+                                     const Tensor& finish_delta, Tensor& residual,
+                                     WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t batch_size = x.ne[2];
     const std::int32_t width      = x.ne[1];
@@ -228,8 +335,11 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     if (materialized_projection(projection_weight, input_rows)) {
         require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
                                   workspace);
+        if (is_gguf(projection_weight.qtype)) {
+            require_gguf_finish_weight(projection_weight, input_rows, kAddOp);
+        }
         detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
-            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
+            x, projection_weight, policy, base_kernel, finish_delta, residual, workspace, stream);
         return;
     }
     require_finish_projection_weight(projection_weight, input_rows);

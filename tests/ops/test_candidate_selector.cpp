@@ -2,6 +2,7 @@
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
+#include "core/device.h"
 
 #include <algorithm>
 #include <array>
@@ -12,12 +13,21 @@
 #include <limits>
 #include <set>
 #include <span>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 using namespace ninfer;
 using namespace ninfer::test;
+
+namespace ninfer::test {
+cudaError_t produce_selector_inputs(const std::int32_t* ids, int count,
+                                     const std::int32_t* anchors, int batch,
+                                     std::int32_t* out_ids, std::int32_t* out_anchors,
+                                     cudaStream_t stream);
+}
 
 namespace {
 
@@ -55,6 +65,24 @@ float predecessor_value(std::int32_t token, std::int32_t rank) {
 float successor_value(std::int32_t token, std::int32_t rank) {
     return represented_pattern(static_cast<std::uint32_t>(token), static_cast<std::uint32_t>(rank),
                                211U, 1.0F / 256.0F);
+}
+
+// One codebook as the Op reads it: [rows, 256] BF16 words in row-major order.
+Weight bf16_codebook(void* data) {
+    Weight weight{};
+    weight.payload         = data;
+    weight.payload_bytes   = static_cast<std::uint64_t>(kCodebookRows) * kRank * sizeof(std::uint16_t);
+    weight.qtype           = QType::BF16;
+    weight.shape[0]        = kCodebookRows;
+    weight.shape[1]        = kRank;
+    weight.padded_shape[0] = kCodebookRows;
+    weight.padded_shape[1] = kRank;
+    weight.ndim            = 2;
+    weight.qdata           = data;
+    weight.n               = kCodebookRows;
+    weight.k               = kRank;
+    weight.layout          = QuantLayout::Contiguous;
+    return weight;
 }
 
 std::size_t candidate_offset(std::int32_t batch, std::int32_t step, std::int32_t candidate) {
@@ -341,6 +369,189 @@ int verify_draws(const std::string& label, int batch, const std::vector<int>& id
     return failures;
 }
 
+
+// A codebook stored as ggml Q8_0 blocks whose values are exactly the ones a BF16 table of the same
+// numbers holds: d is a power of two and every code an integer in [-127, 127], so both forms
+// represent the identical FP32 value. A staged round must therefore produce the identical draw.
+Weight staged_codebook(void* data, std::size_t bytes) {
+    Weight weight{};
+    weight.payload         = data;
+    weight.payload_bytes   = bytes;
+    weight.qtype           = QType::GGUF_Q8_0;
+    weight.layout          = QuantLayout::GgufBlocks;
+    weight.shape[0]        = kCodebookRows;
+    weight.shape[1]        = kRank;
+    weight.padded_shape[0] = kCodebookRows;
+    weight.padded_shape[1] = kRank;
+    weight.ndim            = 2;
+    weight.qdata           = data;
+    weight.n               = kCodebookRows;
+    weight.k               = kRank;
+    weight.group_size      = 32;
+    weight.group           = 32;
+    return weight;
+}
+
+struct StagedCodebook {
+    std::vector<std::uint16_t> bf16;    // one BF16 word per value, [rows][rank]
+    std::vector<std::uint8_t> blocks;   // the same values as Q8_0 blocks
+    DeviceBuffer bf16_device, block_device;
+
+    explicit StagedCodebook(std::uint32_t seed) {
+        constexpr std::size_t kValues = std::size_t(kCodebookRows) * kRank;
+        bf16.resize(kValues);
+        blocks.assign(std::size_t(kCodebookRows) * (kRank / 32) * 34, 0);
+        const std::uint16_t scale_bits = 0x2000U; // binary16 2^-7
+        std::uint32_t state            = seed | 1U;
+        for (std::int32_t row = 0; row < kCodebookRows; ++row) {
+            for (std::int32_t group = 0; group < kRank / 32; ++group) {
+                std::uint8_t* block = blocks.data() + (std::size_t(row) * (kRank / 32) + group) * 34;
+                std::memcpy(block, &scale_bits, sizeof(scale_bits));
+                for (int lane = 0; lane < 32; ++lane) {
+                    state = mix32(state + 0x9e3779b9U);
+                    int code = int((state >> 8) % 255U) - 127;
+                    if (code == 0) { code = 1; }
+                    block[2 + lane] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
+                    const float value = float(code) * (1.0F / 128.0F);
+                    bf16[std::size_t(row) * kRank + group * 32 + lane] = f32_to_bf16(value);
+                }
+            }
+        }
+        bf16_device  = to_device(bf16);
+        block_device = to_device(blocks);
+    }
+
+    Weight bf16_weight() const { return bf16_codebook(bf16_device.p); }
+    Weight block_weight() const {
+        return staged_codebook(block_device.p, blocks.size());
+    }
+};
+
+int run_staged() {
+    // One round of each route, with both codebooks stored both ways: the staged planes must carry
+    // the identical values, so every output is bit for bit the same.
+    const StagedCodebook predecessors(12345U), successors(54321U);
+    std::vector<ops::SamplingConfig> configs(kMaxBatch);
+    for (int b = 0; b < kMaxBatch; ++b) {
+        configs[b].temperature = (b % 2 == 0) ? 0.0F : 0.9F;
+        configs[b].seed        = 900 + b;
+    }
+    DeviceBuffer config_device = to_device(configs);
+    DeviceContext device;
+
+    int failures = 0;
+    for (kSteps = 1; kSteps <= 15; kSteps += 2) {
+        for (int batch_size = 1; batch_size <= kMaxBatch; batch_size += 3) {
+            const std::vector<std::int32_t> candidate_ids_data = make_candidate_ids();
+            const std::vector<std::uint16_t> hidden            = make_projected_hidden();
+            const std::vector<std::int32_t> anchor_values      = make_anchors();
+            const std::vector<std::int32_t> positions          = make_base_positions();
+            const std::vector<float> unary                     = make_unary_scores(7U);
+            DeviceBuffer candidate_device = to_device(candidate_ids_data);
+            DeviceBuffer unary_device     = to_device(unary);
+            DeviceBuffer hidden_device    = to_device(hidden);
+            DeviceBuffer anchor_device    = to_device(anchor_values);
+            DeviceBuffer position_device  = to_device(positions);
+            const auto capacity = [&](const Weight& p, const Weight& s) {
+                return ops::candidate_selector_path_workspace_capacity_bytes(
+                    p, s, kSteps, kSteps, batch_size, batch_size);
+            };
+            const std::size_t draft_count = std::size_t(batch_size) * kSteps;
+            const std::size_t q_count     = draft_count * std::size_t(kCandidates);
+            const auto run_once = [&](const Weight& p, const Weight& s,
+                                      std::vector<std::int32_t>& drafts, std::vector<float>& q,
+                                      bool capture = false) {
+                GuardedDeviceBuffer draft_device(draft_count * sizeof(std::int32_t));
+                GuardedDeviceBuffer q_device(q_count * sizeof(float));
+                draft_device.fill(0xff);
+                q_device.fill(0xff);
+                Tensor ids(candidate_device.p, DType::I32, {kCandidates, kSteps, batch_size});
+                Tensor unary_scores(unary_device.p, DType::FP32, {kCandidates, kSteps, batch_size});
+                Tensor hidden_tensor(hidden_device.p, DType::BF16, {kRank, kSteps, batch_size});
+                Tensor anchor(anchor_device.p, DType::I32, {batch_size});
+                Tensor position(position_device.p, DType::I32, {batch_size});
+                Tensor drafts_tensor(draft_device.data(), DType::I32, {kSteps, batch_size});
+                Tensor q_tensor(q_device.data(), DType::FP32, {kCandidates, kSteps, batch_size});
+                const auto bytes = capacity(p, s);
+                GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 1));
+                WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+                const auto launch = [&](cudaStream_t stream) {
+                    ops::candidate_selector_path(
+                        ids, unary_scores, hidden_tensor, anchor, p, s, position,
+                        static_cast<const ops::SamplingConfig*>(config_device.p), drafts_tensor,
+                        q_tensor, workspace, stream);
+                };
+                if (capture) {
+                    DeviceBuffer source_ids = to_device(candidate_ids_data);
+                    DeviceBuffer source_anchors = to_device(anchor_values);
+                    DecodeGraphDefinition definition;
+                    DecodeGraphExecutable executable;
+                    definition.capture(device.stream, [&] {
+                        cuda_check(produce_selector_inputs(
+                                       static_cast<const std::int32_t*>(source_ids.p),
+                                       static_cast<int>(candidate_ids_data.size()),
+                                       static_cast<const std::int32_t*>(source_anchors.p),
+                                       batch_size, static_cast<std::int32_t*>(candidate_device.p),
+                                       static_cast<std::int32_t*>(anchor_device.p), device.stream),
+                                   "selector graph producer");
+                        launch(device.stream);
+                    });
+                    executable.instantiate(definition);
+                    for (int replay = 0; replay < 2; ++replay) {
+                        cuda_check(cudaMemsetAsync(candidate_device.p, 0, candidate_device.bytes,
+                                                   device.stream),
+                                   "poison selector ids");
+                        cuda_check(cudaMemsetAsync(anchor_device.p, 0, anchor_device.bytes,
+                                                   device.stream),
+                                   "poison selector anchors");
+                        executable.launch(device.stream);
+                        cuda_synchronize(device.stream);
+                    }
+                } else {
+                    launch(device.stream);
+                    cuda_synchronize(device.stream);
+                }
+                failures += scratch.verify_guards("selector staged workspace");
+                failures += draft_device.verify_guards("selector staged drafts");
+                failures += q_device.verify_guards("selector staged probabilities");
+                if (workspace.used() != 0 || workspace.peak_used() > bytes) {
+                    std::cerr << "selector staged workspace exceeds capacity or leaks a scope\n";
+                    ++failures;
+                }
+                drafts = from_device<std::int32_t>(draft_device.data(), draft_count);
+                q      = from_device<float>(q_device.data(), q_count);
+            };
+            std::vector<std::int32_t> bf16_drafts, staged_drafts, mixed_drafts;
+            std::vector<float> bf16_q, staged_q, mixed_q;
+            run_once(predecessors.bf16_weight(), successors.bf16_weight(), bf16_drafts, bf16_q);
+            run_once(predecessors.block_weight(), successors.block_weight(), staged_drafts, staged_q);
+            run_once(predecessors.bf16_weight(), successors.block_weight(), mixed_drafts, mixed_q);
+            const std::string label =
+                "selector staged K=" + std::to_string(kSteps) + " B=" + std::to_string(batch_size);
+            if (bf16_drafts != staged_drafts || bf16_q != staged_q) {
+                std::cerr << label << ": stored Q8_0 codebooks changed the proposal\n";
+                ++failures;
+            }
+            if (bf16_drafts != mixed_drafts ||
+                !std::equal(bf16_q.begin(), bf16_q.end(), mixed_q.begin())) {
+                std::cerr << label << ": a mixed codebook pair changed the proposal\n";
+                ++failures;
+            }
+            for (const auto& pair : {
+                     std::pair{predecessors.block_weight(), successors.block_weight()},
+                     std::pair{predecessors.bf16_weight(), successors.block_weight()},
+                     std::pair{predecessors.block_weight(), successors.bf16_weight()}}) {
+                run_once(pair.first, pair.second, staged_drafts, staged_q, true);
+                if (bf16_drafts != staged_drafts || bf16_q != staged_q) {
+                    std::cerr << label << ": graph producer dependencies changed the proposal\n";
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int run(bool ties = false, bool dependent = false) {
 
     std::vector<std::int32_t> candidate_ids = make_candidate_ids();
@@ -438,8 +649,8 @@ int run(bool ties = false, bool dependent = false) {
     populate_codebook(predecessor_device, tokens, true);
     populate_codebook(successor_device, tokens, false);
 
-    Tensor predecessor(predecessor_device.p, DType::BF16, {kRank, kCodebookRows});
-    Tensor successor(successor_device.p, DType::BF16, {kRank, kCodebookRows});
+    const Weight predecessor = bf16_codebook(predecessor_device.p);
+    const Weight successor   = bf16_codebook(successor_device.p);
 
     int failures = 0;
     for (int batch_size = 1; batch_size <= kMaxBatch; ++batch_size) {
@@ -457,7 +668,7 @@ int run(bool ties = false, bool dependent = false) {
         Tensor drafts(draft_device.data(), DType::I32, {kSteps, batch_size});
         Tensor q(q_device.data(), DType::FP32, {kCandidates, kSteps, batch_size});
         const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
-            kSteps, kSteps, batch_size, batch_size);
+            predecessor, successor, kSteps, kSteps, batch_size, batch_size);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
         WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
         const auto launch = [&](cudaStream_t stream) {
@@ -570,8 +781,8 @@ int run(bool ties = false, bool dependent = false) {
         auto di = to_device(pi), du = to_device(pu), dh = to_device(ph), da = to_device(pa),
              dp = to_device(pp), dc = to_device(pc);
         GuardedDeviceBuffer dd(3 * kSteps * 4), dq(3 * kSteps * kCandidates * 4);
-        const auto capacity =
-            ops::candidate_selector_path_workspace_capacity_bytes(kSteps, kSteps, 3, 3);
+        const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
+            predecessor, successor, kSteps, kSteps, 3, 3);
         GuardedDeviceBuffer sw(std::max<std::size_t>(capacity, 1));
         WorkspaceArena workspace(DeviceSpan{sw.data(), sw.bytes()});
         Tensor ti(di.p, DType::I32, {kCandidates, kSteps, 3}),
@@ -615,7 +826,7 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        int failures = 0;
+        int failures = run_staged();
         for (kSteps = 1; kSteps <= 15; ++kSteps) failures += run();
         {
             kSteps = 1;

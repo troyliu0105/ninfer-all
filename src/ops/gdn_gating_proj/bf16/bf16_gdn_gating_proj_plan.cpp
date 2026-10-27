@@ -188,6 +188,10 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+bool is_2b(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 16 && problem.input_rows == 2048;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -285,6 +289,21 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
         }
     }
 
+    if (is_2b(problem)) {
+        // The 2B control registers only the geometry-generic warp-per-row SIMT schedules; its MMA
+        // tile is not built. Every entry in the 27B/35B tables launches a differently-shaped
+        // kernel, so admitting one here would let execute_candidate reach a wrong-shape launcher.
+        // The warp grid is the CUDA y limit: a C4 CTA covers 4 columns, a C8 CTA 8.
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+            return problem.cols <= 4 * 65'535;
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+            return problem.cols <= 8 * 65'535;
+        default:
+            return false;
+        }
+    }
+
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;
@@ -344,6 +363,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         if (!launched) { launch_unsplit(); }
     };
 
+    const bool small = is_2b(problem);
     switch (plan.schedule) {
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
@@ -355,12 +375,22 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                     execution.stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               execution.stream);
+        if (small) {
+            bf16_gdn_gating_proj_2b_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   execution.stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   execution.stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               execution.stream);
+        if (small) {
+            bf16_gdn_gating_proj_2b_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   execution.stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   execution.stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         finish_cooperative(bf16_gdn_gating_proj_35_mma_split32_launch(
@@ -468,7 +498,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_2b(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -524,6 +554,14 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
     if (!bf16_gdn_gating_admits(problem)) {
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
+    }
+    if (is_2b(problem)) {
+        // The 2B geometry runs the geometry-generic SIMT schedules only; its MMA tile is not
+        // registered, so every column count resolves to the warp-per-row kernel.
+        const Bf16GdnGatingScheduleId schedule = problem.cols <= 4 * 65'535
+                                                     ? Bf16GdnGatingScheduleId::SimtWarpRowC4
+                                                     : Bf16GdnGatingScheduleId::SimtWarpRowC8;
+        return bf16_gdn_gating_resolve_candidate(schedule, problem, sm_count);
     }
     return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count)
                           : resolve_from_routes(k35Routes, problem, sm_count);

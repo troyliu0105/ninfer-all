@@ -91,8 +91,10 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
     DeviceBuffer residual        = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8);
     PackedQuantizedWeight packed =
         make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows);
+    const Weight& projection_weight = packed.weight;
     const std::size_t capacity =
-        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            projection_weight, ops::LinearPolicy::A16Only, 2, 16, 1, 8);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
 
@@ -126,8 +128,10 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
             const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
                 input_rows, width, batch_size);
             measure(route, [&](cudaStream_t capture_stream) {
-                ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
-                                                     residual_view, workspace, capture_stream);
+                ops::linear_dynamic_grouped_conv_add(x, projection_weight,
+                                                     ops::LinearPolicy::A16Only, base_kernel,
+                                                     finish_delta, residual_view, workspace,
+                                                     capture_stream);
             });
         }
     }

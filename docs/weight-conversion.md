@@ -72,7 +72,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses; T2 token table restored at the gather; GDN A/B controls in BF16 (the quantizer's own mix stores the head and table under Q4_K/Q6_K and the controls as ternary) | `ternary` (GGUF), `mtp` |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
@@ -178,9 +178,9 @@ resources come from the Qwen3.8-27B checkpoint, which shares the geometry. The p
 takes its MTP head and DFlash2 adapter from ProCreations' heads trained on Bonsai 2 itself
 ([MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP),
 [DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)), which accept more drafts
-than the vanilla ones. The recipe stores the adapter's feature, output and MLP projections in Q4,
-since against a 2.125-bit target the drafter is a large share of every draft step's bytes; the
-fused query/key/value projection stays Q8, which its three-output op requires.
+than the vanilla ones. For a Safetensors adapter, the recipe stores feature, output and MLP
+projections in Q4 and query/key/value in Q8. A GGUF adapter instead keeps every matrix in its
+source block format, including Q/K/V, convolution projections and selector codebooks.
 
 ```bash
 python3 -m tools.convert \
@@ -203,8 +203,59 @@ tokens, in their own encoding and with the head's rotation, so a draft through `
 scores those tokens exactly as the full head does. It adds 170 MiB to the file and is loaded only
 with `--lm-head-draft`.
 
+`--model` needs only the base checkpoint's configuration and frontend resources, but then the
+vision tower has to come from somewhere: `--source vision=Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
+reads it from the release's mmproj GGUF (under the same `model.visual.*` names, at the formats the
+recipe chose) instead of the checkpoint. `--source mtp=` accepts a separate Safetensors head or
+the original qwen35 GGUF containing its MTP block; the latter preserves the stored blocks.
+
 A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
 tensor set and Hadamard metadata before reading anything.
+
+#### The quantizer's other mix
+
+PrismML's quantizer also writes the same model in its default PQ2_0 mix, which differs in four
+places: llama.cpp's output-tensor and token-embedding types apply, so the output head is stored as
+`Q6_K` and the token table as `Q4_K`; and the GDN A/B controls are quantized with the main type
+instead of being left BF16. The recipe converts either form. Decoding the larger block type
+recovers every ternary code exactly and each per-128 scale to within that block format's own
+rounding (measured under 2.5% on the releases seen, with the codes identical), so the artifact
+keeps the registered T2 rows, their Uses and the runtime's per-gather restore. A ternary A/B
+control is imported at the artifact's BF16 control format, which rounds its recovered scale to
+eight mantissa bits; that is far inside the 2-bit quantization the source already applied.
+Validation decodes a 64-row sample of a matrix stored under a larger block type and refuses values
+that are not a ternary matrix rather than silently re-quantizing them.
+
+The quantizer's 2-bit codes are offset binary, so a group's fp16 scale multiplies `-1`, `0`, `+1`
+or `+2`. The artifact's `t2_g128_fp16` codes are two's complement: `-2`, `-1`, `0` or `+1`. A
+weight stored at `+2` therefore has no exact T2 form, whether a `PQ2_0` block holds it or a larger
+one: those weights are stored at `+1` of their group's scale and the conversion warns with the
+count. In the releases seen this affects 421 weights of one output-head row, a token id past the
+public token domain, and nothing else.
+
+A body matrix the mix stores under a larger ggml block type keeps that type instead of being
+pushed onto the ternary grid, so a mixed release does not have to be re-quantized either: `ssm_out`
+and `ffn_down` are one Linear each, so their rows are imported as stored, their Uses carry the same
+Hadamard sign vector, and their format is the source's own (`gguf_q2_k`, `gguf_q3_k`, ...). Every
+other body role takes part in a T2-fused input projection and keeps its ternary rows.
+
+Either mix may also carry the MTP head as one extra block inside the model file (`blk.64.*`, with
+`qwen35.nextn_predict_layers = 1`). Pass that same file as the MTP source and the block is imported
+from it as stored -- no split step, and no Q8 round trip:
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.8-27B \
+  --recipe bonsai2_27b_ternary \
+  --source ternary=Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf \
+  --source mtp=Ternary-Bonsai-2-27B-PQ2_0-MTP.gguf \
+  --components text,mtp \
+  ...
+```
+
+`tools.convert.split_mtp` can export a value-only MTP source under its `mtp.*` names when that is
+needed by another workflow. Such a source is quantized by the selected recipe. To preserve an
+existing low-precision MTP, pass the original qwen35 GGUF directly as `--source mtp=FILE.gguf`;
+the text and MTP source files may be different.
 
 ### A mixed-precision Qwen3.8-27B GGUF
 
@@ -230,6 +281,10 @@ order of the logical parameter. Only the GGUF linears read a gather, so the conv
 Vision comes from the release's `mmproj` file in the official Vision formats, DFlash2 from
 `--source dflash2`, and `--proposal` gathers the proposal head's rows from the output head in its
 own block format.
+
+Packing joins only compatible stored formats. A mixed gate/up pair or draft K/V pair can keep
+separate parents; native preparation validates and executes those operands separately instead of
+requiring a single fused parent or converting one matrix to the other's format.
 
 ```bash
 python3 -m tools.convert \
@@ -262,6 +317,31 @@ def configure(model, recipe, sources):
     qwen3_8_27b_gguf(model, recipe, sources)
     recipe.assign("text/layers/*/gdn/output", format="q6_g64_fp16", method="grouped_absmax")
 ```
+
+### The Qwen3.5-2B GGUF
+
+`qwen3_5_2b_gguf` imports the unsloth Qwen3.5-2B UD quantized GGUF release
+(`Qwen3.5-2B-UD-IQ2_XXS.gguf` and siblings) through the same block-preserving path as the 27B
+recipe above: every block matrix keeps its exporter blocks byte for byte. The 2B geometry
+(24 blocks, 8 attention heads with 2 KV heads, GDN 16 key + 16 value heads with one value head
+per key head, tied output head) needs no value-head regrouping and no `input_columns`
+permutation — the tiling is the identity. The release stores no MTP tensors and no separate
+output head: the artifact shares the token embedding with the output head, and the `mtp`
+component is refused for this source.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.5-2B \
+  --recipe qwen3_5_2b_gguf \
+  --source gguf=/path/to/Qwen3.5-2B-UD-IQ2_XXS.gguf \
+  --components text \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --name qwen3.5-2b \
+  --out models/qwen3_5_2b.ninfer
+```
+
+`--model` needs the base Qwen3.5-2B checkpoint's `config.json`, `tokenizer.json`,
+`tokenizer_config.json` and `generation_config.json`.
 
 ### Qwen3.8-Flash-Next GGUF releases
 
@@ -535,6 +615,15 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 `EncodedRows`, and the format's required divisor accessors. Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
+A stored ggml block matrix is imported by copying its rows, so a source whose scale words are not
+finite represents no weight there and is refused with the tensor, the block count and the row:
+`blk.45.attn_qkv.weight (IQ2_S) holds 15 blocks with a non-finite multiplier, the first at row 7285
+of 10240; the source data is corrupt there`. Every importer states that check -- the text and MTP
+block recipes, PrismML's ternary recipe and the DFlash2 adapter -- because continuing would put NaN
+or unbounded rows into the artifact. This diagnoses the bytes in the local source, not how they
+became damaged: compare the complete file's SHA-256 with its publisher's digest before attributing
+the problem to a quantizer or a release.
+
 ## Convert from a GGUF quant instead of the full checkpoint
 
 The base `--model` checkpoint only needs to supply `config.json` and the frontend
@@ -595,53 +684,63 @@ source by only looping over the names you've actually mapped.
 `--components text,vision,mtp,dflash2` works with GGUF sources too, matching a
 normal multi-component conversion, though each component needs its own wiring:
 
-- **MTP** is usually exported as a *separate* GGUF file (llama.cpp names these
-  `mtp-*.gguf`), not fused into the main model's file. It appears as one more
-  transformer layer appended after the base model's real layers (layer 64 for a
-  64-layer model), reusing the same attention/MLP/norm tensor roles
-  `standard_dense_name_map` already covers, plus four MTP-specific tensors.
-  `qwen35_mtp_name_map(gguf_layer_index, hf_prefix=...)` builds that map --
-  `hf_prefix="mtp."` when the MTP tensors are fused into the main checkpoint's
-  state dict, or `hf_prefix=""` for a standalone MTP-only checkpoint whose
-  tensors have no prefix. Pass it its own `--source mtp_quantized=mtp-*.gguf`
-  and wrap that in its own `HFAliasSource`.
+- **MTP** is one more transformer layer appended after the base model's real
+  layers (layer 64 for a 64-layer model), reusing the same attention/MLP/norm
+  tensor roles `standard_dense_name_map` covers plus four MTP-specific tensors.
+  A Qwen3.5/3.8 recipe reads it straight from a GGUF with
+  `--source mtp=FILE.gguf`: the file must state `qwen35.nextn_predict_layers = 1`
+  and hold its block at `qwen35.block_count - 1`, either as the whole text tower
+  beside it (`-mtp` exports, PrismML's ternary releases) or as that block alone.
+  `gguf_blocks.mtp_sources` imports the eight matrices as the blocks they are stored in and the
+  seven norms with the qwen35 exporter's `1 + w` offset undone before the native BF16 cast.
+  An explicit `--source mtp=` replaces a fused head: a text-only GGUF beside a separate MTP file
+  then converts as one pair. A selected MTP tensor marked Hadamard-rotated or inverse-rotated
+  is refused: this import has no MTP sign Use, and must not execute rotated blocks as plain ones.
+
+  `qwen35_mtp_name_map(gguf_layer_index, hf_prefix=...)` is the HF-side map the
+  builder uses for the same block -- `hf_prefix="mtp."` when the tensors carry
+  that prefix, `""` for a standalone MTP-only checkpoint. A Safetensors MTP source (from
+  `tools.convert.split_mtp`, or a training run's own file) still works with the selected recipe's
+  quantization; no split step is required for a stored-block GGUF import.
 
 - **Vision** is exported as a separate `mmproj-*.gguf` file (GGUF architecture
   `clip`, not the text model's `qwen35`/`qwen35moe`) covering the ViT tower and
   the projector MLP. `qwen35_vision_name_map(depth, hidden_size=..., patch_size=...,
   temporal_patch_size=..., ...)` builds its name map from the checkpoint's own
-  `vision_config`. It also needs a `--source vision_quantized=mmproj-*.gguf`.
+  `vision_config`. The GGUF and ternary recipes accept it as `--source vision=mmproj-*.gguf`.
   One tensor needs more than a name/value transform: the patch-embed Conv3d
   kernel's temporal dimension is split across two separate GGUF tensors
   (`v.patch_embd.weight` / `.weight.1`), which `HFAliasSource`'s `composites`
   argument reassembles by reading both from the underlying `GGUFSource` and
   stacking them -- see its docstring if you need the same pattern elsewhere.
 
-- **DFlash2** needs no GGUF-specific code at all in the cases seen so far: it's
-  a small enough draft head that a plain Safetensors checkpoint for it is the
-  normal way to get one, and `tools.convert` already reads that natively via
-  `--source dflash2=PATH` plus `--components ...,dflash2` -- the same mechanism
-  `qwen3_8_27b_nvfp4`'s example in this doc already uses. An override recipe
-  only needs to touch `dflash2/*` parameters if you actually have a GGUF export
-  of the draft head to source them from instead.
+- **DFlash2** adapters ship as small GGUFs too (z-lab publishes one per release,
+  and a drafter retrained against a specific target is often published the same
+  way). `--source dflash2=FILE.gguf` reads the release as stored, exactly as the
+  text tower is read: the adapter's config comes from the GGUF's own
+  `dflash.*` header (its `target_layers` are one-based and become the target's
+  indices, and the mask token falls back to `tokenizer.ggml.mask_token_id`), and
+  every matrix keeps its block type. The `--source dflash2=PATH` directory form
+  still reads a Safetensors checkpoint and re-quantizes it by the recipe's own
+  choices; a GGUF is the way to keep a low-precision drafter low-precision.
+  DFlash2's query matrix has `head_count * key_length` rows: unlike the text tower, it has no
+  interleaved output gate. Imported matrices explicitly select `gguf_blocks_v1`, replacing any
+  native layout pinned by the base recipe. A subsequent user override still runs last.
 
-All three name maps above were checked against a real checkpoint/GGUF pair on
-this machine the same way `qwen35_linear_attention_name_map` was (see its
-docstring): every tensor's dequantized GGUF value was compared back to the
-original Safetensors value. MTP's own norm tensors turned out to need **no**
-+1 shift (unlike the base model's layers -- verified, not assumed), vision
-needs no shift at all (it's LayerNorm, not RMSNorm), and the patch-embed
-temporal split reassembles to the exact original kernel. None of the three
-cover mixture-of-experts tensors, and the vision map doesn't cover deepstack
-layers (no checkpoint with those to verify against was available).
+  Three conventions differ from llama.cpp's Qwen3.5 export and are handled by
+  `qwen3_5_gguf_companions.py`: the norms carry no `1 + w` offset, the two
+  dynamic-convolution base kernels are stored C-order `[2, 2, hidden]` (the
+  artifact's own layout, no transpose), and the candidate selector is
+  `selector_hidden.weight` / `selector_predecessor.weight` /
+  `selector_successor.weight`.
 
-This keeps every format/method choice the base recipe already made (`qwen3_6_27b`
-here); only the byte source for each parameter's values changes. Formats needing
-higher source fidelity than the GGUF file provides will simply re-quantize its
-already-lossy values -- e.g. re-deriving `q4_g64_fp16` from a `Q4_K_M` source
-compounds two rounds of quantization error. Prefer the highest-fidelity GGUF you
-have (F16 or `Q8_0`/`Q6_K`) as the source when the target format is more precise
-than the GGUF's own quant level.
+The stored-block companion imports and the value-only alias path have different fidelity
+contracts. DFlash2 and qwen35 MTP GGUF matrices keep their source blocks; DFlash2's F32 norms and
+base kernels are cast to native BF16. Vision uses the selected recipe's native formats, so its
+GGUF values may be quantized again. Prefer F16, BF16 or Q8_0 vision input when available.
+
+These maps cover the supported dense companion geometry, not mixture-of-experts tensors or
+vision deepstack layers.
 
 `standard_dense_name_map` only covers ordinary attention/MLP/norm tensors. Run
 `python3 -m tools.convert.sources.gguf_source /path/to/model.gguf` to list every tensor

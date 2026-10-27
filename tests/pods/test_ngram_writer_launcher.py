@@ -23,6 +23,10 @@ def test_launcher_probes_before_running_conversion(tmp_path, probe_result):
                       "assert sys.argv[1:] == ['ninfer_qwen4_exp_ngram_component_test', '--check-cuda']\n"
                       f"raise SystemExit({probe_result})\n")
     binary.chmod(0o755)
+    if sys.platform == "win32":
+        wrapper = tmp_path / "probe.cmd"
+        wrapper.write_text(f'@"{sys.executable}" -S "%~dp0probe" %*\n')
+        binary = wrapper
     # -S removes site packages, matching the toolchain without pytest or CPU PyTorch.
     result = subprocess.run([sys.executable, "-S", str(launcher), str(binary)])
     assert result.returncode == (23 if probe_result == 0 else probe_result)

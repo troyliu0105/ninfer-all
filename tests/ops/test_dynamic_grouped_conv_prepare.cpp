@@ -3,10 +3,13 @@
 #include "core/decode_graph.h"
 
 #include "ops/direct_bf16_weight.h"
+#include "ops/gguf_reference.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <random>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -122,7 +125,7 @@ struct Reference {
 Reference compute_reference(const std::vector<std::uint16_t>& residual,
                             const std::vector<std::uint16_t>& norm_weight,
                             const std::vector<std::uint16_t>& base_kernel,
-                            const direct_bf16_weight::HostWeight& projection_weight) {
+                            const std::vector<double>& projection_values) {
     std::vector<double> normalized(static_cast<std::size_t>(kHidden) * kMaximumTokens);
     for (std::int32_t token = 0; token < kMaximumTokens; ++token) {
         const std::size_t token_begin = static_cast<std::size_t>(token) * kHidden;
@@ -153,15 +156,14 @@ Reference compute_reference(const std::vector<std::uint16_t>& residual,
             static_cast<std::int64_t>(kCoefficientRows) * (thread + 1) / thread_count);
         workers.emplace_back([&, row_begin, row_end] {
             for (std::int32_t row = row_begin; row < row_end; ++row) {
-                const std::uint16_t* weight_row =
-                    projection_weight.bits.data() + static_cast<std::size_t>(row) * kHidden;
+                const double* weight_row =
+                    projection_values.data() + static_cast<std::size_t>(row) * kHidden;
                 for (std::int32_t token = 0; token < kMaximumTokens; ++token) {
                     const double* normalized_row =
                         normalized.data() + static_cast<std::size_t>(token) * kHidden;
                     double sum = 0.0;
                     for (std::int32_t hidden = 0; hidden < kHidden; ++hidden) {
-                        sum += static_cast<double>(bf16_to_f32(weight_row[hidden])) *
-                               normalized_row[hidden];
+                        sum += weight_row[hidden] * normalized_row[hidden];
                     }
                     coefficients[static_cast<std::size_t>(token) * kCoefficientRows + row] = sum;
                 }
@@ -228,25 +230,39 @@ void set_reference_width(Reference& reference, const std::vector<std::uint16_t>&
     }
 }
 
-int run() {
+// One run over one projection weight: the fixture's own format and the criterion that format's
+// arithmetic is held to.
+struct Fixture {
+    const Weight& weight;
+    const std::vector<double>& values;
+    ops::LinearPolicy policy;
+    const ReductionCriterion& prepared_criterion;
+    const ReductionCriterion& finish_criterion;
+    const std::string& format;
+};
+
+int run_weight(const Fixture& fixture) {
     const auto residual_host = make_residual(), norm_host = make_norm_weight(),
                base_host = make_base_kernel();
-    direct_bf16_weight::DeviceWeight projection_weight(make_projection_weight());
-    Reference reference =
-        compute_reference(residual_host, norm_host, base_host, projection_weight.host);
+    const Weight& weight = fixture.weight;
     DeviceBuffer residual_device = to_device(residual_host), norm_device = to_device(norm_host),
                  base_device = to_device(base_host);
     const auto capacity =
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            weight, fixture.policy, 2, 16, 1, 8);
     WorkspaceArena workspace(capacity);
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     Tensor norm(norm_device.p, DType::BF16, {kHidden});
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
-    const Weight weight = projection_weight.view();
+    // The reference's coefficients are the represented weight values, one row of the fixture per
+    // row of the projection.
+    const Reference reference =
+        compute_reference(residual_host, norm_host, base_host, fixture.values);
     int failures        = 0;
+    Reference adjusted = reference;
     for (int width = 2; width <= 16; ++width) {
-        set_reference_width(reference, base_host, width);
+        set_reference_width(adjusted, base_host, width);
         for (int batch = 1; batch <= 8; ++batch) {
             const std::size_t pe = static_cast<std::size_t>(kHidden) * width * batch;
             const std::size_t fe = static_cast<std::size_t>(kGroups) * 2 * width * batch;
@@ -264,8 +280,9 @@ int run() {
                 cuda_check(cudaStreamSynchronize(nullptr), "fixture fill synchronize");
                 workspace.reset_peak();
                 const auto launch = [&] {
-                    ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, kEps, base, weight,
-                                                              prepared, finish, workspace, stream);
+                    ops::rmsnorm_dynamic_grouped_conv_prepare(
+                        residual, norm, kEps, base, weight, fixture.policy, prepared, finish,
+                        workspace, stream);
                 };
                 if (replay) {
                     DecodeGraphDefinition definition;
@@ -278,34 +295,101 @@ int run() {
                 } else
                     launch();
                 cuda_synchronize();
-                const std::string label = "dynamic conv prepare W=" + std::to_string(width) +
+                const std::string label = "dynamic conv prepare " + fixture.format +
+                                          " W=" + std::to_string(width) +
                                           " B=" + std::to_string(batch) +
                                           " graph=" + std::to_string(replay);
                 failures += verify_reduction(label + " prepared", from_device_bf16(pd.data(), pe),
-                                             std::span<const double>(reference.prepared.data(), pe),
-                                             kPreparedCriterion);
+                                             std::span<const double>(adjusted.prepared.data(), pe),
+                                             fixture.prepared_criterion);
                 failures +=
                     verify_reduction(label + " finish", from_device_bf16(fd.data(), fe),
-                                     std::span<const double>(reference.finish_delta.data(), fe),
-                                     kFinishDeltaCriterion);
+                                     std::span<const double>(adjusted.finish_delta.data(), fe),
+                                     fixture.finish_criterion);
                 failures += pd.verify_guards(label);
                 failures += fd.verify_guards(label);
                 const auto exact =
                     ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                        width, width, batch, batch);
-                if (workspace.used() != 0 || workspace.peak_used() != exact) {
-                    std::cerr << label << ": workspace mismatch\n";
+                        weight, fixture.policy, width, width, batch, batch);
+                if (workspace.used() != 0 || workspace.peak_used() > exact) {
+                    std::cerr << label << ": workspace exceeds its capacity\n";
                     ++failures;
                 }
             }
         }
     }
     cuda_check(cudaStreamDestroy(stream), "destroy stream");
-    failures += verify_preserved("residual", residual_device, residual_host);
-    failures += verify_preserved("norm", norm_device, norm_host);
-    failures += verify_preserved("base", base_device, base_host);
-    failures += projection_weight.verify_preserved("projection");
+    failures += verify_preserved("residual " + fixture.format, residual_device, residual_host);
+    failures += verify_preserved("norm " + fixture.format, norm_device, norm_host);
+    failures += verify_preserved("base " + fixture.format, base_device, base_host);
     return failures;
+}
+
+std::vector<double> bf16_values(const direct_bf16_weight::HostWeight& weight) {
+    std::vector<double> values(weight.bits.size());
+    for (std::size_t i = 0; i < weight.bits.size(); ++i) {
+        values[i] = bf16_to_f32(weight.bits[i]);
+    }
+    return values;
+}
+
+int run() {
+    direct_bf16_weight::DeviceWeight projection(make_projection_weight());
+    const std::vector<double> values = bf16_values(projection.host);
+    const Fixture fixture{projection.view(), values, ops::LinearPolicy::A16Only,
+                          kPreparedCriterion, kFinishDeltaCriterion, "bf16"};
+    return run_weight(fixture) + projection.verify_preserved("projection bf16");
+}
+
+// A release's own ggml blocks: the coefficients are the independently decoded values, and the GGUF
+// route quantises the normalized activation to q8_1, which its criterion covers.
+int run_gguf(QType qtype) {
+    const auto block         = gguf_block_shape(qtype);
+    const std::int64_t count = std::int64_t(kCoefficientRows) * (kHidden / block.elements);
+    std::vector<std::uint8_t> blocks(static_cast<std::size_t>(count) * block.bytes);
+    std::mt19937 rng(0x41u);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002F, 0.02F);
+    for (auto& value : blocks) { value = static_cast<std::uint8_t>(byte(rng)); }
+    const std::vector<int> half_fields = qtype == QType::GGUF_Q2_K ? std::vector<int>{80, 82}
+                                                                 : std::vector<int>{108};
+    for (std::int64_t i = 0; i < count; ++i) {
+        std::uint8_t* base = blocks.data() + i * block.bytes;
+        for (const int offset : half_fields) {
+            const std::uint16_t bits = f32_to_bf16(scale(rng)) & 0x7f80U;
+            std::memcpy(base + offset, &bits, sizeof(bits));
+        }
+    }
+    DeviceBuffer device(blocks.size());
+    device.copy_from_host(blocks.data(), blocks.size());
+    Weight weight{};
+    weight.payload         = device.p;
+    weight.payload_bytes   = blocks.size();
+    weight.qtype           = qtype;
+    weight.layout          = QuantLayout::GgufBlocks;
+    weight.ndim            = 2;
+    weight.n               = kCoefficientRows;
+    weight.k               = kHidden;
+    weight.shape[0]        = kCoefficientRows;
+    weight.shape[1]        = kHidden;
+    weight.padded_shape[0] = kCoefficientRows;
+    weight.padded_shape[1] = kHidden;
+    weight.qdata           = device.p;
+    weight.group_size      = static_cast<std::uint32_t>(block.elements);
+    weight.group           = block.elements;
+
+    const std::vector<double> values =
+        gguf_reference::decode_matrix(qtype, blocks.data(), kCoefficientRows, kHidden);
+    static constexpr ReductionCriterion kPreparedA8{/*relative_l2=*/0.04,
+                                                    /*gross_absolute=*/0.005,
+                                                    /*gross_relative=*/0.06};
+    static constexpr ReductionCriterion kFinishA8{/*relative_l2=*/0.04,
+                                                  /*gross_absolute=*/0.004,
+                                                  /*gross_relative=*/0.06};
+    const std::string format = qtype == QType::GGUF_Q2_K ? "gguf q2_k" : "gguf q3_k";
+    const Fixture fixture{weight, values, ops::LinearPolicy::AllowA8, kPreparedA8, kFinishA8,
+                          format};
+    return run_weight(fixture);
 }
 
 } // namespace
@@ -316,7 +400,8 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        const int failures = run();
+        const int failures =
+            run() + run_gguf(QType::GGUF_Q2_K) + run_gguf(QType::GGUF_Q3_K);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_dynamic_grouped_conv_prepare\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

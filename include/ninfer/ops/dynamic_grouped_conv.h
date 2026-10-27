@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -14,11 +15,14 @@ namespace ninfer::ops {
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare for every
  * width/batch pair in the inclusive intervals. Width endpoints lie in [2,16], batch endpoints
- * in [1,8]. Capacity covers every shape-selected route in the requested domain.
+ * in [1,8]. Capacity covers every shape-selected route in the requested domain, for this
+ * projection weight's stored format: `kernel_projection_weight` is either contiguous BF16
+ * [1280,5120] or a stored GGUF block matrix of that shape, whose route adds an FP32 coefficient
+ * plane beside the GGUF product's own scratch.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size);
+    const Weight& kernel_projection_weight, LinearPolicy policy, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Op: rmsnorm_dynamic_grouped_conv_prepare
@@ -40,7 +44,10 @@ namespace ninfer::ops {
  * Logical shapes / supported domain:
  *   residual/prepared are contiguous BF16 [5120,W,B], W is in [2,16] and B in [1,8];
  *   norm_weight is contiguous BF16 [5120]. base_kernel is the runtime view BF16 [5120,2,2] with
- * axes [channel,tap,side]; kernel_projection_weight is contiguous BF16 [1280,5120]; and
+ *   axes [channel,tap,side]; kernel_projection_weight is [1280,5120], either contiguous BF16 (the
+ *   fused MMA route) or a resident GGUF block matrix (its own GGUF route, which quantizes the
+ *   normalized activation to ggml's q8_1 as that format's arithmetic requires and so needs a
+ *   policy that permits A8); and
  *   finish_delta is contiguous BF16 [320,2,W,B]. eps is positive and finite. Position zero has
  *   no previous-tap contribution: the Op never reads another request or an earlier round.
  *
@@ -62,18 +69,20 @@ namespace ninfer::ops {
  */
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
-                                          const Weight& kernel_projection_weight, Tensor& prepared,
+                                          const Weight& kernel_projection_weight,
+                                          LinearPolicy policy, Tensor& prepared,
                                           Tensor& finish_delta, WorkspaceArena& workspace,
                                           cudaStream_t stream);
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals. The projection's input rows lie in {4096, 17408}, widths lie
+ * in [2,16], and batch sizes in [1,8]. Capacity follows every shape-selected production route for
+ * this weight's format: the fused Q8 route, or Linear's own plan beside the BF16 projected plane.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size);
+    const Weight& projection_weight, LinearPolicy policy, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Op: linear_dynamic_grouped_conv_add
@@ -88,9 +97,10 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
  * Logical shapes / supported domain:
- *   x is contiguous BF16 [C,W,B]; projection_weight is RowSplit [5120,C] with unpadded C, either
- *   Q8_G32_FP16 (the fused routes) or a format Linear registers at that shape (projected through
- *   Linear into the same BF16 plane); base_kernel is contiguous BF16 [5120,2,2] with axes
+ *   x is contiguous BF16 [C,W,B]; projection_weight is [5120,C] with unpadded C, either
+ *   Q8_G32_FP16 RowSplit (the fused routes) or a format Linear registers at that shape, a stored
+ *   GGUF block matrix included (projected through Linear into the same BF16 plane, under `policy`);
+ *   base_kernel is contiguous BF16 [5120,2,2] with axes
  *   [channel,tap,side];
  *   finish_delta is contiguous BF16 [320,2,W,B]; and residual is contiguous BF16 [5120,W,B].
  *   W is in [2,16] and B in [1,8]. Position zero has no previous-tap contribution: the Op never
@@ -112,8 +122,8 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *   not allocate or retain device memory.
  */
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
-                                     const Tensor& base_kernel, const Tensor& finish_delta,
-                                     Tensor& residual, WorkspaceArena& workspace,
-                                     cudaStream_t stream);
+                                     LinearPolicy policy, const Tensor& base_kernel,
+                                     const Tensor& finish_delta, Tensor& residual,
+                                     WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

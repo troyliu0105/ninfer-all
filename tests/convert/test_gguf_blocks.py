@@ -307,7 +307,10 @@ def _header(head_type: int):
         tensors[name] = TensorInfo(name, shape, type_id, offset)
         offset += tensors[name].nbytes
     kv = gguf_blocks.EXPECTED_HEADER | {"qwen35.block_count": gguf_blocks.LAYERS}
-    return SimpleNamespace(path="header.gguf", kv=kv, tensors=tensors, data_bytes_available=offset)
+    return SimpleNamespace(
+        path="header.gguf", kv=kv, tensors=tensors, data_bytes_available=offset,
+        require_finite_scales=lambda names: None,
+    )
 
 
 def test_the_output_head_may_be_stored_blocks_or_bf16_words():

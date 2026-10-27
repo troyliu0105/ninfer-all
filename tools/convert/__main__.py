@@ -22,6 +22,7 @@ from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
 from .gguf_blocks import RECIPES as GGUF_RECIPES
+from .qwen3_5_gguf_companions import apply_gguf_companions
 from .gemma4 import ARCHITECTURES as GEMMA4_ARCHITECTURES
 from .gemma4 import RECIPES as GEMMA4_RECIPES
 from .gemma4 import build_model as build_gemma4
@@ -46,14 +47,43 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
     return SafetensorsSource(path)
 
 
+def _companion_alias(name: str, blocks: GGUFFile, values):
+    """A GGUF companion's tensors under the names the Qwen3.5 builder addresses them with."""
+
+    from .qwen3_5_gguf_companions import dflash2_config, dflash2_tensor_map, mtp_block_of
+    from .sources.gguf_source import HFAliasSource, qwen35_mtp_name_map
+
+    if name == "dflash2":
+        config = dflash2_config(blocks)
+        alias = HFAliasSource(
+            values, {hf: tensor for hf, tensor in dflash2_tensor_map(config).values()}
+        )
+        # The builder derives the adapter's artifact config from this, exactly as from a
+        # checkpoint's config.json; every field it reads comes from the GGUF's own header.
+        alias.config = config
+        return alias
+    if name == "mtp":
+        names, _, _ = qwen35_mtp_name_map(mtp_block_of(blocks), hf_prefix="mtp.")
+        return HFAliasSource(values, names)
+    raise ValueError(f"{name}: no GGUF companion adapter for this component")
+
+
 class SourceInputs(Mapping):
     """Named optional sources are opened only when a recipe or component requests one."""
 
-    def __init__(self, base, paths, stack, block_sources):
+    def __init__(self, base, paths, stack, block_sources, companion_names=frozenset()):
         self._sources = {"base": base}
         self._paths = dict(paths)
         self._stack = stack
         self._block_sources = block_sources
+        self._companion_names = frozenset(companion_names)
+        # The own-block handles of the companions given as GGUF files (see apply_gguf_companions).
+        self.gguf_companions: dict[str, GGUFFile] = {}
+
+    def has(self, name: str) -> bool:
+        """Whether a named source was given, without opening it."""
+
+        return name in self._sources or name in self._paths
 
     def __getitem__(self, name):
         if name not in self._sources:
@@ -61,8 +91,21 @@ class SourceInputs(Mapping):
                 raise ValueError(
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
+            path = self._paths[name]
+            if name in self._companion_names and path.suffix == ".gguf":
+                # One file, two handles: its own blocks for the import, and its values under
+                # checkpoint names for the builder's source surface.
+                from .sources.gguf_source import LazyGGUFSource
+
+                blocks = self._stack.enter_context(GGUFFile(path))
+                values = self._stack.enter_context(LazyGGUFSource(path))
+                self.gguf_companions[name] = blocks
+                self._sources[name] = self._stack.enter_context(
+                    _companion_alias(name, blocks, values)
+                )
+                return self._sources[name]
             self._sources[name] = self._stack.enter_context(
-                _open_named_source(name, self._paths[name], self._block_sources)
+                _open_named_source(name, path, self._block_sources)
             )
         return self._sources[name]
 
@@ -331,7 +374,9 @@ def main(argv=None):
             raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.
         block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
-        sources = SourceInputs(base, paths, stack, block_sources)
+        # Qwen3.5's DFlash2 adapter and MTP head arrive as GGUF releases too, imported as blocks.
+        companion_names = () if flash_next else ("dflash2", "mtp")
+        sources = SourceInputs(base, paths, stack, block_sources, companion_names)
         if args.components is None:
             components = ("text", "ngram") if flash_next else ("text",)
         else:
@@ -361,6 +406,9 @@ def main(argv=None):
         )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
+        if not flash_next:
+            # Last, so a companion's own blocks replace every default format of the same matrices.
+            apply_gguf_companions(model, recipe, sources.gguf_companions)
         if args.proposal:
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
         if args.override:

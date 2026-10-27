@@ -830,6 +830,402 @@ std::vector<std::uint8_t> gradient_ppm(int size, int phase) {
     return ppm;
 }
 
+// ---- disk tier scenarios -------------------------------------------------------------------------
+
+// A per-scenario scratch directory under /tmp; wiped so reruns start from an empty catalog.
+std::filesystem::path disk_tier_dir(const char* scenario) {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("ninfer-hybrid-disk-" + std::string(scenario));
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+// Host pressure demotes cold snapshot closures to the catalog; the blocks keep serving matches
+// from their disk copies and generation stays token-identical to a no-disk reference engine.
+int exercise_disk_demotion(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("demotion");
+    std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 11);
+    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 12);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    const std::vector<ninfer::TokenId> pressure  = synthetic_tokens(3900, 13);
+    const std::vector<ninfer::TokenId> pressure2 = synthetic_tokens(3900, 34);
+    const std::vector<ninfer::TokenId> pressure3 = synthetic_tokens(3900, 35);
+    const auto options = [&](std::size_t host_bytes, bool disk) {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, host_bytes, 8);
+        if (disk) {
+            result.context_cache.disk_kv_path          = dir;
+            result.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+        }
+        return result;
+    };
+    const auto run = [&](ninfer::EngineOptions opts) {
+        ninfer::Engine engine(std::move(opts));
+        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+        (void)engine.generate(engine.prepare_tokens(pressure), greedy(4));
+        (void)engine.generate(engine.prepare_tokens(pressure2), greedy(4));
+        (void)engine.generate(engine.prepare_tokens(pressure3), greedy(4));
+        const ninfer::GenerationResult result =
+            engine.generate(engine.prepare_tokens(second), greedy(24));
+        return Observed{result.generated_token_ids, result.reused_prompt_tokens,
+                        engine.runtime_stats()};
+    };
+    const Observed reference = run(options(1ULL << 30, false));
+    // The advertised Host budget is split between the disk tier's pinned staging and the slab
+    // pool (docs/maintainer/hybrid-prefix-cache-disk-tier.md §3), and the staging takes the
+    // surplus above the slab pool's own minimum geometry. The slab pool therefore lands on its
+    // minimum — one snapshot plus a couple of slabs — so the pressure lineages must overflow it
+    // and drive demotion, while the no-disk reference keeps its larger pool.
+    const Observed disk = run(options(1ULL << 30, true));
+
+    int failures = 0;
+    if (disk.stats.hybrid_disk_demoted_blocks == 0) {
+        std::cerr << "disk-demotion: nothing was demoted (demoted="
+                  << disk.stats.hybrid_disk_demoted_blocks << ")\n";
+        ++failures;
+    }
+    if (disk.stats.hybrid_disk_write_bytes == 0) {
+        std::cerr << "disk-demotion: the catalog saw no bytes\n";
+        ++failures;
+    }
+    if (disk.reused != reference.reused) {
+        std::cerr << "disk-demotion: reuse changed with the disk tier ("
+                  << disk.reused << " vs " << reference.reused << ")\n";
+        ++failures;
+    }
+    if (disk.tokens != reference.tokens) {
+        std::cerr << "disk-demotion: generation diverged from the no-disk reference\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A request reusing a demoted (disk-only) prefix restores through the tier's staging: the same
+// bytes as a Host restore, so greedy generation stays identical and reuse is preserved.
+int exercise_disk_restore(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("restore");
+    const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 21);
+    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 22);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+
+    // The Device pool stays tight so the pressure lineages evict the first prompt's Device
+    // blocks; the Host budget covers the tier's pinned staging and the slab pool's minimum, so
+    // the pressure lineages' write-through overflows it and the first prompt's Host copies are
+    // demoted while its committed disk records keep the prefix restorable. The reusing prompt
+    // restores through staged disk bytes.
+    ninfer::EngineOptions opts =
+        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 7168, 1ULL << 30, 2);
+    opts.context_cache.disk_kv_path           = dir;
+    opts.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+    ninfer::Engine engine(std::move(opts));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    // Three distinct legal pressure lineages (prompt + generation stay inside max_context)
+    // accumulate past the Device pool, evicting the first prompt's copies tier by tier.
+    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3800, 23)), greedy(296));
+    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(1024, 24)), greedy(296));
+    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3800, 25)), greedy(296));
+    // A re-issue of the original prompt drives the Engine's poll while the demotion closure
+    // is still in flight (an idle Engine does not poll), so by the next admission the closure
+    // has committed and released the Host copy.
+    (void)engine.generate(engine.prepare_tokens(first), greedy(512));
+    // The warm attempt stages the disk-only blocks for the reusing prefix; admission retries
+    // while the staging reads land, and the measured attempt restores through them. Both send
+    // the reusing prompt, so the candidate is the demoted terminal snapshot itself.
+    (void)engine.generate(engine.prepare_tokens(second), greedy(8));
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(second), greedy(24));
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+
+    int failures = 0;
+    if (stats.hybrid_disk_demoted_blocks == 0) {
+        std::cerr << "disk-restore: nothing was demoted; the scenario did not run\n";
+        ++failures;
+        return failures;
+    }
+    if (result.reused_prompt_tokens < 2 * kPrefillChunk) {
+        std::cerr << "disk-restore: reuse=" << result.reused_prompt_tokens
+                  << " lost the demoted prefix\n";
+        ++failures;
+    }
+    if (stats.hybrid_disk_read_bytes == 0) {
+        std::cerr << "disk-restore: no staged disk source was read\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// Engine A demotes and exits; engine B reopens the same directory and reconstructs the radix
+// tree from the catalog, serving the same reuse without a prefill of the shared prefix.
+int exercise_disk_restart(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("restart");
+    const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 31);
+    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 32);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    const std::vector<ninfer::TokenId> pressure = synthetic_tokens(3900, 33);
+    const std::vector<ninfer::TokenId> pressure2 = synthetic_tokens(3900, 36);
+    const auto options = [&] {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        result.context_cache.disk_kv_path           = dir;
+        result.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+        return result;
+    };
+
+    std::vector<ninfer::TokenId> reference;
+    std::vector<ninfer::TokenId> first_reference;
+    {
+        ninfer::Engine saver(options());
+        first_reference =
+            saver.generate(saver.prepare_tokens(first), greedy(8)).generated_token_ids;
+        (void)saver.generate(saver.prepare_tokens(pressure), greedy(4));
+        (void)saver.generate(saver.prepare_tokens(pressure2), greedy(4));
+        const ninfer::RuntimeStats before = saver.runtime_stats();
+        reference = saver.generate(saver.prepare_tokens(second), greedy(24)).generated_token_ids;
+        if (before.hybrid_disk_demoted_blocks == 0) {
+            std::cerr << "disk-restart: nothing was demoted; the scenario did not run\n";
+            return 1;
+        }
+    }
+    ninfer::Engine loader(options());
+    // The first attempt stages the disk-only sources (blocks, image, tail); admission retries
+    // the FIFO head while the staging reads land, and the second attempt consumes them.
+    const std::vector<ninfer::TokenId> first_loaded =
+        loader.generate(loader.prepare_tokens(first), greedy(8)).generated_token_ids;
+    const ninfer::RuntimeStats first_stats = loader.runtime_stats();
+    const ninfer::GenerationResult result =
+        loader.generate(loader.prepare_tokens(second), greedy(24));
+    const ninfer::RuntimeStats stats = loader.runtime_stats();
+
+    int failures = 0;
+    if (stats.hybrid_disk_resident_blocks == 0 || stats.hybrid_snapshots == 0) {
+        std::cerr << "disk-restart: the tree was not reconstructed from disk (blocks="
+                  << stats.hybrid_disk_resident_blocks << " snapshots="
+                  << stats.hybrid_snapshots << ")\n";
+        ++failures;
+    }
+    if (first_stats.hybrid_disk_restored_blocks == 0 || first_stats.hybrid_disk_read_bytes == 0) {
+        std::cerr << "disk-restart: the first reuse read no block from disk (blocks="
+                  << first_stats.hybrid_disk_restored_blocks << " bytes="
+                  << first_stats.hybrid_disk_read_bytes << ")\n";
+        ++failures;
+    }
+    if (first_loaded != first_reference) {
+        std::cerr << "disk-restart: the first reuse diverged from the pre-restart reference\n";
+        ++failures;
+    }
+    if (result.reused_prompt_tokens < 2 * kPrefillChunk) {
+        std::cerr << "disk-restart: reuse=" << result.reused_prompt_tokens
+                  << " did not hit the reconstructed prefix\n";
+        ++failures;
+    }
+    if (result.generated_token_ids != reference) {
+        std::cerr << "disk-restart: generation diverged from the pre-restart reference\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A snapshot whose frontier is not a 64-token multiple needs its tail, and a demoted one needs it
+// from the disk tier's staging (the Host copy is gone). Resuming one extra token past the
+// endpoint requires exactly that tail: the fill must accept the disk-committed tail source.
+int exercise_disk_tail_restore(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("tail-restore");
+    // 1500 tokens: the terminal endpoint carries a 92-token tail.
+    const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 41);
+    std::vector<ninfer::TokenId> extended(first);
+    extended.push_back(static_cast<ninfer::TokenId>(first.back() + 1U));
+
+    const auto options = [&](bool disk) {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        if (disk) {
+            result.context_cache.disk_kv_path           = dir;
+            result.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+        }
+        return result;
+    };
+    // The reference keeps the endpoint's Host copy and resumes over it; the disk engine must
+    // restore the same bytes from its committed closure.
+    std::vector<ninfer::TokenId> reference;
+    std::uint32_t reference_reuse = 0;
+    {
+        ninfer::Engine engine(options(false));
+        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+        const ninfer::GenerationResult result =
+            engine.generate(engine.prepare_tokens(extended), greedy(24));
+        reference         = result.generated_token_ids;
+        reference_reuse   = result.reused_prompt_tokens;
+    }
+    ninfer::Engine engine(options(true));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    // Push the endpoint's closure to the disk tier and its Host copy out of the slab pool.
+    for (std::uint32_t index = 0; index < 4; ++index) {
+        if (engine.runtime_stats().hybrid_disk_demoted_blocks != 0) { break; }
+        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, 42 + index)), greedy(4));
+    }
+    const ninfer::RuntimeStats demoted = engine.runtime_stats();
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(extended), greedy(24));
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+
+    int failures = 0;
+    if (demoted.hybrid_disk_demoted_blocks == 0) {
+        std::cerr << "disk-tail-restore: nothing was demoted; the scenario did not run\n";
+        ++failures;
+        return failures;
+    }
+    // 1408 is the last full block of the shared prefix: reuse past it can only come from the
+    // endpoint's tail.
+    constexpr std::uint32_t kLastFullBlock = 1408;
+    if (result.reused_prompt_tokens <= kLastFullBlock) {
+        std::cerr << "disk-tail-restore: reuse=" << result.reused_prompt_tokens
+                  << " did not resume over the snapshot tail (reference=" << reference_reuse
+                  << ")\n";
+        ++failures;
+    }
+    if (stats.hybrid_disk_read_bytes == 0) {
+        std::cerr << "disk-tail-restore: the tail was not read from the disk tier\n";
+        ++failures;
+    }
+    if (result.generated_token_ids != reference) {
+        std::cerr << "disk-tail-restore: generation diverged from the no-disk reference\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A small disk capacity (512 MiB) fills its record directories after a few lineages: the bounded
+// victim eviction and the reserved-record collection must keep serving instead of failing every
+// later demotion, and a restart on the same directory must not resurrect what the running cache
+// removed.
+int exercise_disk_small_capacity(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("small-capacity");
+    std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 61);
+    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 62);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    const auto options = [&] {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        result.context_cache.disk_kv_path = dir;
+        // Half the block directory and half the image directory of a 512 MiB tier.
+        result.context_cache.disk_kv_capacity_bytes = 512ULL << 20;
+        return result;
+    };
+    std::vector<ninfer::TokenId> expected;
+    {
+        ninfer::Engine engine(options());
+        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+        for (std::uint32_t index = 0; index < 4; ++index) {
+            if (engine.runtime_stats().hybrid_disk_demoted_blocks != 0) { break; }
+            (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, 63 + index)),
+                                  greedy(4));
+        }
+        expected = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        if (stats.hybrid_disk_demoted_blocks == 0) {
+            std::cerr << "disk-small-capacity: nothing was demoted; the scenario did not run\n";
+            return 1;
+        }
+        if (stats.hybrid_disk_write_bytes == 0) {
+            std::cerr << "disk-small-capacity: the catalog saw no bytes\n";
+            return 1;
+        }
+    }
+    // The previous Engine's removals are journaled: the replay must reconstruct a consistent
+    // tree (no dangling closure) and serve the same bytes.
+    ninfer::Engine reopened(options());
+    const ninfer::GenerationResult result =
+        reopened.generate(reopened.prepare_tokens(second), greedy(24));
+    int failures = 0;
+    if (result.generated_token_ids != expected) {
+        std::cerr << "disk-small-capacity: the reopened Engine diverged from the reference\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A cold chain longer than any possible staging batch (the tier's block staging is capped below
+// 256 blocks) and longer than one prefetch batch (256 blocks) must still be prepared and
+// admitted: bounded streaming stages and copies a batch per cycle with progress, instead of
+// requesting more than the pool holds and never being admitted.
+int exercise_disk_long_chain(const char* artifact) {
+    const std::filesystem::path dir = disk_tier_dir("long-chain");
+    constexpr std::uint32_t kContext = 20480;
+    // 17000 prompt tokens share 16640 with the second prompt: 260 cold blocks, more than the
+    // staging cap and more than one prefetch batch.
+    std::vector<ninfer::TokenId> first = synthetic_tokens(17000, 71);
+    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 16640);
+    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(512, 72);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    const auto options = [&](bool disk) {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, kContext, 1ULL << 30, 8);
+        result.max_context = kContext;
+        if (disk) {
+            result.context_cache.disk_kv_path           = dir;
+            result.context_cache.disk_kv_capacity_bytes = 4ULL << 30;
+        }
+        return result;
+    };
+    std::vector<ninfer::TokenId> reference;
+    {
+        ninfer::Engine engine(options(false));
+        (void)engine.generate(engine.prepare_tokens(first), greedy(4));
+        reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
+    }
+    ninfer::Engine engine(options(true));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(4));
+    // Distinct long lineages fill the slab pool and shed the shared chain's Device copies, so the
+    // chain reaches the disk tier.
+    for (std::uint32_t index = 0; index < 2; ++index) {
+        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(18000, 73 + index)), greedy(4));
+    }
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(second), greedy(24));
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+
+    int failures = 0;
+    if (stats.hybrid_disk_demoted_blocks == 0) {
+        std::cerr << "disk-long-chain: nothing was demoted; the scenario did not run\n";
+        ++failures;
+        return failures;
+    }
+    // 16640 shared tokens: the resume point must sit deep in the shared chain, not at a shallow
+    // survivor of the pressure.
+    if (result.reused_prompt_tokens + 256U < 16640U) {
+        std::cerr << "disk-long-chain: reuse=" << result.reused_prompt_tokens
+                  << " lost the long shared chain\n";
+        ++failures;
+    }
+    if (result.generated_token_ids != reference) {
+        std::cerr << "disk-long-chain: generation diverged from the no-disk reference\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// The persistence file and the disk tier are mutually exclusive at the Engine boundary.
+int exercise_disk_persist_exclusive(const char* artifact) {
+    ninfer::EngineOptions opts =
+        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    opts.context_cache.disk_kv_path           = std::filesystem::temp_directory_path();
+    opts.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+    opts.context_cache.hybrid.persistent_file =
+        std::filesystem::temp_directory_path() / "ninfer-disk-exclusive.bin";
+    try {
+        ninfer::Engine engine(std::move(opts));
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "disk-persist-exclusive: the Engine accepted both a persistence file and the "
+                 "disk tier\n";
+    return 1;
+}
+
 // Vision identity: the same image and text resume at the generation opener, while identical text
 // tokens with a different image cannot reuse anything from the image onwards (its blocks carry the
 // image's content key) and never resume inside the image's span.
@@ -904,7 +1300,7 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 15> kScenarios{"all",
+    constexpr std::array<std::string_view, 22> kScenarios{"all",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -918,7 +1314,14 @@ int main() {
                                                           "persist",
                                                           "turns-protocol",
                                                           "coalesce",
-                                                          "interleaved"};
+                                                          "interleaved",
+                                                          "disk-demotion",
+                                                          "disk-restore",
+                                                          "disk-restart",
+                                                          "disk-persist-exclusive",
+                                                          "disk-tail-restore",
+                                                          "disk-small-capacity",
+                                                          "disk-long-chain"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
         std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
@@ -952,6 +1355,21 @@ int main() {
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
+        if (all || scenario == "disk-demotion") { failures += exercise_disk_demotion(artifact); }
+        if (all || scenario == "disk-restore") { failures += exercise_disk_restore(artifact); }
+        if (all || scenario == "disk-restart") { failures += exercise_disk_restart(artifact); }
+        if (all || scenario == "disk-persist-exclusive") {
+            failures += exercise_disk_persist_exclusive(artifact);
+        }
+        if (all || scenario == "disk-tail-restore") {
+            failures += exercise_disk_tail_restore(artifact);
+        }
+        if (all || scenario == "disk-small-capacity") {
+            failures += exercise_disk_small_capacity(artifact);
+        }
+        if (all || scenario == "disk-long-chain") {
+            failures += exercise_disk_long_chain(artifact);
+        }
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);

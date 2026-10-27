@@ -189,6 +189,7 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
+
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 256;

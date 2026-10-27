@@ -204,9 +204,17 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const bool whole_pieces = attention && (dense || moe) && !joins(inputs.first<2>()) &&
                               !joins(inputs.last<2>());
     const bool share = dense_share || attention_share || whole_pieces;
-    require(dense || moe || share, "input projection: unsupported logical projection geometry");
+    // The 2B dense geometry: GDN layers project q/k/v/z all at the hidden width, attention
+    // layers a 4:1 query:key ratio of the same width.
+    const bool small =
+        attention ? q == std::vector<std::uint64_t>{2048, 2048} &&
+                        k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
+                  : q == std::vector<std::uint64_t>{2048, 2048} && k == q && third == q &&
+                    fourth == q;
+    require(dense || moe || share || small,
+            "input projection: unsupported logical projection geometry");
     if (std::any_of(inputs.begin(), inputs.end(), gguf_parent) || share) {
-        require(dense || share, "input projection: GGUF parts need the dense geometry");
+        require(dense || share || small, "input projection: GGUF parts need the dense geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
@@ -253,9 +261,8 @@ SingleProjectionWeight prepare_linear_weight(std::span<const WeightInput> rows) 
     return single(rows);
 }
 
-SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
-                                                       const WeightInput& key,
-                                                       const WeightInput& value) {
+ProjectionWeights prepare_attn_input_proj_weights(const WeightInput& query, const WeightInput& key,
+                                                  const WeightInput& value) {
     const auto& q = matrix(query);
     require((q == std::vector<std::uint64_t>{4096, 2048} ||
              q == std::vector<std::uint64_t>{4096, 5120}) &&
@@ -263,9 +270,16 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                 matrix(value) == matrix(key),
             "QKV input projection: unsupported logical geometry");
     const std::array inputs{query, key, value};
+    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
+        // The same output slots as the four-row attention projection: 0 = q, 2 = k, 3 = v. A
+        // drafter has no output gate, so rows 1 cover nothing.
+        const std::array<std::int32_t, 3> outputs{0, 2, 3};
+        const std::array<std::int32_t, 3> rows{0, 0, 0};
+        return part_projection(inputs, outputs, rows);
+    }
     auto result = single(inputs);
     require(result.weight.qtype == QType::Q8_G32_FP16,
-            "QKV input projection: native form requires Q8");
+            "QKV input projection: native form requires Q8 or stored GGUF blocks");
     return result;
 }
 
@@ -285,7 +299,8 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
+                                   shape == std::vector<std::uint64_t>{32, 2048} ||
+                                   shape == std::vector<std::uint64_t>{16, 2048}),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {
@@ -293,7 +308,8 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
+    // Only a parent that joins the two halves reaches the combined form. Every admitted geometry
+    // (48/5120, 32/2048, 16/2048) has a split consumer, so separate parents stay a pair.
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,

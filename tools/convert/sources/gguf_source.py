@@ -173,6 +173,55 @@ class GGUFSource:
         self.close()
 
 
+class LazyGGUFSource:
+    """A GGUFSource opened on the first value read, for a companion imported as stored blocks.
+
+    A recipe that stores a companion's own ggml blocks never reads a value, so a release whose
+    stored types the `gguf` package does not know (PrismML's PQ2_0) still converts; only asking
+    for values opens the file, and there the unknown type is reported where it is read.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.config: dict = {}
+        self._source: GGUFSource | None = None
+
+    def _open(self) -> GGUFSource:
+        if self._source is None:
+            self._source = GGUFSource(self.path)
+        return self._source
+
+    @property
+    def bytes_read(self) -> int:
+        return 0 if self._source is None else self._source.bytes_read
+
+    def has(self, name: str) -> bool:
+        return self._open().has(name)
+
+    def describe(self, name: str) -> TensorInfo:
+        return self._open().describe(name)
+
+    def read_flat(self, name: str, begin: int = 0, end: int | None = None) -> torch.Tensor:
+        return self._open().read_flat(name, begin, end)
+
+    def list_tensors(self):
+        yield from self._open().list_tensors()
+
+    def metadata(self) -> dict:
+        return self._open().metadata()
+
+    def close(self) -> None:
+        if self._source is not None:
+            self._source.close()
+        self._source = None
+
+    def __enter__(self) -> "LazyGGUFSource":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
 Transform = Callable[[torch.Tensor, tuple[int, ...]], tuple[torch.Tensor, tuple[int, ...]]]
 
 

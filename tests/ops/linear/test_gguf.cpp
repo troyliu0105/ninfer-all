@@ -15,6 +15,8 @@
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
+#include "../gguf_reference.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -229,9 +231,28 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
             return 1;
         }
     }
-    if (const auto host = host_decode(c.qtype, host_blocks); !host.empty() && host != exact) {
-        std::cerr << "FAIL " << c.name << ": dequantization differs from the host decode\n";
-        return 1;
+    // The oracle's weight values: the four K-quant types read this header's independent FP64
+    // decode, which also checks the device decoder to within one float rounding; every other type
+    // reads the device decoder's own float values.
+    std::vector<double> weights;
+    if (test::gguf_reference::decodes(c.qtype)) {
+        weights = test::gguf_reference::decode_matrix(c.qtype, host_blocks.data(), 2 * kRows, kK);
+        double worst = 0;
+        for (std::size_t i = 0; i < exact.size(); ++i) {
+            const double scale = std::max(std::abs(weights[i]), 1e-30);
+            worst = std::max(worst, std::abs(double(exact[i]) - weights[i]) / scale);
+        }
+        if (worst > 1e-6) {
+            std::cerr << "FAIL " << c.name << ": device decode differs from the independent "
+                      << "FP64 decode by " << worst << " relative\n";
+            return 1;
+        }
+    } else {
+        weights.assign(exact.begin(), exact.end());
+        if (const auto host = host_decode(c.qtype, host_blocks); !host.empty() && host != exact) {
+            std::cerr << "FAIL " << c.name << ": dequantization differs from the host decode\n";
+            return 1;
+        }
     }
 
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -254,10 +275,10 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
         for (std::int32_t col = 0; col < t; ++col) {
             for (std::int32_t r = 0; r < kRows; ++r) {
                 double acc = 0;
-                const float* w = exact.data() + std::size_t(row0 + r) * kK;
+                const double* w = weights.data() + std::size_t(row0 + r) * kK;
                 const float* x = x_float.data() + std::size_t(col) * kK;
                 for (std::int32_t i = 0; i < kK; ++i) {
-                    acc += double(w[i]) * x[permuted ? columns[i] : i];
+                    acc += w[i] * double(x[permuted ? columns[i] : i]);
                 }
                 out[std::size_t(col) * kRows + r] = acc;
             }

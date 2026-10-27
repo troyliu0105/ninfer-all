@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -15,6 +16,11 @@ std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
     std::int32_t min_batch_size, std::int32_t max_batch_size);
 
+// The same projected BF16 plane, then Linear's own workspace for this weight and policy.
+std::size_t materialized_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    const Weight& projection_weight, LinearPolicy policy, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size);
+
 const char* q8_linear_dynamic_grouped_conv_add_route_name(std::int32_t input_rows,
                                                           std::int32_t width,
                                                           std::int32_t batch_size);
@@ -24,9 +30,10 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
                                                  const Tensor& finish_delta, Tensor& residual,
                                                  WorkspaceArena& workspace, cudaStream_t stream);
 
-// Any other registered row-split projection: Linear into the plan's BF16 plane, then the finish.
+// Any other registered projection (a row-split format or stored GGUF blocks): Linear under the
+// Use's policy into the plan's BF16 plane, then the finish.
 void materialized_linear_dynamic_grouped_conv_add_dispatch(
-    const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,
+    const Tensor& x, const Weight& projection_weight, LinearPolicy policy, const Tensor& base_kernel,
     const Tensor& finish_delta, Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

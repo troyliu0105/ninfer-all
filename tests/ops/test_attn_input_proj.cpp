@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
+#include "ops/gguf_reference.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear/sm70/sm70_project.h"
 
@@ -16,6 +17,8 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <cstring>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -626,8 +629,9 @@ int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char*
     const auto physical       = physical_parent(parent.view());
     const auto qw = rows(physical, 0, 4096), kw = rows(physical, 4096, 1024);
     const auto vw       = rows(physical, 5120, 1024);
-    const auto prepared = ops::prepare_attn_input_proj_weights({qw}, {kw}, {vw});
-    const auto launch   = [&] { ops::attn_input_proj(x, prepared.weight, q, k, v, stream); };
+    const auto prepared = std::get<ops::SingleProjectionWeight>(
+        ops::prepare_attn_input_proj_weights({qw}, {kw}, {vw}));
+    const auto launch = [&] { ops::attn_input_proj(x, prepared.weight, q, k, v, stream); };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     cuda_synchronize();
@@ -698,6 +702,142 @@ int run_q8_dflash2() {
     return failures;
 }
 
+
+// The drafter's three-output Q/K/V projection over a release's own ggml blocks: three parents of
+// different block types, each decoded independently in FP64 for the oracle.
+Weight gguf_weight(QType qtype, void* data, std::int32_t n, std::int32_t k, std::size_t bytes) {
+    const auto block = gguf_block_shape(qtype);
+    Weight weight{};
+    weight.payload         = data;
+    weight.payload_bytes   = bytes;
+    weight.qtype           = qtype;
+    weight.layout          = QuantLayout::GgufBlocks;
+    weight.ndim            = 2;
+    weight.n               = n;
+    weight.k               = k;
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    weight.qdata           = data;
+    weight.group_size      = static_cast<std::uint32_t>(block.elements);
+    weight.group           = block.elements;
+    return weight;
+}
+
+std::vector<std::uint8_t> gguf_blocks(QType qtype, std::int32_t rows, std::int32_t k,
+                                      std::uint32_t seed) {
+    const auto block         = gguf_block_shape(qtype);
+    const std::int64_t count = std::int64_t(rows) * (k / block.elements);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count) * block.bytes);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002F, 0.02F);
+    for (auto& value : bytes) { value = static_cast<std::uint8_t>(byte(rng)); }
+    const std::vector<int> half_fields = qtype == QType::GGUF_Q2_K   ? std::vector<int>{80, 82}
+                                         : qtype == QType::GGUF_Q3_K ? std::vector<int>{108}
+                                         : qtype == QType::GGUF_Q4_K ? std::vector<int>{0, 2}
+                                                                     : std::vector<int>{208};
+    for (std::int64_t i = 0; i < count; ++i) {
+        std::uint8_t* base = bytes.data() + i * block.bytes;
+        for (const int offset : half_fields) {
+            const std::uint16_t bits = f32_to_bf16(scale(rng)) & 0x7f80U;
+            std::memcpy(base + offset, &bits, sizeof(bits));
+        }
+    }
+    return bytes;
+}
+
+int run_gguf_qkv() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 4096;
+    constexpr std::int32_t kKvRows = 1024;
+    struct Part {
+        QType qtype;
+        std::int32_t rows;
+        std::int32_t output;
+    };
+    const Part parts[] = {{QType::GGUF_Q2_K, kQRows, 0},
+                          {QType::GGUF_Q2_K, kKvRows, 2},
+                          {QType::GGUF_Q4_K, kKvRows, 3}};
+    std::vector<std::vector<std::uint8_t>> storage;
+    std::vector<DeviceBuffer> devices;
+    std::vector<Weight> weights;
+    ops::PartProjectionWeights projection;
+    for (std::size_t index = 0; index < 3; ++index) {
+        storage.push_back(gguf_blocks(parts[index].qtype, parts[index].rows, kHidden,
+                                      0x31u + static_cast<std::uint32_t>(index)));
+        devices.emplace_back(storage.back().size());
+        devices.back().copy_from_host(storage.back().data(), storage.back().size());
+        weights.push_back(gguf_weight(parts[index].qtype, devices.back().p, parts[index].rows,
+                                     kHidden, storage.back().size()));
+        projection.parts.push_back({weights.back(), parts[index].output, 0});
+    }
+
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 8, 9, 32, 128}) {
+        std::vector<float> activation(static_cast<std::size_t>(kHidden) * tokens);
+        fill_uniform(activation, 0x5u + static_cast<std::uint32_t>(tokens), -2.0F, 2.0F);
+        round_to_bf16(activation);
+        std::vector<std::uint16_t> activation_bits(activation.size());
+        std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
+        DeviceBuffer activation_device = to_device(activation_bits);
+        GuardedBf16Tensor query(kQRows, tokens), key(kKvRows, tokens), value(kKvRows, tokens);
+        Tensor x(activation_device.p, DType::BF16, {kHidden, tokens});
+        const std::size_t capacity =
+            ops::attn_input_proj_workspace_capacity_bytes(projection, tokens, tokens);
+        GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        Tensor query_view = query.tensor(), key_view = key.tensor(), value_view = value.tensor();
+        ops::attn_input_proj(x, projection, query_view, key_view, value_view, workspace, nullptr);
+        cuda_synchronize();
+
+        const std::vector<std::int32_t> samples{0, 1, 7, 63, 255, 256, 1023};
+        for (std::size_t index = 0; index < 3; ++index) {
+            const auto& part = parts[index];
+            GuardedBf16Tensor* output =
+                part.output == 0 ? &query : (part.output == 2 ? &key : &value);
+            const auto got = from_device_bf16(output->tensor().data,
+                                             std::size_t(part.rows) * tokens);
+            const auto block     = gguf_block_shape(part.qtype);
+            const std::int32_t per_row = kHidden / gguf_reference::kSuperBlock;
+            std::vector<double> decoded(gguf_reference::kSuperBlock);
+            std::vector<double> sampled, expected;
+            for (const std::int32_t row : samples) {
+                if (row >= part.rows) { continue; }
+                for (std::int32_t t = 0; t < tokens; ++t) {
+                    double accumulator = 0;
+                    for (std::int32_t b = 0; b < per_row; ++b) {
+                        gguf_reference::decode_block(
+                            part.qtype,
+                            storage[index].data() +
+                                static_cast<std::size_t>(row) * per_row * block.bytes +
+                                static_cast<std::size_t>(b) * block.bytes,
+                            decoded.data());
+                        for (int i = 0; i < gguf_reference::kSuperBlock; ++i) {
+                            accumulator +=
+                                decoded[static_cast<std::size_t>(i)] *
+                                double(activation[static_cast<std::size_t>(t) * kHidden +
+                                                  static_cast<std::size_t>(b) * 256 + i]);
+                        }
+                    }
+                    sampled.push_back(
+                        got[static_cast<std::size_t>(t) * part.rows + row]);
+                    expected.push_back(accumulator);
+                }
+            }
+            const std::string role = part.output == 0 ? "q" : (part.output == 2 ? "k" : "v");
+            failures += verify_reduction("attn " + role + " GGUF parts T=" +
+                                             std::to_string(tokens),
+                                         sampled, expected, kAttnInputProjA8Tolerance);
+        }
+        failures += verify_preserved("attn GGUF x T=" + std::to_string(tokens),
+                                     activation_device, activation_bits);
+        failures += scratch.verify_guards("attn GGUF workspace T=" + std::to_string(tokens));
+    }
+    return failures;
+}
+
 int run_weight_inputs() {
     int failures = 0;
     {
@@ -720,6 +860,7 @@ int run_weight_inputs() {
     }
     failures += run_nvfp4_target();
     failures += run_q8_dflash2();
+    failures += run_gguf_qkv();
     return failures;
 }
 

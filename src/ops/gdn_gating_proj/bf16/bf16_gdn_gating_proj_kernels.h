@@ -56,6 +56,14 @@ void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, 
                                              const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
                                              Tensor& beta, cudaStream_t stream);
 
+void bf16_gdn_gating_proj_2b_simt_c4_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream);
+void bf16_gdn_gating_proj_2b_simt_c8_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream);
 void bf16_gdn_gating_proj_35_simt_c4_launch(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,

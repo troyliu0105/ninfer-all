@@ -84,8 +84,9 @@ void run_batch(int width, std::int32_t batch_size, const Options& options,
     const auto launch = [&](cudaStream_t launch_stream) {
         workspace.reset();
         ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm_weight, 1.0e-6F, base_kernel,
-                                                  projection_weight, prepared, finish_delta,
-                                                  workspace, launch_stream);
+                                                  projection_weight, ops::LinearPolicy::A16Only,
+                                                  prepared, finish_delta, workspace,
+                                                  launch_stream);
     };
     workspace.reset_peak();
     TimedGraph graph;
@@ -120,8 +121,10 @@ int main(int argc, char** argv) {
         DeviceBuffer finish = make_zeros(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth *
                                          8 * sizeof(std::uint16_t));
         DeviceBuffer flush(options.flush_bytes);
+        const Weight& projection_weight = projection.weight;
         const std::size_t workspace_bytes =
-            ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
+            ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                projection_weight, ops::LinearPolicy::A16Only, 2, 16, 1, 8);
         WorkspaceArena workspace(workspace_bytes);
         Tensor norm_weight(norm.p, DType::BF16, {kHidden});
         Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});

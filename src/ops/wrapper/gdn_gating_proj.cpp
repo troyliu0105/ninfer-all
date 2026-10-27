@@ -48,6 +48,18 @@ struct GdnControlParentGeometry {
     std::int32_t heads;
 };
 
+GdnControlParentGeometry require_split_parent(const Weight& a_weight, const Weight& b_weight) {
+    for (const auto [heads, input_rows] : {std::pair{48, 5120}, std::pair{32, 2048},
+                                           std::pair{16, 2048}}) {
+        if (a_weight.n == heads && a_weight.k == input_rows) {
+            require_bf16_weight(a_weight, heads, input_rows, "a_weight");
+            require_bf16_weight(b_weight, heads, input_rows, "b_weight");
+            return {.input_rows = input_rows, .heads = heads};
+        }
+    }
+    throw std::invalid_argument("gdn_gating_proj: unsupported a/b weight geometry");
+}
+
 GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
     if (parent.n == 96 && parent.k == 5120) {
         require_bf16_weight(parent, 96, 5120, "ab_weight");
@@ -56,6 +68,12 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
     if (parent.n == 64 && parent.k == 2048) {
         require_bf16_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};
+    }
+    // The 2B control pair is registered as one [A;B] parent of 16+16 rows, exactly as the 35B
+    // parent is 32+32. Its halves run the geometry-generic 2B SIMT schedules.
+    if (parent.n == 32 && parent.k == 2048) {
+        require_bf16_weight(parent, 32, 2048, "ab_weight");
+        return {.input_rows = 2048, .heads = 16};
     }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
 }
@@ -103,15 +121,14 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                      Tensor& beta, DeviceExecutionView execution) {
-    constexpr const char* op  = "gdn_gating_proj";
+    constexpr const char* op = "gdn_gating_proj";
     const std::int32_t tokens = x.ne[1];
-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    const GdnControlParentGeometry geometry = require_split_parent(a_weight, b_weight);
+    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
+    require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
 
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, execution);
@@ -139,20 +156,19 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, DeviceExecutionView execution) {
-    constexpr const char* op  = "gdn_norm_gating_proj";
+    constexpr const char* op = "gdn_norm_gating_proj";
     const std::int32_t tokens = x.ne[1];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
-    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    const GdnControlParentGeometry geometry = require_split_parent(a_weight, b_weight);
+    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
+    require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
+    require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
@@ -195,16 +211,15 @@ void gdn_norm_gating_proj_rotated(const Tensor& x, const Tensor& norm_weight, fl
         throw std::invalid_argument(
             "gdn_norm_gating_proj_rotated: eps must be positive and finite");
     }
-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
-    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
-    require_vector_tensor(signs, DType::BF16, 5120, op, "signs");
-    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    const GdnControlParentGeometry geometry = require_split_parent(a_weight, b_weight);
+    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
+    require_vector_tensor(signs, DType::BF16, geometry.input_rows, op, "signs");
+    require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
+    require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
     if ((reinterpret_cast<std::uintptr_t>(signs.data) & 15U) != 0 ||
         (reinterpret_cast<std::uintptr_t>(h.data) & 15U) != 0) {

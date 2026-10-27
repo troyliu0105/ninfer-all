@@ -24,6 +24,9 @@ struct CausalAttentionGeometry {
 
 using CausalD256H24Kv4 = CausalAttentionGeometry<6, 4, 1>;
 using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
+// The Qwen3.5-2B dense geometry: 8 query heads over 2 KV heads (group 4), half the small-T
+// splits of the 16-head model.
+using CausalD256H8Kv2 = CausalAttentionGeometry<4, 2, 1>;
 
 // Whether `query_heads` over `kv_heads` is one of those geometries or a run of its KV heads.
 [[nodiscard]] constexpr bool causal_attention_geometry_supported(std::int32_t query_heads,
@@ -31,7 +34,8 @@ using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
     if (kv_heads <= 0 || query_heads % kv_heads != 0) { return false; }
     const std::int32_t group = query_heads / kv_heads;
     return (group == CausalD256H24Kv4::GroupSize && kv_heads <= CausalD256H24Kv4::ModelKVHeads) ||
-           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads);
+           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads) ||
+           (group == CausalD256H8Kv2::GroupSize && kv_heads <= CausalD256H8Kv2::ModelKVHeads);
 }
 
 // Calls `f.template operator()<Geometry>()` with the geometry of `query_heads` over `kv_heads`.
@@ -41,27 +45,37 @@ decltype(auto) with_causal_geometry(std::int32_t query_heads, std::int32_t kv_he
     if (!causal_attention_geometry_supported(query_heads, kv_heads)) {
         throw std::invalid_argument("causal attention: unsupported head geometry");
     }
-    if (query_heads / kv_heads == CausalD256H24Kv4::GroupSize) {
+    const std::int32_t group = query_heads / kv_heads;
+    if (group == CausalD256H24Kv4::GroupSize) {
         return f.template operator()<CausalD256H24Kv4>();
+    }
+    if (group == CausalD256H8Kv2::GroupSize) {
+        return f.template operator()<CausalD256H8Kv2>();
     }
     return f.template operator()<CausalD256H16Kv2>();
 }
 
-// The same for a call named by its query heads alone. A call holds whole groups of query heads, and
-// the geometries' counts (6, 12, 18 or 24, and 8 or 16) do not overlap.
+// The same for a call named by its query heads alone. A call holds whole groups of query heads,
+// and the geometries' counts (6, 12, 18 or 24, 4 or 8, and 8 or 16) overlap at 8: the 2B model's
+// whole 8 over 2 KV heads and a 16-head model's half over 1. `kv_heads` — every call site holds
+// the cache view's count — separates them.
 template <typename F>
-decltype(auto) with_causal_query_geometry(std::int32_t query_heads, F&& f) {
-    const std::int32_t group = query_heads % CausalD256H24Kv4::GroupSize == 0
-                                   ? CausalD256H24Kv4::GroupSize
-                                   : CausalD256H16Kv2::GroupSize;
-    return with_causal_geometry(query_heads, query_heads / group, static_cast<F&&>(f));
+decltype(auto) with_causal_query_geometry(std::int32_t query_heads, std::int32_t kv_heads,
+                                          F&& f) {
+    return with_causal_geometry(query_heads, kv_heads, static_cast<F&&>(f));
 }
 
 // The query heads of the model whose geometry a call with `query_heads` takes: a tensor-parallel
 // share takes its model's measured routes, chunks and tiles.
-[[nodiscard]] inline std::int32_t causal_attention_model_query_heads(std::int32_t query_heads) {
-    return with_causal_query_geometry(query_heads,
-                                      []<typename Geometry>() { return Geometry::ModelQHeads; });
+[[nodiscard]] inline std::int32_t causal_attention_model_query_heads(std::int32_t query_heads,
+                                                                     std::int32_t kv_heads) {
+    if (!causal_attention_geometry_supported(query_heads, kv_heads)) {
+        throw std::invalid_argument("causal attention: unsupported head geometry");
+    }
+    const std::int32_t group = query_heads / kv_heads;
+    if (group == CausalD256H24Kv4::GroupSize) { return CausalD256H24Kv4::ModelQHeads; }
+    if (group == CausalD256H8Kv2::GroupSize) { return CausalD256H8Kv2::ModelQHeads; }
+    return CausalD256H16Kv2::ModelQHeads;
 }
 
 } // namespace ninfer::ops

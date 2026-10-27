@@ -2,6 +2,15 @@ ninfer_add_test(ninfer_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)
 
+# The Hadamard-rotated projection over a release's own block formats (tools/convert/ternary.py's
+# rotated_source): the production rotate-then-add composition against an independent FP64 oracle.
+ninfer_add_test(ninfer_qwen3_5_rotated_gguf_projection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rotated_gguf_projection.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+set_tests_properties(ninfer_qwen3_5_rotated_gguf_projection_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_ngram_archive_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   LIBRARIES ninfer_model_runtime)
