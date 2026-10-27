@@ -43,7 +43,8 @@ CausalAttentionRoute route_at(AttentionHeadGeometry geometry, std::uint32_t capa
     const std::uint64_t target =
         std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1);
     return causal_attention_resolve_route(
-        geometry.query_heads, static_cast<std::int32_t>(draft_window) + 1, 1, storage,
+        geometry.query_heads, geometry.kv_heads, static_cast<std::int32_t>(draft_window) + 1, 1,
+        storage,
         CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)});
 }
 
@@ -146,7 +147,7 @@ void check(AttentionHeadGeometry geometry, std::uint32_t capacity, std::uint32_t
             const std::uint64_t target = std::min<std::uint64_t>(
                 capacity, static_cast<std::uint64_t>(profile.max) + draft_window + step + 2);
             steps.push_back(causal_attention_resolve_route(
-                geometry.query_heads, 1, 1, storage,
+                geometry.query_heads, geometry.kv_heads, 1, 1, storage,
                 CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)}));
         }
         const auto [it, inserted] = steps_of_class.emplace(profile.topology_class, steps);
@@ -168,7 +169,7 @@ void check_ordinary(AttentionHeadGeometry geometry, std::uint32_t capacity, KvCa
     std::map<std::uint32_t, CausalAttentionRoute> route_of_class;
     for (const auto& profile : profiles) {
         const CausalAttentionRoute route = causal_attention_resolve_route(
-            geometry.query_heads, 1, 1, storage,
+            geometry.query_heads, geometry.kv_heads, 1, 1, storage,
             CausalAttentionExecutionEnvelope{profile.min + 1U, profile.max + 1U});
         const auto [it, inserted] = route_of_class.emplace(profile.topology_class, route);
         if (!inserted && it->second != route) {

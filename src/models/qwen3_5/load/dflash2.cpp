@@ -30,13 +30,15 @@ void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
         weights.layers[i].attention_conv = convolution("attention_conv");
         weights.layers[i].mlp_conv       = convolution("mlp_conv");
     }
+    // The codebooks are read a row at a time, never projected, so they are parameters without a
+    // Use: a release stores them in its own block type as readily as in BF16 words.
     weights.selector =
         SelectorWeights{b.parameter("dflash2/candidate_selector/hidden_projection",
                                     {extra.selector_rank, h}, {"dflash2/final_hidden"}),
-                        b.direct("dflash2/candidate_selector/predecessor_codebook",
-                                 {target.vocab_size, extra.selector_rank}),
-                        b.direct("dflash2/candidate_selector/successor_codebook",
-                                 {target.vocab_size, extra.selector_rank})};
+                        b.parameter("dflash2/candidate_selector/predecessor_codebook",
+                                    {target.vocab_size, extra.selector_rank}),
+                        b.parameter("dflash2/candidate_selector/successor_codebook",
+                                    {target.vocab_size, extra.selector_rank})};
 }
 
 } // namespace ninfer::models::qwen3_5::loading

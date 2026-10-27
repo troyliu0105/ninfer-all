@@ -155,7 +155,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
 
-        if (config.dflash2) {
+        // The fused materialization reads one shared Q8 row-split parent per layer; an adapter
+        // that keeps its own stored blocks, or any other format, takes the layer-by-layer route.
+        bool fused = config.dflash2.has_value();
+        for (int layer = 0; fused && layer < dimension(config.num_hidden_layers); ++layer) {
+            const auto& weights = state.execution.parameters.draft->layers[layer];
+            fused = weights.context_key.weight.qtype == QType::Q8_G32_FP16 &&
+                    weights.context_key.weight.layout == QuantLayout::RowSplit &&
+                    weights.context_value.weight.qtype == QType::Q8_G32_FP16 &&
+                    weights.context_value.weight.layout == QuantLayout::RowSplit;
+        }
+        if (fused) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
                 config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
@@ -175,6 +185,16 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
                 state.execution.work, state.execution.device.stream);
         } else {
+            // A DFlash2 context buffer already holds only the local window (see projected_width),
+            // so its per-layer route must not truncate it again; that form needs every layer to be
+            // a sliding one, exactly as the fused materialization does.
+            const bool window_only = config.dflash2.has_value();
+            if (window_only && replace_local_window &&
+                config.local_layer_count() != config.num_hidden_layers) {
+                throw std::invalid_argument(
+                    "masked draft context: an oversized local window needs every layer to be a "
+                    "sliding one");
+            }
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = state.execution.work.scope();
                 const auto& weight =
@@ -183,12 +203,14 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                     config.layer_types[layer] == DraftAttentionKind::SlidingAttention;
                 const int layer_width   = local_layer ? local_width : width;
                 const int layer_columns = layer_width * batch;
-                Tensor layer_context    = local_layer && replace_local_window
-                                              ? context.slice(1, local_offset, local_width)
-                                              : context;
-                Tensor layer_positions  = local_layer && replace_local_window
-                                              ? positions.slice(0, local_offset, local_width)
-                                              : positions;
+                Tensor layer_context =
+                    local_layer && replace_local_window && !window_only
+                        ? context.slice(1, local_offset, local_width)
+                        : context;
+                // The positions are the caller's own, so a local layer always takes the window.
+                Tensor layer_positions = local_layer && replace_local_window
+                                             ? positions.slice(0, local_offset, local_width)
+                                             : positions;
                 auto layer_roots = workspace::dflash_context_layer(state.execution.work, target,
                                                                    config, layer_columns);
                 Tensor key_raw   = layer_roots.key_raw.view(
@@ -201,9 +223,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                     key_raw.view({dimension(config.attention.key_width()), layer_columns});
                 Tensor value_flat =
                     value.view({dimension(config.attention.key_width()), layer_columns});
-                ops::linear_pair(layer_context, weight.context_key.weight,
-                                 weight.context_value.weight, key_flat, value_flat,
-                                 state.execution.device.stream);
+                if (is_gguf(weight.context_key.weight.qtype) ||
+                    is_gguf(weight.context_value.weight.qtype)) {
+                    project(layer_context, weight.context_key, key_flat, state.execution.work,
+                            state.execution.device.stream);
+                    project(layer_context, weight.context_value, value_flat, state.execution.work,
+                            state.execution.device.stream);
+                } else {
+                    ops::linear_pair(layer_context, weight.context_key.weight,
+                                     weight.context_value.weight, key_flat, value_flat,
+                                     state.execution.device.stream);
+                }
                 Tensor key = layer_roots.key.view({dimension(config.attention.head_dim),
                                                    dimension(config.attention.num_key_value_heads),
                                                    layer_columns});
@@ -241,11 +271,13 @@ void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, co
     auto scope      = execution.work.scope();
     const int width = residual.ne[1], batch = residual.ne[2];
     WorkspaceArena scratch(execution.work.alloc_bytes(
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(width, width, batch,
-                                                                           batch)));
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            weights.kernel_projection.weight, weights.kernel_projection.policy, width, width,
+            batch, batch)));
     ops::rmsnorm_dynamic_grouped_conv_prepare(
-        residual, norm, eps, weights.base_kernel, weights.kernel_projection.weight, branch.prepared,
-        branch.finish_delta, scratch, execution.device.stream);
+        residual, norm, eps, weights.base_kernel, weights.kernel_projection.weight,
+        weights.kernel_projection.policy, branch.prepared, branch.finish_delta, scratch,
+        execution.device.stream);
 }
 
 void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
@@ -255,9 +287,29 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
     const int width = input.ne[1], batch = input.ne[2];
     WorkspaceArena scratch(
         execution.work.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-            input.ne[0], width, width, batch, batch)));
-    ops::linear_dynamic_grouped_conv_add(input, projection.weight, weights.base_kernel,
-                                         finish_delta, residual, scratch, execution.device.stream);
+            projection.weight, projection.policy, width, width, batch, batch)));
+    ops::linear_dynamic_grouped_conv_add(input, projection.weight, projection.policy,
+                                         weights.base_kernel, finish_delta, residual, scratch,
+                                         execution.device.stream);
+}
+
+// The drafter's fused Q/K/V projection: one Q8 parent takes its own three-output route, and the
+// stored GGUF parts of an adapter that keeps its own blocks take the part form.
+void attn_input_proj_qkv(ExecutionCore& execution, const Tensor& x,
+                         const ops::ProjectionWeights& projection, Tensor& query, Tensor& key,
+                         Tensor& value) {
+    if (const auto* parts = std::get_if<ops::PartProjectionWeights>(&projection)) {
+        auto scope = execution.work.scope();
+        WorkspaceArena scratch(execution.work.alloc_bytes(
+            ops::attn_input_proj_workspace_capacity_bytes(*parts, x.ne[1], x.ne[1])));
+        ops::attn_input_proj(x, *parts, query, key, value, scratch, execution.device.stream);
+        return;
+    }
+    const auto* single = std::get_if<ops::SingleProjectionWeight>(&projection);
+    if (single == nullptr) {
+        throw std::invalid_argument("DFlash Q/K/V projection needs one Q8 parent or GGUF parts");
+    }
+    ops::attn_input_proj(x, single->weight, query, key, value, execution.device.stream);
 }
 
 void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
@@ -311,9 +363,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     query.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat   = key.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
-                                     layer.query_key_value.weight, query_flat, key_flat, value_flat,
-                                     stream);
+                attn_input_proj_qkv(
+                    state.execution,
+                    branch.prepared.view({dimension(target.hidden_size), columns}),
+                    layer.query_key_value, query_flat, key_flat, value_flat);
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
@@ -448,8 +501,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     query_raw.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat = key_raw.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value.weight, query_flat,
-                                     key_flat, value_flat, state.execution.device.stream);
+                attn_input_proj_qkv(state.execution, roots.hidden, weight.query_key_value,
+                                    query_flat, key_flat, value_flat);
                 Tensor query =
                     roots.query.view({dimension(config.attention.head_dim),
                                       dimension(config.attention.num_attention_heads), columns});

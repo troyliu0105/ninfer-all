@@ -569,9 +569,10 @@ public:
                 }));
         }
         if (w.selector) {
-            out.selector = SelectorParameters{linear(w.selector->hidden_projection),
-                                              tensor(w.selector->predecessor_codebook),
-                                              tensor(w.selector->successor_codebook)};
+            out.selector = SelectorParameters{
+                linear(w.selector->hidden_projection),
+                native_weight(model_.weight(w.selector->predecessor_codebook).view),
+                native_weight(model_.weight(w.selector->successor_codebook).view)};
         }
         return out;
     }

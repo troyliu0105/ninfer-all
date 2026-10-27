@@ -2058,33 +2058,35 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            const auto count = static_cast<std::int32_t>(local_scatter_indices.size());
+            Tensor indices_device;
             if (!local_scatter_indices.empty()) {
-                Tensor indices_device = roots.scatter_indices;
+                indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
-                const auto count = static_cast<std::int32_t>(local_scatter_indices.size());
-                Tensor embeddings;
-                if (overlay_staging) {
-                    // Overlay residency keeps the item embeddings pinned; only this chunk's
-                    // columns travel, plus the next one, which the shifted MTP input of the
-                    // chunk's last visual token names.
-                    const std::size_t column_bytes = static_cast<std::size_t>(
-                        roots.visual_embeddings.ne[0]) * sizeof(std::uint16_t);
-                    const auto merged = static_cast<std::int32_t>(vision_chunk.control->merged_count);
-                    const std::int32_t staged_columns =
-                        std::min<std::int32_t>(count + 1, merged - visual_begin);
-                    const std::size_t offset = static_cast<std::size_t>(visual_begin) * column_bytes;
-                    const std::size_t bytes = static_cast<std::size_t>(staged_columns) * column_bytes;
-                    if (staged_columns < count ||
-                        offset + bytes > vision_chunk.host_embeddings.size()) {
-                        throw std::logic_error("Vision chunk columns exceed the item embeddings");
-                    }
-                    CUDA_CHECK(cudaMemcpyAsync(roots.visual_embeddings.data,
-                                               vision_chunk.host_embeddings.data() + offset, bytes,
-                                               cudaMemcpyHostToDevice, s));
-                    embeddings = roots.visual_embeddings.slice(1, 0, count);
-                } else {
-                    embeddings = vision_chunk.embeddings.slice(1, visual_begin, count);
+            }
+            if (overlay_staging) {
+                // Overlay residency keeps the item embeddings pinned; only this chunk's columns
+                // travel, plus the next one, which the shifted MTP input of the chunk's last
+                // visual token names. A chunk that ends exactly on an item's first visual token
+                // scatters none of its own yet still stages that one column for the MTP input.
+                const std::size_t column_bytes =
+                    static_cast<std::size_t>(roots.visual_embeddings.ne[0]) * sizeof(std::uint16_t);
+                const auto merged = static_cast<std::int32_t>(vision_chunk.control->merged_count);
+                const std::int32_t staged_columns =
+                    std::min<std::int32_t>(count + 1, merged - visual_begin);
+                const std::size_t offset = static_cast<std::size_t>(visual_begin) * column_bytes;
+                const std::size_t bytes   = static_cast<std::size_t>(staged_columns) * column_bytes;
+                if (staged_columns < count || offset + bytes > vision_chunk.host_embeddings.size()) {
+                    throw std::logic_error("Vision chunk columns exceed the item embeddings");
                 }
+                CUDA_CHECK(cudaMemcpyAsync(roots.visual_embeddings.data,
+                                           vision_chunk.host_embeddings.data() + offset, bytes,
+                                           cudaMemcpyHostToDevice, s));
+            }
+            if (!local_scatter_indices.empty()) {
+                Tensor embeddings = overlay_staging
+                                        ? roots.visual_embeddings.slice(1, 0, count)
+                                        : vision_chunk.embeddings.slice(1, visual_begin, count);
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }

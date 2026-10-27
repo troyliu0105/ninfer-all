@@ -166,7 +166,10 @@ struct DynamicConvParameters {
 
 struct DraftBlockParameters {
     Tensor input_norm, post_attention_norm;
-    LinearParameters query_key_value, context_key, context_value;
+    // One Q8 parent (the fast three-output route) or stored GGUF parts (see
+    // PartProjectionWeights).
+    ops::ProjectionWeights query_key_value;
+    LinearParameters context_key, context_value;
     Tensor query_norm, key_norm;
     LinearParameters output;
     DenseParameters mlp;
@@ -175,7 +178,9 @@ struct DraftBlockParameters {
 
 struct SelectorParameters {
     LinearParameters hidden_projection;
-    Tensor predecessor_codebook, successor_codebook;
+    // Operand tables, not Linear weights: each Use's codebook is read a row at a time, as its
+    // stored BF16 words or as the release's own ggml blocks.
+    Weight predecessor_codebook, successor_codebook;
 };
 
 struct DraftParameters {
