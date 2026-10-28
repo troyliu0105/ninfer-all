@@ -232,6 +232,10 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, HybridPrefixCache& ca
         return; // below the high watermark
     }
     const auto candidates = index.collect_demotion_candidates(options_.demotion_batch_records);
+    // Deferred chain repairs: a backfill's slab allocation runs under this same loop's pressure
+    // and may evict (pick_victim) a snapshot this list still names, so no repair runs while the
+    // candidates are being walked. Each candidate is re-validated against the index below.
+    std::vector<PendingClosure> repairs;
     for (const SnapshotRef snapshot : candidates) {
         if (static_cast<double>(occupied_slabs()) < low) {
             break; // the pressure cleared: stop selecting more work
@@ -243,6 +247,7 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, HybridPrefixCache& ca
                 return; // backpressure: stop submitting, never block
             }
         }
+        if (!index.valid(snapshot)) { continue; } // a prior candidate's repair evicted it
         const SnapshotView view = index.snapshot(snapshot);
         if (view.host != CopyState::Resident) { continue; }
         if (view.superseded) {
@@ -376,10 +381,10 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, HybridPrefixCache& ca
             // The upper prefix's queued writes land on their own and the backfill repairs the
             // chain for the next cadence, which re-walks and reuses the landed records. No
             // image job is queued: its anchor would name a broken chain, and the snapshot
-            // stays a demotion candidate in the meantime. The pin taken above protects the
-            // snapshot from the eviction the backfill's own slab allocation may cause.
-            backfill_chain(cache, closure, producer, transfer);
-            index.unpin_snapshot(snapshot);
+            // stays a demotion candidate in the meantime. The pin taken above stays until the
+            // repair runs: it protects the snapshot from the eviction another repair's (or its
+            // own) slab allocation may cause, and a pinned snapshot is never a victim.
+            repairs.push_back(std::move(closure));
             continue;
         }
 
@@ -425,6 +430,13 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, HybridPrefixCache& ca
             wake_.notify_one();
         }
         pending_closures_.push_back(std::move(closure));
+    }
+    // All repairs run after the walk: their slab allocations may evict other candidates, which
+    // is safe here because no candidate reference is dereferenced afterwards.
+    for (PendingClosure& repair : repairs) {
+        // Pinned through the walk, so still valid: a pinned snapshot never leaves the index.
+        backfill_chain(cache, repair, producer, transfer);
+        index.unpin_snapshot(repair.snapshot);
     }
 }
 

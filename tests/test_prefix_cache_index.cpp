@@ -1694,11 +1694,65 @@ void test_release_disk_record_range() {
             "each release must reach the catalog's release callback");
     index.check_invariants();
 
-    // Disk-only nodes are never unsealed: the record is the node's only copy.
-    // (Reached through release_disk_record_range's own guard; a disk-only node here would be
-    // freed with its subtree by evict_disk_entries, which is the committed-closure path.)
+    // The last record keeps its node valid (a volatile copy backs it), so the volatile
+    // release takes it and leaves the node standing.
     require(index.release_disk_record_range(8) == 1,
             "only the last volatile-backed record may leave");
+    index.check_invariants();
+}
+
+// A replayed directory of loose disk-only blocks (a closure that never committed) seals the
+// record store with no committed-snapshot victim and no volatile copy to unseal through: the
+// range release takes disk-only leaves no snapshot anchors on, node and record together, until
+// the store has room again.
+void test_release_disk_record_range_disk_only() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const std::vector<TokenId> tokens = make_tokens(3 * kBlockTokens, 78);
+    const auto hashes                 = block_lookup_hashes(tokens, {});
+
+    // Replayed chain: three disk-only blocks, no snapshot anywhere (the closure never
+    // committed), exactly what restore_into builds from a crashed directory.
+    std::vector<NodeRef> restored;
+    NodeRef parent;
+    for (std::uint32_t b = 0; b < 3; ++b) {
+        const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+        const auto node = index.restore_disk_block(parent, hashes[b], block, 0, 300 + b);
+        require(node.has_value(), "replayed block restores");
+        restored.push_back(*node);
+        parent = *node;
+    }
+    require(index.stats().disk_resident_blocks == 3, "three replayed records are resident");
+    require(index.evict_disk_entries(8) == 0,
+            "a directory with no committed snapshot must find no victim");
+
+    // The unseal: the two deepest leaves leave with their nodes; the shallowest keeps its
+    // record only while the count asks for less than everything.
+    require(index.release_disk_record_range(2) == 2, "two disk-only leaves must be released");
+    require(index.stats().disk_resident_blocks == 1, "one replayed record must remain");
+    require(!index.valid(restored[1]) && !index.valid(restored[2]),
+            "released disk-only nodes must leave the index");
+    require(index.valid(restored[0]) && index.node(restored[0]).disk == CopyState::Resident,
+            "the shallowest replayed record must survive a partial release");
+    require(backend.disk_released.size() == 2,
+            "each release must reach the catalog's release callback");
+    index.check_invariants();
+
+    // A live snapshot anchored on the chain seals it: its resume still reads the record.
+    const std::vector<TokenId> more  = make_tokens(4 * kBlockTokens, 79);
+    const auto more_hashes           = block_lookup_hashes(more, {});
+    const std::span<const TokenId> block3(more.data() + 3 * kBlockTokens, kBlockTokens);
+    const auto grown = index.restore_disk_block(restored[0], more_hashes[3], block3, 0, 303);
+    require(grown.has_value(), "a fourth replayed block restores under the survivor");
+    // grown sits at depth 1, so its whole-block frontier is 2 * kBlockTokens.
+    const auto tap =
+        index.restore_disk_snapshot(*grown, 2 * kBlockTokens, {}, SnapshotKind::Tap, 1, 304,
+                                    true);
+    require(tap.has_value(), "a committed closure anchors the chain");
+    index.check_invariants();
+    require(index.release_disk_record_range(8) == 0,
+            "a record a live snapshot's resume reads is never unsealed away");
+    require(index.stats().disk_resident_blocks == 2, "both anchored records must remain");
     index.check_invariants();
 }
 
@@ -1763,6 +1817,7 @@ int main() {
         test_disk_closure_reclaims_host_copies();
         test_demotion_candidates();
         test_release_disk_record_range();
+        test_release_disk_record_range_disk_only();
         test_disk_host_releases_counter();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

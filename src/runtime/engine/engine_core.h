@@ -50,6 +50,11 @@
 #include <variant>
 #include <vector>
 
+#if defined(__linux__) && !defined(NINFER_NO_CRASH_BACKTRACE)
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+
 namespace ninfer::runtime {
 
 // `Manager` selects the prefix-cache implementation: ResourceManager (Legacy) or
@@ -3221,6 +3226,19 @@ private:
             std::rethrow_exception(error);
         } catch (const std::exception& e) {
             publish_diagnostic(diagnostics_, DiagnosticLevel::Error, "worker crash: %s", e.what());
+#if defined(__linux__) && !defined(NINFER_NO_CRASH_BACKTRACE)
+            // An invariant failure names its check, not its caller: the frames below the
+            // rethrow are the shortest path from the crash site to the Engine loop, which is
+            // what a report from a production container cannot otherwise carry.
+            void* frames[32];
+            const int depth = ::backtrace(frames, 32);
+            if (depth > 0) {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "worker crash frames: %d (addr2line the binary for symbols)",
+                                   depth);
+                ::backtrace_symbols_fd(frames, depth, STDERR_FILENO);
+            }
+#endif
         } catch (...) {
             publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
                                "worker crash: unknown exception");

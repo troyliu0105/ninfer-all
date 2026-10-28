@@ -1094,7 +1094,10 @@ std::uint32_t PrefixCacheIndex::release_disk_record_range(std::uint32_t count) {
     // Deepest chain-first: a deep unbranched chain carries the most exclusive records, and a
     // shallower shared block keeps serving every other closure that anchors through it.
     std::vector<std::uint32_t> chain;
-    for (std::uint32_t root : root_children_) {
+    // The disk-only release below removes a root itself; iterate a copy of the roots.
+    const std::vector<std::uint32_t> roots = root_children_;
+    for (std::uint32_t root : roots) {
+        if (!nodes_[root].occupied) { continue; }
         chain.clear();
         for (std::uint32_t current = root; current != kNoId;) {
             const Node& node = nodes_[current];
@@ -1111,7 +1114,19 @@ std::uint32_t PrefixCacheIndex::release_disk_record_range(std::uint32_t count) {
                 continue;
             }
             if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
-                continue; // disk-only: the record is the node's only copy, keep it
+                // A replayed closure that never committed: no snapshot anchors here or below,
+                // so no resume can ever read this block. Taking the record takes the node too —
+                // it holds nothing once every residency is gone — and exposes the node above as
+                // the next candidate. Only a true leaf: a child the same pass kept (a volatile
+                // release above) still holds content this removal would destroy. This is the
+                // only way a directory of loose replayed records (0 committed closures) can
+                // drain; without it every begin_*_write fails forever and demotion stalls at
+                // the high watermark.
+                if (!node.children.empty()) { continue; }
+                remove_subtree(index);
+                ++counters_.disk_record_evictions;
+                ++released;
+                continue;
             }
             drop_node_disk_copy(index);
             ++counters_.disk_record_evictions;

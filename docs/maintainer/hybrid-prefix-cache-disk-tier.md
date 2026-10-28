@@ -204,9 +204,14 @@ with no committed snapshot — a replayed catalog of loose block records — has
 selection accepts, so the tier also releases pure block records (deepest chain-first, no live
 snapshot anchored on them, a volatile copy keeping the node valid) through
 `release_disk_record_range` before treating the cycle as backpressure; without it, a full
-directory seals every later demotion shut. A closure whose anchor or awaited record the index
-removed in the meantime never commits, so a restart cannot resurrect a closure with a dangling
-anchor.
+directory seals every later demotion shut. The replayed loose blocks themselves are usually
+disk-only (no volatile copy anywhere): a record is taken from such a node only at a leaf no
+snapshot anchors on and no live content sits below — a closure that never committed, whose
+content no resume can ever read — and the node goes with its record, exposing the node above
+as the next candidate. This is the only drain for a directory the loose records have filled;
+without it every `begin_*_write` fails forever and demotion stalls at the high watermark with
+the Host tier frozen. A closure whose anchor or awaited record the index removed in the
+meantime never commits, so a restart cannot resurrect a closure with a dangling anchor.
 
 Submissions are bounded by queued-but-unstarted bytes, resolved as three image jobs (two closures
 in flight plus one block batch; a single image job is ~75 MiB). A flat bound below two image jobs
@@ -233,8 +238,11 @@ recent turns — and drops the window once Host occupancy reaches 95%: drainage 
 retention. A chain node whose Host copy was dropped under pressure while its Device copy stayed
 is backfilled (Device→Host copies on the write-through streams) instead of failing the closure;
 the next cadence re-walks the chain, reuses every record that landed and closes it once the
-backfilled slabs complete. A node with no copy on either tier still fails the closure: no bytes
-exist to write.
+backfilled slabs complete. The repairs are deferred until after the whole candidate walk and each
+candidate is re-validated before use: a repair's slab allocation runs under the same Host pressure
+the demotion is draining and may evict (as `pick_victim`) a snapshot later in the candidate list —
+dereferencing it mid-walk is the stale-reference crash. A node with no copy on either tier still
+fails the closure: no bytes exist to write.
 
 ### Write and publication protocol
 
@@ -573,8 +581,10 @@ Extend existing behavioral coverage for:
   including a disabled or slow disk rate. The superseded grace window and its occupancy escape
   are tier-level (the index orders only).
 - A full directory with no committed snapshot: `release_disk_record_range` releases pure block
-  records (a volatile copy keeps the node valid) and a following `begin_*_write` succeeds, where
-  `evict_disk_entries` alone finds no victim and the directory stays sealed.
+  records (a volatile copy keeps the node valid) and, at a leaf no snapshot anchors on, a
+  disk-only node's record together with the node itself (a closure that never committed), and a
+  following `begin_*_write` succeeds, where `evict_disk_entries` alone finds no victim and the
+  directory stays sealed.
 - The staging budget split: `plan_hybrid_disk_staging` caps the block batch, never shrinks the
   slab pool below its own minimum, and reports the exact rejection figure.
 - Queue saturation, stale completions, cancellation and source lifetime through accepted I/O.

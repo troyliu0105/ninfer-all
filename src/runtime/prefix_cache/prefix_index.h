@@ -349,8 +349,10 @@ public:
     // Unseals a full directory with no committed-snapshot victim: releases up to `count` pure
     // block records (deepest-first along unbranched chains no live snapshot anchors on, unpinned
     // and disk-Resident) through drop_node_disk_copy. Each release keeps the node valid through
-    // its volatile copies, so `begin_*_write` can reserve the freed slots again. Records on
-    // disk-only nodes are not taken: their bytes exist nowhere else. Returns the number released.
+    // its volatile copies, so `begin_*_write` can reserve the freed slots again. A disk-only
+    // node is taken only at a leaf no snapshot anchors on (children, direct anchors and every
+    // below-count zero): its content reached no closure and no resume can ever read it, so the
+    // node goes with its record. Returns the number released.
     std::uint32_t release_disk_record_range(std::uint32_t count);
 
     // Returns the Host slabs of `nodes` a committed disk closure has made redundant. A node keeps
