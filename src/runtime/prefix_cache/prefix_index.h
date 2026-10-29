@@ -340,10 +340,13 @@ public:
     // keeps the image, tail and every anchor block durable, so the Host copy is a duplicate.
     void release_snapshot_host_copy(SnapshotRef snapshot);
 
-    // Reclaims unpinned disk records: committed disk snapshots in GDSF order (a shared ancestor
-    // survives while another committed closure references it), then disk-backed nodes no
-    // committed closure needs. Returns the number of records released. Skipped when the disk
-    // tier is disabled.
+    // Reclaims unpinned disk records, dead closures first: superseded committed closures in
+    // lowest-GDSF order, each released whole — its image record plus the anchor-chain records no
+    // remaining snapshot (live or superseded) reads — because a fresh resume point's value always
+    // underrates it against a superseded one. Only when no dead closure remains are retained
+    // closures reclaimed, in GDSF order. Returns the number of records released; the count may
+    // exceed `records` because a chosen closure's chain is finished once started. Skipped when
+    // the disk tier is disabled.
     std::uint32_t evict_disk_entries(std::uint32_t records);
 
     // Unseals a full directory with no committed-snapshot victim: releases up to `count` pure
@@ -563,7 +566,10 @@ private:
     void revalue_around(std::uint32_t snapshot, std::span<const std::uint32_t> dependents);
     // Next snapshot to give up its Host slabs (host_only) or its index entry: the oldest
     // superseded one, otherwise the GDSF minimum. kNoId when every candidate is protected.
-    [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect) const;
+    // `skip_committed` leaves committed disk closures alone: a caller about to remove its victim
+    // outright must not destroy durable state only the disk tier's own reclaim may take.
+    [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect,
+                                            bool skip_committed = false) const;
     void remove_subtree(std::uint32_t node);
     void release_node_storage(std::uint32_t node);
     void drop_node_device_copy(std::uint32_t node);

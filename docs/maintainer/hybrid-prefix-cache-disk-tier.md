@@ -197,9 +197,16 @@ A committed closure is also the trigger for reclaiming what it duplicated: the t
 snapshot's Host image and tail slabs through `release_snapshot_host_copy` and the anchor chain's
 Host copies through `release_redundant_host_copies`, which keeps a chain node's copy while any
 live snapshot anchored at or below it still lacks a committed disk closure. A full record
-directory recycles instead of blocking: the tier runs the index's bounded disk victim selection
-(`evict_disk_entries`, lowest-value committed closures first, each including the exclusive anchor
-blocks it kept) plus `reclaim_abandoned` for reserved records no write will finish. A directory
+directory recycles instead of blocking: the tier drains abandoned reservations
+(`reclaim_abandoned`) and loose replayed records (`release_disk_record_range`) first, then runs
+the index's disk victim selection (`evict_disk_entries`): dead closures first — superseded
+committed ones in lowest-GDSF order, each released whole with the exclusive anchor-chain records
+no remaining snapshot reads — because a fresh resume point's GDSF value (one hit against its
+whole exclusive chain) always underrates it against a superseded one, so a reclaim that freed a
+dead closure never crosses into live ones in the same step; retained closures are a last
+resort. Volatile-tier pressure (Host slabs, Device slots, snapshot-table room) never destroys a
+committed closure — it takes the volatile copy (`release_snapshot_host_copy`,
+Device-copy eviction) or refuses. A directory
 with no committed snapshot — a replayed catalog of loose block records — has no victim that
 selection accepts, so the tier also releases pure block records (deepest chain-first, no live
 snapshot anchored on them, a volatile copy keeping the node valid) through

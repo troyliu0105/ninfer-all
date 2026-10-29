@@ -779,9 +779,18 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         }
         if (chosen.superseded) {
             // Only requests diverging before its lineage's newer snapshot could use it: both
-            // copies go, and GDSF time does not advance.
-            remove_snapshot(victim);
-            ++counters_.superseded_evictions;
+            // volatile copies go, and GDSF time does not advance. A committed disk closure keeps
+            // the snapshot restorable, so it stays an index entry and only its slabs yield —
+            // removing it would destroy durable state only the disk tier's own reclaim may take.
+            if (chosen.disk == CopyState::Resident && chosen.disk_committed) {
+                for (const std::uint32_t slab : chosen.host_slabs) { free_slab(slab); }
+                chosen.host_slabs.clear();
+                chosen.host = CopyState::Absent;
+                refresh_tail(victim);
+            } else {
+                remove_snapshot(victim);
+                ++counters_.superseded_evictions;
+            }
             ++counters_.host_snapshot_evictions;
             continue;
         }
@@ -1034,13 +1043,53 @@ void PrefixCacheIndex::release_snapshot_host_copy(SnapshotRef ref) {
 std::uint32_t PrefixCacheIndex::evict_disk_entries(std::uint32_t records) {
     if (config_.disk_capacity_records == 0) { return 0; }
     std::uint32_t released = 0;
+    // One closure's full reclamation: its image record, then the anchor-chain records it alone
+    // kept, upward from its anchor (deepest block first). A record no remaining snapshot anchors
+    // at or below — live or superseded, `live_below` counts both — was this closure's alone and
+    // yields with it; the first such snapshot (or an in-flight write's pin) ends the walk, so the
+    // chain records another closure's restore reads survive for it. A disk-only node leaves only
+    // as a leaf nothing anchors on, dead subtree and all, as the Host dead-reclaim does. The walk
+    // is not bounded by `records` (only the victim count is): a half-reclaimed closure's leftover
+    // records sit below the snapshots that block the range release's downward walk, so the
+    // reclamation must finish once it starts. The return may exceed `records`.
+    const auto reclaim_closure = [&](std::uint32_t victim) {
+        const std::uint32_t anchor = snapshots_[victim].anchor;
+        remove_snapshot(victim);
+        ++counters_.disk_record_evictions;
+        ++released;
+        std::uint32_t current = anchor;
+        while (current != kNoId) {
+            const std::uint32_t parent = nodes_[current].parent;
+            const Node& node           = nodes_[current];
+            if (node.pins != 0 || node.live_below != 0) { break; }
+            if (node.disk == CopyState::Resident) {
+                if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
+                    // Without a volatile copy the record is the node's only content: take it
+                    // only where nothing sits below it any resume could ever read.
+                    if (node.children.empty() && node.snapshots.empty()) {
+                        remove_subtree(current);
+                        ++counters_.disk_record_evictions;
+                        ++released;
+                    }
+                } else {
+                    drop_node_disk_copy(current);
+                    ++counters_.disk_record_evictions;
+                    ++released;
+                }
+            }
+            current = parent;
+        }
+    };
+    // Dead closures first: superseded ones no running lineage can resume from, lowest GDSF value
+    // (largest dead chain) first. A fresh resume point's GDSF value — one hit against its whole
+    // exclusive chain — always underrates it, so a call that reclaimed a dead closure never
+    // crosses into live ones in the same step; the next cycle re-decides with the dead ones gone.
     while (released < records) {
-        // Lowest-GDSF unpinned committed disk snapshot.
         std::uint32_t victim = kNoId;
         for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
             const Snapshot& snapshot = snapshots_[i];
-            if (!snapshot.occupied || snapshot.pins != 0 || snapshot.disk != CopyState::Resident ||
-                !snapshot.disk_committed) {
+            if (!snapshot.occupied || !snapshot.superseded || snapshot.pins != 0 ||
+                snapshot.disk != CopyState::Resident || !snapshot.disk_committed) {
                 continue;
             }
             if (victim == kNoId || snapshot.priority < snapshots_[victim].priority ||
@@ -1050,40 +1099,26 @@ std::uint32_t PrefixCacheIndex::evict_disk_entries(std::uint32_t records) {
             }
         }
         if (victim == kNoId) { break; }
-        const std::uint32_t anchor = snapshots_[victim].anchor;
-        remove_snapshot(victim);
-        ++counters_.disk_record_evictions;
-        ++released;
-
-        // Blocks the closure exclusively kept: below the anchor along the unbranched chain.
-        // Each yields its record when a volatile copy keeps the node valid; a disk-only node
-        // is removed with its (dead) subtree instead, as the Host dead-reclaim does.
-        std::vector<std::uint32_t> chain;
-        for (std::uint32_t current = anchor; current != kNoId;) {
-            const Node& node = nodes_[current];
-            if (!node.snapshots.empty() || node.children.size() > 1U) { break; }
-            chain.push_back(current);
-            if (node.children.empty()) { break; }
-            current = node.children.front();
-        }
-        for (auto it = chain.rbegin(); it != chain.rend() && released < records; ++it) {
-            const std::uint32_t index = *it;
-            const Node& node           = nodes_[index];
-            if (node.snapshots.empty() && node.live_below == 0 && node.pins == 0 &&
-                node.disk == CopyState::Resident) {
-                if (node.device == CopyState::Absent && node.host == CopyState::Absent) {
-                    // Everything below was in this dead subtree: stop after removing it.
-                    remove_subtree(index);
-                    ++counters_.disk_record_evictions;
-                    ++released;
-                    break;
-                } else {
-                    drop_node_disk_copy(index);
-                    ++counters_.disk_record_evictions;
-                    ++released;
-                }
+        reclaim_closure(victim);
+    }
+    if (released != 0) { return released; }
+    // Last resort, only once no dead closure remains: retained ones by GDSF value.
+    while (released < records) {
+        std::uint32_t victim = kNoId;
+        for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
+            const Snapshot& snapshot = snapshots_[i];
+            if (!snapshot.occupied || snapshot.superseded || snapshot.pins != 0 ||
+                snapshot.disk != CopyState::Resident || !snapshot.disk_committed) {
+                continue;
+            }
+            if (victim == kNoId || snapshot.priority < snapshots_[victim].priority ||
+                (snapshot.priority == snapshots_[victim].priority &&
+                 snapshot.last_hit_tick < snapshots_[victim].last_hit_tick)) {
+                victim = i;
             }
         }
+        if (victim == kNoId) { break; }
+        reclaim_closure(victim);
     }
     return released;
 }
@@ -1243,6 +1278,12 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
         if (snapshots_[slot_owner_[superseded]].host == CopyState::Resident) {
             return drop_device_copy(superseded);
         }
+        // A committed closure stays a restorable resume point: only the disk tier's own reclaim
+        // may take its records, so its slot yields the device image and the snapshot stays.
+        if (snapshots_[slot_owner_[superseded]].disk == CopyState::Resident &&
+            snapshots_[slot_owner_[superseded]].disk_committed) {
+            return drop_device_copy(superseded);
+        }
         remove_snapshot(slot_owner_[superseded]);
         return take(superseded);
     }
@@ -1314,8 +1355,9 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
         }
     }
     if (free_snapshots_.empty()) {
-        // Make room by evicting a superseded snapshot, otherwise the GDSF minimum.
-        const std::uint32_t victim = pick_victim(false, kNoId);
+        // Make room by evicting a superseded snapshot, otherwise the GDSF minimum. A committed
+        // disk closure is durable state; the new entry this makes room for must not destroy it.
+        const std::uint32_t victim = pick_victim(false, kNoId, /*skip_committed=*/true);
         if (victim == kNoId) {
             set_slot(device_slot, SlotState::Free);
             if (tail_device_id) { backend_->release_device_block(*tail_device_id); }
@@ -1521,7 +1563,8 @@ void PrefixCacheIndex::revalue_around(std::uint32_t index,
     if (ancestor != kNoId) { update_priority(ancestor); }
 }
 
-std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect) const {
+std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect,
+                                            bool skip_committed) const {
     std::uint32_t superseded = kNoId;
     std::uint32_t retained   = kNoId;
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
@@ -1529,6 +1572,9 @@ std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t pr
         if (!snapshot.occupied || i == protect || snapshot.pins != 0 ||
             (host_resident ? snapshot.host != CopyState::Resident
                            : snapshot.host == CopyState::Filling)) {
+            continue;
+        }
+        if (skip_committed && snapshot.disk == CopyState::Resident && snapshot.disk_committed) {
             continue;
         }
         if (snapshot.superseded) {

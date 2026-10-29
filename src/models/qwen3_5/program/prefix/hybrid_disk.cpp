@@ -639,17 +639,25 @@ void HybridDiskTier::publish_completions(PrefixCacheIndex& index) {
 }
 
 bool HybridDiskTier::reclaim_records(PrefixCacheIndex& index) {
-    // The index removes whole committed closures (their image, tail and exclusive anchor blocks)
-    // in GDSF order, then disk-backed blocks no committed closure needs. Each removal comes back
-    // through release_disk_record, so the catalog journals it and a restart cannot resurrect it.
-    const std::uint32_t evicted = index.evict_disk_entries(kReclaimRecords);
-    // A directory with no committed snapshot (a replayed catalog of loose block records) has no
-    // victim evict_disk_entries accepts; the unseal path releases pure block records instead.
-    const std::uint32_t unsealed = index.release_disk_record_range(kReclaimRecords);
-    std::uint32_t collected     = 0;
+    // Cheapest first: reserved records no write will finish, then pure block records no live
+    // snapshot anchors on. Committed closures — live resume points and their anchor chains —
+    // go last, and only once nothing cheaper remains. Each removal comes back through
+    // release_disk_record, so the catalog journals it and a restart cannot resurrect it.
+    std::uint32_t collected = 0;
     try {
         collected = catalog_->reclaim_abandoned();
     } catch (...) { collected = 0; }
+    if (collected >= kReclaimRecords) {
+        std::lock_guard lock(mutex_);
+        stats_.evicted_records += collected;
+        return true;
+    }
+    // A directory with no committed snapshot (a replayed catalog of loose block records) has no
+    // victim evict_disk_entries accepts; the unseal path releases pure block records instead.
+    const std::uint32_t unsealed = index.release_disk_record_range(kReclaimRecords);
+    const std::uint32_t evicted = collected + unsealed < kReclaimRecords
+                                      ? index.evict_disk_entries(kReclaimRecords)
+                                      : 0U;
     if (collected != 0) {
         std::lock_guard lock(mutex_);
         stats_.evicted_records += collected;

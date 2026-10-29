@@ -1330,8 +1330,9 @@ void test_restore_disk_reconstruction() {
     small.check_invariants();
 }
 
-// evict_disk_entries releases the lowest-value committed closure; shared ancestors recorded
-// once survive one branch's eviction.
+// evict_disk_entries releases a dead lineage whole: the superseded closure's image record plus
+// the chain records below the shared boundary no other live snapshot's restore reads; the
+// boundary's own records survive the branch's eviction.
 void test_disk_victim_reclamation() {
     DiskBackend backend;
     PrefixCacheIndex index(disk_config(), backend);
@@ -1344,20 +1345,116 @@ void test_disk_victim_reclamation() {
         index.mark_disk_backed(node, record);
         index.unpin_node(node);
     }
-    const SnapshotRef first  = publish_tap(index, path[1]);
-    const SnapshotRef second = publish_tap(index, path[3]);
-    index.pin_snapshot(first);
-    index.begin_snapshot_disk_fill(first, 710);
-    index.complete_snapshot_disk_fill(first);
-    index.unpin_snapshot(first);
-    index.pin_snapshot(second);
-    index.begin_snapshot_disk_fill(second, 711);
-    index.complete_snapshot_disk_fill(second);
-    index.unpin_snapshot(second);
+    // A boundary two conversations share, and this lineage's endpoint that later moved on.
+    const SnapshotRef boundary = publish_tap(index, path[1]);
+    const SnapshotRef dead     = publish_tap(index, path[3]);
+    index.pin_snapshot(boundary);
+    index.begin_snapshot_disk_fill(boundary, 710);
+    index.complete_snapshot_disk_fill(boundary);
+    index.unpin_snapshot(boundary);
+    index.pin_snapshot(dead);
+    index.begin_snapshot_disk_fill(dead, 711);
+    index.complete_snapshot_disk_fill(dead);
+    index.unpin_snapshot(dead);
+    index.supersede(dead);
+    index.release_path(path); // the inserting reference's pins go away
+
+    // The superseded closure goes first: its image record, then the chain records of blocks 2-3
+    // no remaining snapshot's restore reads (the boundary reads blocks 0-1).
+    const std::uint32_t released = index.evict_disk_entries(1);
+    require(released == 3, "the dead closure and its exclusive chain are reclaimed together");
+    require(index.node(path[2]).disk == CopyState::Absent &&
+                index.node(path[3]).disk == CopyState::Absent,
+            "the victim's exclusive chain records must leave");
+    require(index.node(path[0]).disk == CopyState::Resident &&
+                index.node(path[1]).disk == CopyState::Resident,
+            "the shared boundary's chain records must stay");
+    require(index.valid(boundary) && index.snapshot(boundary).disk_committed,
+            "the live boundary's closure must survive");
+    require(!backend.snapshot_disk_released.empty(), "backend saw the release");
+    require(std::any_of(backend.snapshot_disk_released.begin(),
+                        backend.snapshot_disk_released.end(),
+                        [](const auto& entry) { return entry.first == 711 && entry.second; }),
+            "the dead closure's image record must be released as committed");
+    index.check_invariants();
+}
+
+// A dead closure loses to no live resume point: the freshest endpoint's GDSF value — one hit
+// against its whole exclusive chain — always underrates it, so eviction takes the superseded
+// lineage first even when its stored priority reads higher.
+void test_dead_closure_precedes_live_victim() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config();
+    config.device_snapshot_slots = 8; // four taps must coexist before any closure commits
+    PrefixCacheIndex index(config, backend);
+    // Lineage A: a retained boundary at block 1 and a superseded endpoint at block 3.
+    const auto a        = make_tokens(4 * kBlockTokens, 81);
+    const auto path_a   = insert_sequence(index, backend, a);
+    for (const NodeRef node : path_a) {
+        index.pin_node(node);
+        index.begin_node_disk_fill(node, 800U + node.index);
+        index.mark_disk_backed(node, 800U + node.index);
+        index.unpin_node(node);
+    }
+    const SnapshotRef a0 = publish_tap(index, path_a[1]);
+    const SnapshotRef a1 = publish_tap(index, path_a[3]);
+    index.supersede(a1);
+    // Lineage B: a live endpoint at block 4 — the conversation's only resume point.
+    const auto b        = make_tokens(5 * kBlockTokens, 82);
+    const auto path_b   = insert_sequence(index, backend, b);
+    const SnapshotRef b0 = publish_tap(index, path_b[3]);
+    const SnapshotRef b1 = publish_tap(index, path_b[4]);
+    for (const auto* snap : {&a0, &a1, &b0, &b1}) {
+        index.pin_snapshot(*snap);
+        index.begin_snapshot_disk_fill(*snap, 900U + snap->index);
+        index.complete_snapshot_disk_fill(*snap);
+        index.unpin_snapshot(*snap);
+    }
+    index.release_path(path_a);
+    index.release_path(path_b);
 
     const std::uint32_t released = index.evict_disk_entries(1);
-    require(released == 1, "one disk closure is reclaimed");
-    require(!backend.snapshot_disk_released.empty(), "backend saw the release");
+    require(released == 3, "the dead closure and its exclusive chain leave together");
+    require(!index.valid(a1), "the superseded endpoint must be reclaimed");
+    require(index.valid(a0) && index.snapshot(a0).disk_committed,
+            "lineage A's retained boundary must survive");
+    require(index.valid(b0) && index.valid(b1) && index.snapshot(b1).disk_committed,
+            "the live lineage must survive untouched");
+    index.check_invariants();
+}
+
+// Host-slab pressure takes only the volatile copy of a disk-committed closure: the superseded
+// snapshot keeps its durable records and survives as a disk-only restore source.
+void test_committed_closure_survives_slab_pressure() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(8), backend);
+    // Lineage A: two backed blocks (2 slabs) and a committed superseded tap (4 image slabs).
+    const auto a      = make_tokens(2 * kBlockTokens, 83);
+    const auto path_a = insert_sequence(index, backend, a);
+    backup_node(index, path_a[0]);
+    backup_node(index, path_a[1]);
+    const SnapshotRef tap_a = publish_tap(index, path_a[1]);
+    backup_snapshot(index, tap_a);
+    index.pin_snapshot(tap_a);
+    index.begin_snapshot_disk_fill(tap_a, 910);
+    index.complete_snapshot_disk_fill(tap_a);
+    index.unpin_snapshot(tap_a);
+    index.supersede(tap_a);
+    // Lineage B needs four slabs for its image; only two are free.
+    const auto b      = make_tokens(kBlockTokens, 84);
+    const auto path_b = insert_sequence(index, backend, b);
+    const SnapshotRef tap_b = publish_tap(index, path_b[0]);
+    index.pin_snapshot(tap_b);
+    require(index.begin_snapshot_host_fill(tap_b), "slabs must come from the dead closure");
+    index.complete_snapshot_host_fill(tap_b);
+    index.unpin_snapshot(tap_b);
+
+    require(index.valid(tap_a), "the committed closure must survive slab pressure");
+    require(index.snapshot(tap_a).host == CopyState::Absent,
+            "only the volatile copy was taken");
+    require(index.snapshot(tap_a).disk_committed, "the durable records stay committed");
+    require(index.stats().superseded_evictions == 0,
+            "no snapshot must be destroyed for Host slabs");
     index.check_invariants();
 }
 
@@ -1784,6 +1881,71 @@ void test_disk_host_releases_counter() {
     index.check_invariants();
 }
 
+// Device-slot pressure sheds only the volatile Device copy of a disk-committed superseded
+// snapshot: the durable closure stays valid and restorable from its records.
+void test_committed_closure_survives_slot_pressure() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config();
+    config.device_snapshot_slots = 2;
+    PrefixCacheIndex index(config, backend);
+    const std::vector<TokenId> tokens = make_tokens(3 * kBlockTokens, 85);
+    const auto path                   = insert_sequence(index, backend, tokens);
+    const SnapshotRef first  = publish_tap(index, path[1]);
+    const SnapshotRef second = publish_tap(index, path[2]);
+    for (const SnapshotRef snap : {first, second}) {
+        index.pin_snapshot(snap);
+        index.begin_snapshot_disk_fill(snap, 950U + snap.index);
+        index.complete_snapshot_disk_fill(snap);
+        index.unpin_snapshot(snap);
+    }
+    index.supersede(first);
+
+    const auto slot = index.acquire_device_slot();
+    require(slot.has_value(), "a slot must come from the committed closure's Device copy");
+    require(index.valid(first) && index.snapshot(first).disk_committed,
+            "the committed closure must survive slot pressure");
+    require(index.snapshot(first).device_slot == kNoId,
+            "only the Device copy was taken");
+    require(index.valid(second) && index.snapshot(second).device_slot != kNoId,
+            "the live snapshot keeps its slot");
+    index.release_device_slot(*slot);
+    index.check_invariants();
+}
+
+// A snapshot table full of committed closures refuses publication instead of destroying durable
+// records; the refusal is bounded and graceful, and both originals stay valid.
+void test_publish_refuses_over_committed_table() {
+    DiskBackend backend;
+    PrefixIndexConfig config = disk_config();
+    config.max_snapshots      = 2;
+    config.device_snapshot_slots = 4;
+    PrefixCacheIndex index(config, backend);
+    const auto a      = make_tokens(kBlockTokens, 86);
+    const auto path_a = insert_sequence(index, backend, a);
+    const SnapshotRef first = publish_tap(index, path_a[0]);
+    const auto b      = make_tokens(kBlockTokens, 87);
+    const auto path_b = insert_sequence(index, backend, b);
+    const SnapshotRef second = publish_tap(index, path_b[0]);
+    for (const SnapshotRef snap : {first, second}) {
+        index.pin_snapshot(snap);
+        index.begin_snapshot_disk_fill(snap, 970U + snap.index);
+        index.complete_snapshot_disk_fill(snap);
+        index.unpin_snapshot(snap);
+    }
+
+    const auto c      = make_tokens(kBlockTokens, 88);
+    const auto path_c = insert_sequence(index, backend, c);
+    const auto slot   = index.acquire_device_slot();
+    require(slot.has_value(), "a device slot must be free for the third tap");
+    const PublishResult third = index.publish_snapshot(
+        path_c[0], kBlockTokens, {}, std::nullopt, *slot, SnapshotKind::Tap);
+    require(!third.created, "a full committed table must refuse publication");
+    require(index.valid(first) && index.snapshot(first).disk_committed &&
+                index.valid(second) && index.snapshot(second).disk_committed,
+            "both committed closures must survive the refusal");
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -1819,6 +1981,10 @@ int main() {
         test_release_disk_record_range();
         test_release_disk_record_range_disk_only();
         test_disk_host_releases_counter();
+        test_dead_closure_precedes_live_victim();
+        test_committed_closure_survives_slab_pressure();
+        test_committed_closure_survives_slot_pressure();
+        test_publish_refuses_over_committed_table();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
