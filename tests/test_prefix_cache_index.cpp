@@ -1756,6 +1756,36 @@ void test_demotion_candidates() {
     index.check_invariants();
 }
 
+// With the disk tier attached, Host pressure must not consume the tier's demotion fuel: a
+// superseded snapshot without a committed closure survives slab pressure (its slabs free at the
+// closure's commit), and a block write-through on a full Host tier yields instead of displacing
+// any snapshot — the node keeps its Device copy and a later release retries the fill.
+void test_write_through_spares_demotion_fuel() {
+    DiskBackend backend;
+    // Six slabs: two blocks (2) plus one image without a tail (4) fill the tier exactly.
+    PrefixCacheIndex index(disk_config(6), backend);
+    const auto tokens = make_tokens(2 * kBlockTokens, 96);
+    const auto path   = insert_sequence(index, backend, tokens);
+    backup_node(index, path[0]);
+    backup_node(index, path[1]);
+    const SnapshotRef stale = publish_tap(index, path[1]);
+    backup_snapshot(index, stale);
+    index.supersede(stale);
+    // A pinned device-only node whose fill would need a slab the tier cannot take from any
+    // snapshot: with the disk tier attached only free slabs and dead nodes serve the fill.
+    const auto other  = make_tokens(kBlockTokens, 97);
+    const auto other_path = insert_sequence(index, backend, other);
+    index.pin_node(other_path[0]);
+    require(!index.begin_host_fill(other_path[0]).has_value(),
+            "a block write-through on a full Host tier must yield, not displace a snapshot");
+    index.unpin_node(other_path[0]);
+    require(index.valid(stale) && index.snapshot(stale).host == CopyState::Resident,
+            "the superseded demotion candidate must keep its Host slabs");
+    require(index.stats().superseded_evictions == 0,
+            "no superseded snapshot may be destroyed for a block write-through");
+    index.check_invariants();
+}
+
 // A full directory with no committed snapshot seals itself under evict_disk_entries (no victim
 // it accepts); release_disk_record_range unseals it by freeing pure block records a volatile
 // copy still backs.
@@ -1978,6 +2008,7 @@ int main() {
         test_disk_tail_device_fill();
         test_disk_closure_reclaims_host_copies();
         test_demotion_candidates();
+        test_write_through_spares_demotion_fuel();
         test_release_disk_record_range();
         test_release_disk_record_range_disk_only();
         test_disk_host_releases_counter();

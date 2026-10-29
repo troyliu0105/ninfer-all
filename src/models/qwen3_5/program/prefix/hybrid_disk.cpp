@@ -249,6 +249,16 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, HybridPrefixCache& ca
         }
         if (!index.valid(snapshot)) { continue; } // a prior candidate's repair evicted it
         const SnapshotView view = index.snapshot(snapshot);
+        if (view.host == CopyState::Absent && view.device_slot != pc::kNoId &&
+            (view.tail_len == 0 || view.tail_device_copy == CopyState::Resident)) {
+            // Host pressure dropped this snapshot's image while its Device copy stayed: the
+            // closure needs the Host slabs to copy. Refill from the Device image now — this is
+            // the same repair the publication path performs — and let the fill land before the
+            // next cadence re-offers the snapshot as a candidate. The refill pins the snapshot,
+            // so this round walks on.
+            cache.start_snapshot_host_write(snapshot, producer, transfer);
+            continue;
+        }
         if (view.host != CopyState::Resident) { continue; }
         if (view.superseded) {
             // Grace window: a snapshot superseded within the last turns is the one retries and

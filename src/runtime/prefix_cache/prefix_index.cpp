@@ -828,7 +828,27 @@ std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
-    if (!allocate_slabs(1, slab, kNoId)) { return std::nullopt; }
+    // A block write-through never displaces a snapshot: its Device copy keeps the node valid, a
+    // later release retries the fill, and with the disk tier attached a superseded snapshot this
+    // allocation could take is the tier's pending demotion — destroying it would strand the
+    // content unrestartable while the Host tier stays full. Dead nodes still reclaim here.
+    if (config_.disk_capacity_records != 0) {
+        // With the disk tier attached, only free slabs and dead nodes serve the fill.
+        if (!take_free_slabs(1, slab)) {
+            const std::uint32_t victim = dead_head_;
+            if (victim == kNoId) { return std::nullopt; }
+            ++counters_.host_dead_reclaims;
+            if (nodes_[victim].device == CopyState::Absent &&
+                nodes_[victim].disk != CopyState::Resident) {
+                remove_subtree(victim);
+            } else {
+                drop_node_host_copy(victim);
+            }
+            if (!take_free_slabs(1, slab)) { return std::nullopt; }
+        }
+    } else if (!allocate_slabs(1, slab, kNoId)) {
+        return std::nullopt;
+    }
     Node& filled     = nodes_[ref.index];
     filled.host      = CopyState::Filling;
     filled.host_slab = slab.front();
@@ -1575,6 +1595,15 @@ std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t pr
             continue;
         }
         if (skip_committed && snapshot.disk == CopyState::Resident && snapshot.disk_committed) {
+            continue;
+        }
+        // With the disk tier attached, a superseded snapshot without a committed closure is the
+        // tier's certain-dead demotion fuel: its slabs free at the closure's commit while its
+        // content stays restartable, so Host pressure must not destroy it first. A committed
+        // closure still yields its slabs further down. Without a tier there is no demotion, and
+        // superseded eviction stays the Host drain.
+        if (config_.disk_capacity_records != 0 && snapshot.superseded &&
+            !(snapshot.disk == CopyState::Resident && snapshot.disk_committed)) {
             continue;
         }
         if (snapshot.superseded) {
