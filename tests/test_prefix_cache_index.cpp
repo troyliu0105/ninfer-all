@@ -1608,9 +1608,8 @@ void test_disk_tail_device_fill() {
     index.check_invariants();
 }
 
-// A committed closure makes the Host copies of its anchor chain redundant; a live snapshot below
-// a chain node that still lacks a committed closure keeps them (its resume needs the volatile
-// copy). The release also runs the index's disk callbacks, so the catalog hears about it.
+// Finished block records are safe mixed-tier sources before a descendant closure commits.
+// Their Host duplicates can fund further demotion, but an active source lease defers release.
 void test_disk_closure_reclaims_host_copies() {
     DiskBackend backend;
     PrefixIndexConfig config = disk_config(24);
@@ -1635,26 +1634,25 @@ void test_disk_closure_reclaims_host_copies() {
     }
     index.release_path(path); // the inserting reference's pins go away
 
-    // The deep node's Host copy is redundant (its only snapshot below is disk-committed); the
-    // shallow node keeps its copy while `shallow` has no committed closure.
+    // Both finished records back mixed-tier restores, even while `shallow` is uncommitted.
     require(index.release_redundant_host_copies(
                 std::span<const NodeRef>{&path[1], 1}) == 1,
             "a committed closure must free its anchor's Host copy");
     require(index.node(path[1]).host == CopyState::Absent, "the deep Host copy must be released");
     require(index.release_redundant_host_copies(
-                std::span<const NodeRef>{&path[0], 1}) == 0,
-            "an uncommitted snapshot below a chain node must keep its Host copy");
-    require(index.node(path[0]).host == CopyState::Resident, "the shallow copy must survive");
+                std::span<const NodeRef>{&path[0], 1}) == 1,
+            "a finished disk block must fund further spill before the snapshot closes");
+    require(index.node(path[0]).host == CopyState::Absent, "the mixed-tier backup must serve");
     index.check_invariants();
 
-    // Once `shallow` commits too, nothing below the chain node needs the Host bytes any more.
+    // Closing the remaining snapshot must not release an already returned Host slab twice.
     index.pin_snapshot(shallow);
     index.begin_snapshot_disk_fill(shallow, 970);
     index.complete_snapshot_disk_fill(shallow);
     index.unpin_snapshot(shallow);
     require(index.release_redundant_host_copies(
-                std::span<const NodeRef>{&path[0], 1}) == 1,
-            "the last uncommitted dependent must release the Host copy");
+                std::span<const NodeRef>{&path[0], 1}) == 0,
+            "a repeated release must not return the same slab twice");
     require(index.node(path[0]).host == CopyState::Absent, "the Host copy must be released");
     for (const NodeRef node : path) {
         require(index.node(node).disk == CopyState::Resident, "the disk record must survive");
@@ -1668,6 +1666,8 @@ void test_disk_closure_reclaims_host_copies() {
                 std::span<const NodeRef>{&path[0], 1}) == 0,
             "a pinned node must keep its Host copy");
     index.unpin_node(path[0]);
+    require(index.node(path[0]).host == CopyState::Absent,
+            "the last source unpin must complete the deferred Host release");
 
     // Disk victim reclamation drives the backend's release callbacks, so the catalog learns which
     // records left the running cache (a restart must not resurrect them).
@@ -1684,10 +1684,8 @@ void test_disk_closure_reclaims_host_copies() {
     index.check_invariants();
 }
 
-// Demotion candidates: unpinned Host-resident snapshots without a committed disk closure.
-// Superseded ones come first, oldest supersession first (certain dead content that a closure
-// keeps restartable); retained ones follow by ascending GDSF priority. Pinned, disk-committed
-// and Host-absent snapshots never demote.
+// Drainable Host images precede images requiring a refill, so a limited candidate batch cannot
+// be monopolized by Device-only snapshots that currently need more Host space.
 void test_demotion_candidates() {
     DiskBackend backend;
     PrefixIndexConfig config = disk_config();
@@ -1762,8 +1760,8 @@ void test_demotion_candidates() {
 // any snapshot — the node keeps its Device copy and a later release retries the fill.
 void test_write_through_spares_demotion_fuel() {
     DiskBackend backend;
-    // Six slabs: two blocks (2) plus one image without a tail (4) fill the tier exactly.
-    PrefixCacheIndex index(disk_config(6), backend);
+    // Two blocks plus one image consume ordinary capacity; one slab funds disk repair only.
+    PrefixCacheIndex index(disk_config(7), backend);
     const auto tokens = make_tokens(2 * kBlockTokens, 96);
     const auto path   = insert_sequence(index, backend, tokens);
     backup_node(index, path[0]);
@@ -1976,6 +1974,219 @@ void test_publish_refuses_over_committed_table() {
     index.check_invariants();
 }
 
+void test_disk_commit_respects_host_reader() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(16), backend);
+    const auto tokens = make_tokens(2 * kBlockTokens, 301);
+    const auto path = insert_sequence(index, backend, tokens);
+    const auto snapshot = publish_at(index, backend, path, tokens, kBlockTokens + 5,
+                                     SnapshotKind::Endpoint);
+    backup_snapshot(index, snapshot);
+    index.release_path(path);
+    const auto free_before = index.stats().host_free_slabs;
+    index.pin_snapshot(snapshot); // accepted disk image job
+    index.begin_snapshot_disk_fill(snapshot, 400);
+    index.pin_snapshot(snapshot); // accepted Host-to-Device image/tail reader
+    index.complete_snapshot_disk_fill(snapshot);
+    index.release_snapshot_host_copy(snapshot);
+    index.unpin_snapshot(snapshot); // disk job returned, but the reader has not landed
+    require(index.snapshot(snapshot).host == CopyState::Resident &&
+                index.stats().host_free_slabs == free_before,
+            "commit must preserve the image and tail while a Host reader owns their lease");
+    index.unpin_snapshot(snapshot);
+    require(index.snapshot(snapshot).host == CopyState::Absent &&
+                index.stats().host_free_slabs == free_before + 5,
+            "the final reader must return the complete image and tail exactly once");
+    index.release_snapshot_host_copy(snapshot);
+    require(index.stats().host_free_slabs == free_before + 5, "no duplicate source release");
+    index.check_invariants();
+}
+
+void test_full_host_streaming_repair() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(7), backend);
+    const auto tokens = make_tokens(4 * kBlockTokens, 302);
+    const auto path = insert_sequence(index, backend, tokens);
+    backup_node(index, path[0]);
+    backup_node(index, path[1]);
+    const auto snapshot = publish_tap(index, path.back());
+    backup_snapshot(index, snapshot);
+    index.release_path(path);
+    index.supersede(snapshot);
+    require(index.stats().host_free_slabs == 1, "ordinary retention leaves one repair slab");
+    index.pin_node(path[2]);
+    require(!index.begin_host_fill(path[2]), "ordinary write-through must preserve repair headroom");
+    index.unpin_node(path[2]);
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const auto node = path[i];
+        index.pin_node(node);
+        if (index.node(node).host == CopyState::Absent) {
+            require(index.begin_host_fill(node, true).has_value(),
+                    "disk repair must progress without evicting the candidate image");
+            index.complete_host_fill(node);
+        }
+        const auto record = 500U + static_cast<std::uint32_t>(i);
+        index.begin_node_disk_fill(node, record);
+        index.mark_disk_backed(node, record);
+        index.release_redundant_host_copies({&node, 1});
+        require(index.node(node).host == CopyState::Resident, "accepted source remains leased");
+        index.unpin_node(node);
+        require(index.node(node).host == CopyState::Absent,
+                "each finished block funds the next repair before the closure commits");
+        index.check_invariants();
+    }
+    index.pin_snapshot(snapshot);
+    index.begin_snapshot_disk_fill(snapshot, 510);
+    index.complete_snapshot_disk_fill(snapshot);
+    index.release_snapshot_host_copy(snapshot);
+    index.unpin_snapshot(snapshot);
+    require(index.snapshot(snapshot).disk_committed && index.stats().host_free_slabs == 7,
+            "a chain larger than ordinary Host block capacity must close and drain the pool");
+    index.check_invariants();
+}
+
+void test_branched_loose_records_and_live_boundary() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const auto common = make_tokens(kBlockTokens, 303);
+    const auto left = make_tokens(kBlockTokens, 304);
+    const auto right = make_tokens(kBlockTokens, 305);
+    const auto hash = block_lookup_hash(kRootLookupHash, common, 0);
+    const auto root = index.restore_disk_block({}, hash, common, 0, 600);
+    require(root.has_value(), "restore shared root");
+    require(index.restore_disk_block(*root, block_lookup_hash(hash, left, 0), left, 0, 601).has_value(),
+            "restore left orphan branch");
+    require(index.restore_disk_block(*root, block_lookup_hash(hash, right, 0), right, 0, 602).has_value(),
+            "restore right orphan branch");
+    const auto boundary = index.restore_disk_snapshot(*root, kBlockTokens, {}, SnapshotKind::Boundary,
+                                                      1, 603, true);
+    require(boundary.has_value(), "restore useful shallow boundary");
+    require(index.release_disk_record_range(1) == 1, "one orphan leaf must yield at the budget");
+    require(index.release_disk_record_range(8) == 1, "the other branch must remain reachable");
+    require(index.stats().disk_resident_blocks == 1 && index.valid(*root) && index.valid(*boundary),
+            "the live boundary keeps only its own required ancestor");
+    index.check_invariants();
+    require(index.evict_disk_entries(1) == 2 && index.stats().nodes == 0,
+            "retiring the final boundary must return its complete remaining closure");
+    index.check_invariants();
+}
+
+void test_device_image_refill_candidates() {
+    DiskBackend backend;
+    auto config = disk_config();
+    config.device_snapshot_slots = 3;
+    PrefixCacheIndex index(config, backend);
+    const auto tokens = make_tokens(3 * kBlockTokens, 306);
+    const auto path = insert_sequence(index, backend, tokens);
+    const auto absent = publish_tap(index, path[0]);
+    const auto host = publish_tap(index, path[1]);
+    backup_snapshot(index, host);
+    index.release_path(path);
+    index.supersede(absent);
+    const auto one = index.collect_demotion_candidates(1);
+    require(one.size() == 1 && one.front() == host,
+            "a refill must not hide drainable Host bytes behind the candidate limit");
+    const auto both = index.collect_demotion_candidates(8);
+    require(both.size() == 2 && both[1] == absent,
+            "a complete Device-only image must be offered for actual Host refill");
+    index.pin_snapshot(absent);
+    require(index.begin_snapshot_host_fill(absent), "the offered image can acquire a Host destination");
+    require(index.collect_demotion_candidates(8).size() == 1,
+            "an accepted image fill must not be offered twice");
+    index.complete_snapshot_host_fill(absent);
+    index.unpin_snapshot(absent);
+    index.check_invariants();
+}
+
+void test_bad_disk_copy_keeps_volatile_resume() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const auto tokens = make_tokens(3 * kBlockTokens + 1, 307);
+    const auto path = insert_sequence(index, backend, tokens);
+    const auto snapshot = publish_tap(index, path.back());
+    backup_snapshot(index, snapshot);
+    for (const auto node : path) {
+        index.begin_node_disk_fill(node, 700 + node.index);
+        index.mark_disk_backed(node, 700 + node.index);
+    }
+    index.pin_snapshot(snapshot);
+    index.begin_snapshot_disk_fill(snapshot, 710);
+    index.complete_snapshot_disk_fill(snapshot);
+    index.unpin_snapshot(snapshot);
+    index.release_path(path);
+    index.invalidate_disk_block(path[0], 700 + path[0].index);
+    require(index.stats().disk_resident_blocks == 0 && index.stats().disk_committed_snapshots == 0,
+            "a bad parent must invalidate every old persistent descendant link");
+    const auto match = index.match(tokens, block_lookup_hashes(tokens, {}), {}, tokens.size());
+    require(match.candidates.size() == 1 && match.candidates[0].snapshot == snapshot &&
+                match.candidates[0].disk_read_bytes == 0,
+            "intact volatile copies must keep serving the exact same resume point");
+    index.pin_node(path[0]);
+    index.begin_node_disk_fill(path[0], 799);
+    index.mark_disk_backed(path[0], 799);
+    index.unpin_node(path[0]);
+    index.invalidate_disk_block(path[0], 700 + path[0].index);
+    require(index.node(path[0]).disk_ref == 799, "a stale read failure must not retire a replacement");
+    index.check_invariants();
+}
+
+void test_bad_disk_only_path_waits_for_leases() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const auto tokens = make_tokens(2 * kBlockTokens + 1, 308);
+    const auto hashes = block_lookup_hashes(tokens, {});
+    const auto first = index.restore_disk_block({}, hashes[0], {tokens.data(), kBlockTokens}, 0, 800);
+    require(first.has_value(), "restore disk-only root");
+    const auto child = index.restore_disk_block(*first, hashes[1],
+                                               {tokens.data() + kBlockTokens, kBlockTokens}, 0, 801);
+    require(child.has_value(), "restore disk-only child");
+    const auto snapshot = index.restore_disk_snapshot(*child, 2 * kBlockTokens, {},
+                                                      SnapshotKind::Endpoint, 1, 802, true);
+    require(snapshot.has_value(), "restore disk-only snapshot");
+    index.pin_snapshot(*snapshot);
+    index.pin_node(*child);
+    index.invalidate_disk_block(*first, 800);
+    const auto match = index.match(tokens, hashes, {}, tokens.size());
+    require(match.candidates.empty() && !index.choose(match, tokens.size()).candidate,
+            "a bad disk-only prefix must immediately fall back to root instead of retrying");
+    require(index.valid(*first) && index.valid(*snapshot), "accepted leases prevent early destruction");
+    index.check_invariants();
+    index.unpin_node(*child);
+    require(index.valid(*first), "the image reader still owns the invalid subtree");
+    index.unpin_snapshot(*snapshot);
+    require(index.stats().nodes == 0 && index.stats().snapshots == 0,
+            "the final lease must reclaim all invalid descriptors and copies");
+    index.check_invariants();
+}
+
+void test_bad_parent_discards_inflight_descendant() {
+    DiskBackend backend;
+    PrefixCacheIndex index(disk_config(), backend);
+    const auto tokens = make_tokens(2 * kBlockTokens, 309);
+    const auto path = insert_sequence(index, backend, tokens);
+    const auto snapshot = publish_tap(index, path.back());
+    index.begin_node_disk_fill(path[0], 900);
+    index.mark_disk_backed(path[0], 900);
+    index.pin_node(path[1]);
+    index.begin_node_disk_fill(path[1], 901);
+    index.pin_snapshot(snapshot);
+    index.begin_snapshot_disk_fill(snapshot, 902);
+    index.invalidate_disk_block(path[0], 900);
+    require(index.node(path[1]).disk_invalidated && index.snapshot(snapshot).disk_invalidated,
+            "accepted descendants must not publish obsolete persistent parent links");
+    require_throws([&] { index.mark_disk_backed(path[1], 901); }, "reject invalidated block completion");
+    require_throws([&] { index.mark_snapshot_disk_backed(snapshot, 902); },
+                   "reject invalidated image completion");
+    index.abort_node_disk_fill(path[1]);
+    index.unpin_node(path[1]);
+    index.abort_snapshot_disk_fill(snapshot);
+    index.unpin_snapshot(snapshot);
+    index.release_path(path);
+    require(index.valid(snapshot) && index.snapshot(snapshot).device_slot != kNoId,
+            "failure must preserve the intact Device image");
+    index.check_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -2016,6 +2227,13 @@ int main() {
         test_committed_closure_survives_slab_pressure();
         test_committed_closure_survives_slot_pressure();
         test_publish_refuses_over_committed_table();
+        test_disk_commit_respects_host_reader();
+        test_full_host_streaming_repair();
+        test_branched_loose_records_and_live_boundary();
+        test_device_image_refill_candidates();
+        test_bad_disk_copy_keeps_volatile_resume();
+        test_bad_disk_only_path_waits_for_leases();
+        test_bad_parent_discards_inflight_descendant();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

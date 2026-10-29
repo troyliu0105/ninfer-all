@@ -344,6 +344,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      statuses: write
     strategy:
       fail-fast: false
       matrix:

@@ -4,12 +4,14 @@
 [Hybrid prefix cache](hybrid-prefix-cache-spec.md). Hybrid mode accepts `--disk-kv-path` with
 `--disk-kv-gib` (default 64 GiB) and opens its own catalog under the artifact-scoped directory;
 the Legacy-only `--disk-kv-restore` and `--disk-kv-directstorage` switches remain Legacy-only.
-Host-only unit tests cover the index residency rules, the disk-committed tail fill, the Host-copy
-reclamation a committed closure triggers, the source-ranking cost model and the catalog; the
-demotion and preparation lifecycle is exercised by the real-engine scenarios
-(`disk-demotion`, `disk-restore`, `disk-restart`, `disk-tail-restore`, `disk-small-capacity`,
-`disk-long-chain`, plus the `disk-persist-exclusive` option check), and the performance contract
-(§9) holds only within what those runs measured.
+Host-only tests cover the production demotion/staging/completion orchestration as well as source
+leases, bounded streaming repair, branched reclamation, failed-source fallback, exact catalog
+reservations/replay and real worker I/O, including blocked-journal isolation. The real-engine
+scenarios (`disk-demotion`, `disk-restore`,
+`disk-restart`, `disk-tail-restore`, `disk-small-capacity`, `disk-long-chain`) now require completed
+image demotion, not merely block writes. Those strengthened scenarios have not been requalified
+on a GPU for the current lifecycle changes. The feature remains opt-in and GPU-unqualified;
+neither numerical restore nor the performance contract (§9) follows from CPU coverage.
 
 The extension retains cold prefixes after the pinned Host cache comes under pressure, serves
 requests from Device, Host or Disk copies, and reconstructs the radix tree from committed disk
@@ -63,8 +65,8 @@ cache base class, storage-plugin framework or a copy of the Legacy owner/catalog
 | Owner | Responsibility |
 |---|---|
 | Core storage | Physical records, bounded I/O, payload checksums and read claims |
-| `runtime/prefix_cache` | Exact tree identity, snapshot dependencies, per-tier residency, victim selection and model-independent persistent metadata |
-| Qwen3.5 `HybridPrefixCache` | Bind opaque records to KV bundles and StateImage parts; own staging, copy events and asynchronous jobs |
+| `runtime/prefix_cache` | Exact tree identity, snapshot dependencies, per-tier residency and victim selection; `PrefixDiskCatalog` owns persistent metadata and `PrefixDiskWorker` executes runtime storage I/O |
+| Qwen3.5 Program / `HybridPrefixCache` / `HybridDiskTier` | Program owns pinned staging, cache owns Host slabs and CUDA copy events; the CUDA-independent tier borrows staging and requests physical fills, then adopts disk completions on the Engine thread |
 | Program admission | Quote ready sources, validate resources, bind prepared data and activate a lane |
 | Engine | FIFO, deadlines, cancellation, execution order and publication |
 
@@ -89,9 +91,19 @@ Existing code offers these reuse boundaries:
 - [`PrefixCacheIndex`](../../src/runtime/prefix_cache/prefix_index.h) already owns tokens, extra
   keys, references and eviction. Extend this index rather than recreating those facts elsewhere.
 
-New implementation files should separate persistent metadata from model binding. For example,
-`runtime/prefix_cache/disk_catalog.*` owns metadata encoding/replay, while
-`models/qwen3_5/program/prefix/hybrid_disk.*` owns demotion and preparation jobs.
+`runtime/prefix_cache/disk_catalog.*` owns metadata encoding/replay and pure-memory reservations.
+`disk_worker.*` is its sole runtime I/O executor: payload reads/writes, publication journals,
+removals and checkpoints. `models/qwen3_5/program/prefix/hybrid_disk.*` owns model binding,
+demotion interests and staging leases, not a second storage executor. Startup replay and shutdown
+settlement may perform synchronous I/O before/after serving.
+
+`HybridDiskTier::Layout` carries only byte geometry; `Staging` borrows the three accounted
+buffers for the tier's full lifetime. `HostTransfers` supplies slab addresses and requests block
+or snapshot D2H fills. A successful submission is not completion: the physical owner keeps its
+pins and publishes Host residency only when the copy lands. Production callbacks invoke the
+existing CUDA paths. CPU tests supply distinct memory buffers and explicitly delayed completion
+events, while executing the same tier/index/catalog/worker code, not a second demotion algorithm.
+Program destroys the tier and settles its worker before freeing staging or Host source slabs.
 
 ## 3. Residency, identity and capacity
 
@@ -160,6 +172,11 @@ MiB it needs — the plan's own `min_budget_bytes` (image segments, tail payload
 one block payload), never a re-derived approximation. Disk capacity is not part of the Host
 budget: the catalog's byte capacity stays real bytes.
 
+With Disk enabled, ordinary Host block and snapshot fills leave one slab available for a missing
+ancestor's Device-to-Host repair. Only disk backfill can consume it. This is a reservation within
+the existing slab pool, not another allocation: ordinary hot retention loses one slab of capacity,
+while the advertised Host-plus-staging budget and the minimum startup geometry stay the same.
+
 The node and snapshot descriptor bounds derive from the capacity plan in
 [`create_hybrid_prefix_cache`](../../src/models/qwen3_5/program/prefix/hybrid_program.cpp):
 Device pages plus Host slabs plus, with the tier enabled, the record budgets of
@@ -193,63 +210,58 @@ value of keeping a Host copy from the value of keeping a Disk copy. Host retenti
 restore; Disk retention avoids recomputation. The current Host score is not automatically the
 right score for both tiers.
 
-A committed closure is also the trigger for reclaiming what it duplicated: the tier releases the
-snapshot's Host image and tail slabs through `release_snapshot_host_copy` and the anchor chain's
-Host copies through `release_redundant_host_copies`, which keeps a chain node's copy while any
-live snapshot anchored at or below it still lacks a committed disk closure. A full record
-directory recycles instead of blocking: the tier drains abandoned reservations
-(`reclaim_abandoned`) and loose replayed records (`release_disk_record_range`) first, then runs
-the index's disk victim selection (`evict_disk_entries`): dead closures first — superseded
-committed ones in lowest-GDSF order, each released whole with the exclusive anchor-chain records
-no remaining snapshot reads — because a fresh resume point's GDSF value (one hit against its
-whole exclusive chain) always underrates it against a superseded one, so a reclaim that freed a
-dead closure never crosses into live ones in the same step; retained closures are a last
-resort. Volatile-tier pressure (Host slabs, Device slots, snapshot-table room) never destroys a
-committed closure — it takes the volatile copy (`release_snapshot_host_copy`,
-Device-copy eviction) or refuses. A directory
-with no committed snapshot — a replayed catalog of loose block records — has no victim that
-selection accepts, so the tier also releases pure block records (deepest chain-first, no live
-snapshot anchored on them, a volatile copy keeping the node valid) through
-`release_disk_record_range` before treating the cycle as backpressure; without it, a full
-directory seals every later demotion shut. The replayed loose blocks themselves are usually
-disk-only (no volatile copy anywhere): a record is taken from such a node only at a leaf no
-snapshot anchors on and no live content sits below — a closure that never committed, whose
-content no resume can ever read — and the node goes with its record, exposing the node above
-as the next candidate. This is the only drain for a directory the loose records have filled;
-without it every `begin_*_write` fails forever and demotion stalls at the high watermark with
-the Host tier frozen. A closure whose anchor or awaited record the index removed in the
-meantime never commits, so a restart cannot resurrect a closure with a dangling anchor.
+A finished block record is already a valid mixed-tier source, even before any descendant image
+commits. Each block completion requests release of its Host duplicate immediately, funding the
+next missing ancestor. Image/tail duplicates release after the image job commits. Both release
+requests defer while another reader or writer holds a source pin and complete at the last
+unpin; publication never authorizes reuse of bytes an accepted H2D or disk job still reads.
 
-Submissions are bounded by queued-but-unstarted bytes, resolved as three image jobs (two closures
-in flight plus one block batch; a single image job is ~75 MiB). A flat bound below two image jobs
-serializes closures one at a time and drains the Host tier no faster than a single commit cycle.
+A full record directory first drains loose records through `release_disk_record_range`. It visits
+every branch deepest-first, including orphan suffixes beyond a live shallow snapshot. A record
+yields only when no snapshot needs it, no transfer pins it and no child's persistent reference
+still needs it. A disk-only dead node retires with its unreachable subtree; valid volatile copies
+otherwise keep the node. This prevents abandoned branches from permanently sealing the directory.
+The tier then selects committed closure victims with `evict_disk_entries`: superseded closures
+first, in lowest-GDSF order, followed by retained ones only when no dead closure remains.
+Shared ancestors and mixed-tier runtime dependencies stay protected. A chosen closure may return
+more than the nominal record budget because its exclusive chain is reclaimed together.
 
-A closure that cannot commit returns everything it reserved in the same completion pass. The
-completion step drops each awaited block record as its write lands, and a closure that will never
-commit — a failed block write, a catalog commit failure, a chain record the index removed, or a
-snapshot that left the index — closes its snapshot's disk fill through the index
-(`abort_open_snapshot_fill`), whose release callback hands the image record back to the journaled
-removal path. No snapshot is left Filling and no record stays reserved for a closure that cannot
-publish; a failed closure keeps its Host copy, so the snapshot stays a valid volatile resume point.
-A demotion candidate must also carry a complete Host copy to be written at all: the closure copies
-the snapshot's image grid plus, when a tail exists, its tail slab, and a candidate whose slabs are
-not exactly that set (an aborted Host fill, or a tail the Host tier never allocated) is skipped
-rather than published as a half-closure.
+Runtime pressure never calls `reclaim_abandoned`: queued and running jobs own their reservations.
+Only after the I/O worker has stopped may shutdown sweep provisional records. Runtime removals
+are asynchronous; a refused reservation retries on a later cadence after the worker has journaled
+the removals and refunded capacity. Volatile-tier pressure drops duplicates or refuses retention,
+rather than destroying a committed closure.
 
-Superseded snapshots are demotion candidates, not eviction fodder: their content is certain dead
-for the running lineages, and a committed closure keeps it restartable. Candidates order
-superseded snapshots first, oldest supersession first, then retained ones by ascending GDSF
-priority. The tier applies a grace window on top — a snapshot superseded within the last two
-supersession ticks stays on Host, because retries and branch resumes concentrate on the most
-recent turns — and drops the window once Host occupancy reaches 95%: drainage then beats
-retention. A chain node whose Host copy was dropped under pressure while its Device copy stayed
-is backfilled (Device→Host copies on the write-through streams) instead of failing the closure;
-the next cadence re-walks the chain, reuses every record that landed and closes it once the
-backfilled slabs complete. The repairs are deferred until after the whole candidate walk and each
-candidate is re-validated before use: a repair's slab allocation runs under the same Host pressure
-the demotion is draining and may evict (as `pick_victim`) a snapshot later in the candidate list —
-dereferencing it mid-walk is the stale-reference crash. A node with no copy on either tier still
-fails the closure: no bytes exist to write.
+Every write submission checks the remaining byte bound separately, before taking a reservation.
+The default bound is three physical image-and-tail jobs. It covers queued, running and completed
+but unadopted writes, including padded image segments and the full tail bundle. Image reservations
+charge every image slot and the optional tail slot before execution; refusals consume no ID or
+capacity. Demanded reads precede unstarted removals and writes. Writes themselves keep submission
+order, so new block streams cannot starve an older image commit and its Host release. No
+priority rule preempts I/O that is already running.
+
+There is no closure-wide repair pin. Each accepted block write pins only for that job; waiting
+for backfill or queue capacity owns neither an image reservation nor a snapshot pin. Once every
+ancestor is disk-Resident, the tier reserves and pins the image/tail job. A bounded set of unpinned
+demotion interests lets started closures finish below the low watermark. An image refill that
+cannot yet fit keeps its started interest: other jobs may return space only on a later cadence.
+Failed or stale fills abort on completion, release their records and retain any valid volatile
+source. No accepted job's record is reclaimed early, so late work cannot recreate an abandoned
+payload key.
+
+Within each candidate batch, drainable Host-resident images precede complete Device-only images
+requiring refill. Each group orders superseded snapshots oldest-first, then retained ones by GDSF.
+In-flight, pinned and invalidated snapshots are excluded. A snapshot superseded within the last
+two supersession ticks gets a grace window while Host occupancy stays below 95%; above that,
+drainage wins. An image/tail is submitted only with its complete Host slab set.
+
+A missing Device-resident ancestor uses the reserved repair slab on the existing write-through
+streams. After its D2H event and disk write complete, returning that slab funds the next repair.
+There is no need to hold the whole ancestor chain on Host. A complete Device-only image may also
+refill on those streams; if it cannot yet fit, its Host-resident ancestors can still stream to
+Disk and fund image space. Every candidate handle is revalidated before use, since an allocation
+may evict a later candidate. Retention stays best-effort when no valid source or sufficient
+capacity remains.
 
 ### Write and publication protocol
 
@@ -261,8 +273,9 @@ parts in bounded batches:
    those payloads to disk workers.
 3. Write missing records, reusing committed ancestors rather than copying the whole prefix for
    each snapshot.
-4. On completion, the worker publishes the new Disk copies and releases the batch's Host leases.
-   It may drop those Host copies when the remaining runtime dependencies allow it.
+4. The worker finishes the persistent record and returns a completion. The Engine alone publishes
+   index residency and releases that job's Host source pin; a pending duplicate release runs only
+   when the last source reader has returned.
 5. Publish a restartable snapshot record only after its complete Disk closure exists. Protect
    all records required by that commit until publication completes.
 
@@ -271,9 +284,10 @@ the Host cache to accumulate on Disk as Host write-through advances. Bound provi
 and pending metadata references; collect abandoned records when their publication can no longer
 complete. Payloads without a committed snapshot never create restart hits by themselves.
 
-The implementation must distinguish offload source leases from execution pins. A source lease
-prevents reuse of the Host bytes under an accepted write, including after cancellation, without
-pinning unrelated Device ancestors for the duration of disk I/O.
+Accepted offloads own independent source pins until their completion is adopted. Block jobs use
+the index's conservative path-wide pins; image jobs pin their snapshot only while its image/tail
+is actually queued or running. No pin spans an entire streaming repair or capacity wait. The
+Device-eviction and latency cost of those bounded job pins remains part of GPU qualification.
 
 ### Backpressure
 
@@ -309,6 +323,10 @@ Use measured end-to-end restore coefficients with margin, not SSD sequential-rea
 or the Host H2D coefficient. A useful Disk choice must beat the best other source by enough to
 cover prediction uncertainty. Predictions rank choices; actual pages, slots and validity decide
 whether they can execute.
+
+Quote excludes infeasible candidates before calling `choose`; both quote and prefetch honor its
+root result. An absent candidate means root: a fitting cold prefix does not override a cheaper
+recomputation decision, and no Disk reads are staged for a root choice.
 
 ### Prepare outside the global context transaction
 
@@ -424,13 +442,30 @@ On startup:
    before children, then attach complete Disk snapshots.
 4. Recompute runtime handles, reachability, per-tier accounting and eviction structures. Preserve
    bounded useful history such as hit counts, not pointers or old in-flight states.
-5. Retain only paths supporting committed snapshots. Reclaim abandoned records in bounded work.
-   Admit requests once the restored catalog is coherent.
+5. Reclaim provisional payloads whose metadata never published and prune records with missing
+   ancestry, image segments or a required tail. Finished loose blocks may replay without creating
+   a snapshot hit; runtime pressure reclaims them across all branches. Admit requests only after
+   this catalog is coherent.
 
 Read headers/index metadata at startup; verify full payload checksums on demand rather than
 preloading the disk cache into Host. A damaged or missing payload later invalidates that copy
 and affected disk closures before reuse. Other intact copies and shallower snapshots remain
 eligible. A corrupt catalog must not publish a partial tree with unchecked ancestry.
+
+A read failure returns its own completion before cleanup I/O. The Engine invalidates the expected
+record ID only, preserving a newer replacement and any intact Device/Host copies. Losing a parent
+also invalidates descendant persistent parent links; already accepted fills keep their leases but
+must abort instead of publishing those old links. A last-copy loss excludes the affected resume
+point immediately, then retires its descriptors after the last transfer lease ends. Fresh matching
+selects another valid source or root instead of retrying the same broken record until timeout.
+Record removal is queued independently, so a blocked cleanup journal does not delay that fallback.
+
+Removal first makes the record unavailable, then journals its tombstone, and only then releases
+physical slots and metadata. An append or eviction failure preserves enough state for an
+idempotent retry. Neither capacity accounting nor a crash replay treats an unjournaled deletion
+as completed. The metadata mutex covers short in-memory operations only; a separate I/O mutex
+serializes payload, journal and checkpoint operations without blocking Engine `find`, `begin_*`
+or `stats` behind filesystem work.
 
 Normal shutdown stops new submissions, settles accepted jobs, commits complete closures and
 flushes catalog updates. An interrupted shutdown may lose pending cache work. There is no
@@ -576,31 +611,82 @@ Extend existing behavioral coverage for:
 - Tier-local reclaimable bytes, bounded metadata, and no automatic eviction of referenced records.
 - Provisional blocks, complete snapshot commit, removal, interrupted checkpoints/journals,
   missing payloads and checksum failures.
-- The demotion commit state machine: a closure commits only after every awaited block record and
-  its image landed; a failed block write, a failed catalog commit or a record the index removed
-  closes the fill and reclaims the image record, and a failed closure keeps its Host copy.
-- Host-copy reclamation at commit: `release_redundant_host_copies` frees a chain node's slab only
-  once no live snapshot below it lacks a committed closure, and never a pinned node's.
+- A streaming closure larger than ordinary Host block capacity, one reserved repair slab,
+  per-block Host release before image commit, and the complete image/tail commit boundary.
+- Source leases across commit: another reader keeps image, tail and block slabs until its last
+  unpin; duplicate release requests return no bytes twice.
+- Exact queue bytes through unadopted completions, read-destination limits, demanded-read priority
+  and write ordering that prevents new block streams from starving an older closure.
+- Exact image/tail reservations, rejected late writes after abandonment, removal publication
+  failures and retries, crash replay without resurrection, and incomplete-ancestry pruning.
+- Real blocked-journal I/O while Engine metadata operations and failed-read completion still
+  progress; these checks use a Linux FIFO, not a mocked catalog or elapsed-time sleep.
+- Failed-generation isolation, preserved volatile resumes, root fallback after last-copy loss,
+  invalidated in-flight fills and deferred descriptor retirement until accepted leases end.
 - The disk-committed tail as a device-fill source after device pressure shed its Device copy, and
-  the refusal of a tail with no Host slab and no committed closure.
-- Demotion candidate selection (unpinned, Host-resident, no committed closure; superseded
-  oldest-first, then retained by ascending GDSF priority) and the source-ranking cost model,
-  including a disabled or slow disk rate. The superseded grace window and its occupancy escape
-  are tier-level (the index orders only).
-- A full directory with no committed snapshot: `release_disk_record_range` releases pure block
-  records (a volatile copy keeps the node valid) and, at a leaf no snapshot anchors on, a
-  disk-only node's record together with the node itself (a closure that never committed), and a
-  following `begin_*_write` succeeds, where `evict_disk_entries` alone finds no victim and the
-  directory stays sealed.
+  refusal when neither Host nor a committed disk closure can supply it.
+- Host-first candidates, reachable complete Device-only refills, the source-ranking cost model
+  including root, and orphan reclamation across forks and suffixes behind live boundaries.
 - The staging budget split: `plan_hybrid_disk_staging` caps the block batch, never shrinks the
   slab pool below its own minimum, and reports the exact rejection figure.
 - Queue saturation, stale completions, cancellation and source lifetime through accepted I/O.
 - CLI and Engine option validation, including persistence-file mutual exclusion.
 
-The existing `ninfer_prefix_cache_index_test`, `ninfer_disk_kv_store_test` and
-`ninfer_disk_kv_bridge_test` cover reusable components, not this new composition. Native I/O
-queue tests may skip in restricted environments; report that gap rather than treating a skip as
-asynchronous-read qualification.
+`ninfer_prefix_cache_index_test` covers index transitions; `ninfer_prefix_disk_catalog_test`
+covers real persistent framing and recovery; `ninfer_prefix_disk_worker_test` exercises actual
+queued I/O and blocking isolation. `ninfer_disk_kv_store_test` and `ninfer_disk_kv_bridge_test`
+cover reusable storage primitives. Native I/O queue tests may skip in restricted environments;
+report that gap rather than treating a skip as asynchronous-read qualification.
+
+`ninfer_hybrid_disk_cpu_test` drives the production tier through long branching paths with a Host
+pool smaller than the prefix, bounded cold-read staging and restart. Independent payloads compare
+all block, full StateImage and nonaligned tail bytes exactly. Controlled copy completion checks
+that cancellation of request interest never permits source reuse, accepted writes keep their byte
+budget until adoption, and held repair events do not accumulate pins. Real payload corruption,
+stale read completions and a failed tombstone journal exercise fallback and cleanup retries.
+
+The staging-slot lease includes a monotonically assigned generation, carried through Program
+queues and checked on release. A delayed duplicate release after the slot has changed owners
+cannot free the new reader's buffer; a free/busy bit alone does not protect this reuse boundary.
+This adds one 64-bit owner token per staging slot and per returned block lease, not another payload
+buffer or RAM cache. Pinned payload sizes and the advertised Host staging budget are unchanged.
+
+`ninfer_prefix_disk_crash_test` uses pipe-synchronized Linux child processes terminated by SIGKILL
+or `_exit`, so catalog destructors cannot manufacture recovery state. It checks unpublished
+payloads, uncommitted images/tails, exact committed closures, tombstones and allocator recovery.
+Narrow removal/checkpoint interruption windows are assembled from real production files captured
+at explicit barriers; they test the resulting recoverable file pair, not an observed interruption
+inside an atomic rename. Torn uncovered journal tails and leftover checkpoint temporaries are
+also covered. Other platforms report this subprocess test as skipped, not qualified.
+
+`ninfer_prefix_disk_reference_test` compares the index with a flat reference of exact token
+prefixes, extra keys and independently tracked available sources. Three fixed seeds drive 72
+branching epochs and 1,728 randomized operations, with candidate eligibility/source bytes, lease
+counts, backend releases and Host/Device/disk accounting checked after each logical transition.
+All lookup hashes collide deliberately; different tokens and extra keys still select different
+prefixes. Repeated descriptor reuse checks stale generations, and controlled full drains avoid
+duplicating private GDSF/LRU victim selection. Failures report the seed, epoch and operation trace.
+
+The standalone [CPU gate](../../tests/host/prefix_disk/CMakeLists.txt) builds these paths with a
+C++20 compiler and Threads only: no CUDA toolkit, driver, model artifact or Python is required.
+
+```bash
+cmake -S tests/host/prefix_disk -B ~/tmp/ninfer-prefix-disk-cpu -DCMAKE_BUILD_TYPE=Debug
+cmake --build ~/tmp/ninfer-prefix-disk-cpu -j 4
+TMPDIR=~/tmp ctest --test-dir ~/tmp/ninfer-prefix-disk-cpu --output-on-failure
+```
+
+For GCC/Clang ownership and undefined-behavior checks, configure a separate build with
+`-DNINFER_PREFIX_DISK_SANITIZERS=ON`. The same sources also run in the normal product CTest suite.
+These checks establish exact storage/recovery bytes, dependency and capacity semantics, and the
+ownership protocol under delayed transfers; CUDA bindings and numerical execution remain the
+separate qualification below.
+
+Product integration also needs the CI configuration (`BUILD_TESTING=ON`, `NINFER_MULTICALL=ON`)
+and a build of all default targets before CTest. Building only `ninfer_tests`, `ninfer` and
+`ninfer-serve` omits independent tools such as `ninfer-multi-gpu-probe`, whose directly compiled
+Device runtime must carry its peer-preflight implementation too. A passing CPU disk gate does not
+establish that this wider source/link closure builds.
 
 ### Real execution and numerical semantics
 
@@ -626,6 +712,8 @@ placements. Track source-specific bytes, preparation/queue time, actual prefill 
 decode tokens, streaming gaps, staging/leased Host peaks and cache drops. Extend existing logs
 and benchmarks rather than creating a separate observability project.
 
-CPU tests establish metadata, ownership and I/O behavior. GPU runs establish restore correctness,
-TTFT and interference. Until those runs satisfy the selected acceptance conditions, report this
-feature as unqualified and keep it opt-in. No GPU performance result is recorded by this design.
+CPU tests establish logical recovery, exact stored bytes and the transfer ownership protocol
+under controlled completion schedules. They do not exercise actual CUDA event/stream ordering,
+model-specific GPU packing/copy kernels or resumed model arithmetic. GPU runs qualify those
+bindings, numerical outputs, TTFT and interference. Until those runs satisfy the selected
+acceptance conditions, keep the feature opt-in and GPU-unqualified.

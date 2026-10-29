@@ -164,7 +164,8 @@ public:
     // Copies every Device-only node of `nodes` to a Host slab in one batch. Nodes are pinned until
     // the copy completes. Stops early when the Host tier cannot free a slab.
     void start_block_host_writes(std::span<const runtime::prefix_cache::NodeRef> nodes,
-                                 cudaStream_t producer, cudaStream_t transfer);
+                                 cudaStream_t producer, cudaStream_t transfer,
+                                 bool disk_backfill = false);
     // Publishes every completed Host write. Non-blocking.
     void poll();
 

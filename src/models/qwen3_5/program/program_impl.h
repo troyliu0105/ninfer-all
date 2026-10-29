@@ -1424,6 +1424,10 @@ private:
 
     // Hybrid prefix cache (null in Legacy mode).
     std::unique_ptr<HybridPrefixCache> hybrid_;
+    // Physical staging outlives the tier: its worker settles before these buffers are destroyed.
+    std::optional<PinnedHostBuffer> hybrid_disk_block_staging_;
+    std::optional<PinnedHostBuffer> hybrid_disk_image_staging_;
+    std::optional<PinnedHostBuffer> hybrid_disk_tail_staging_;
     // Disk tier (null unless --disk-kv-path enabled the hybrid disk tier).
     std::unique_ptr<HybridDiskTier> hybrid_disk_;
     // Block payload slots the disk tier's staging holds, reserved out of the advertised Host

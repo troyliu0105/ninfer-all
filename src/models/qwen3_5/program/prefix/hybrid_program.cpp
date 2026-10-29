@@ -199,6 +199,7 @@ LoadSummary::DiskTierRestore ProgramImpl::attach_hybrid_disk_tier(
     const std::filesystem::path& directory, std::uint64_t capacity_bytes,
     std::string fingerprint) {
     if (hybrid_ == nullptr) { return {}; }
+    if (hybrid_disk_) { throw std::logic_error("hybrid disk tier was already attached"); }
     if (hybrid_disk_staging_blocks_ == 0) {
         // create_hybrid_prefix_cache reserved the staging out of the Host budget when the path
         // was configured; a tier with no block slot could never stage a block read.
@@ -215,8 +216,20 @@ LoadSummary::DiskTierRestore ProgramImpl::attach_hybrid_disk_tier(
     options.block_capacity_bytes = disk.block_bytes;
     options.image_capacity_bytes = disk.image_bytes;
     options.staging_blocks       = hybrid_disk_staging_blocks_;
-    hybrid_disk_ = std::make_unique<HybridDiskTier>(std::move(options),
-                                                    hybrid_->host_layout(), std::move(fingerprint));
+    const auto& host = hybrid_->host_layout();
+    hybrid_disk_block_staging_.emplace(options.staging_blocks * host.block_payload_bytes);
+    hybrid_disk_image_staging_.emplace(host.image_slabs * host.slab_bytes);
+    hybrid_disk_tail_staging_.emplace(host.block_payload_bytes);
+    HybridDiskTier::Staging staging{
+        {static_cast<std::byte*>(hybrid_disk_block_staging_->data()),
+         options.staging_blocks * host.block_payload_bytes},
+        {static_cast<std::byte*>(hybrid_disk_image_staging_->data()),
+         host.image_slabs * host.slab_bytes},
+        {static_cast<std::byte*>(hybrid_disk_tail_staging_->data()), host.block_payload_bytes}};
+    hybrid_disk_ = std::make_unique<HybridDiskTier>(
+        std::move(options),
+        HybridDiskTier::Layout{host.slab_bytes, host.block_payload_bytes, host.image_slabs},
+        staging, fingerprint);
     // The index's disk release callbacks must reach the catalog before anything can drop a record.
     hybrid_->attach_disk_tier(hybrid_disk_.get());
     const auto restored = hybrid_disk_->restore_into(hybrid_->index());
@@ -479,22 +492,14 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         const std::vector<VisionTokenRange> ranges =
             prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
-        });
-        const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
-        std::vector<std::size_t> order;
-        if (choice.candidate) { order.push_back(*choice.candidate); }
-        for (std::size_t i = 0; i < match.candidates.size(); ++i) {
-            if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
-        }
-        for (const std::size_t i : order) {
-            const pc::MatchCandidate& candidate = match.candidates[i];
             const std::span<const pc::NodeRef> path(match.path.data(), candidate.path_blocks);
-            if (fits(&candidate, path)) {
-                selected = candidate;
-                break;
-            }
-        }
+            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
+                   !fits(&candidate, path);
+        });
+        // Root participates in the same remaining-time comparison. Do not reinsert candidates
+        // the cost model rejected after it selected recomputation.
+        const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
+        if (choice.candidate) { selected = match.candidates[*choice.candidate]; }
     }
 
     HybridAdmissionQuote out;
@@ -1601,7 +1606,25 @@ void ProgramImpl::hybrid_disk_poll() {
         if (!landed.empty()) { hybrid_disk_->release_staged(landed); }
     }
     // Demotion after the bookkeeping: the completions it observes are current.
-    hybrid_disk_->maybe_demote(index, *hybrid_, device.stream, device.transfer_stream);
+    struct CopyContext {
+        HybridPrefixCache& cache;
+        cudaStream_t producer;
+        cudaStream_t transfer;
+    } copies{*hybrid_, device.stream, device.transfer_stream};
+    const HybridDiskTier::HostTransfers transfers{
+        &copies,
+        [](void* context, std::uint32_t slab) {
+            return static_cast<CopyContext*>(context)->cache.slab_bytes_of(slab);
+        },
+        [](void* context, pc::SnapshotRef snapshot) {
+            auto& copy = *static_cast<CopyContext*>(context);
+            return copy.cache.start_snapshot_host_write(snapshot, copy.producer, copy.transfer);
+        },
+        [](void* context, pc::NodeRef node) {
+            auto& copy = *static_cast<CopyContext*>(context);
+            copy.cache.start_block_host_writes({&node, 1}, copy.producer, copy.transfer, true);
+        }};
+    hybrid_disk_->maybe_demote(index, transfers);
 }
 
 std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPages& source,

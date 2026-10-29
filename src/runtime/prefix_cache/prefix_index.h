@@ -158,6 +158,7 @@ struct NodeView {
     CopyState host                     = CopyState::Absent;
     std::uint32_t disk_ref             = kNoId;
     CopyState disk                     = CopyState::Absent;
+    bool disk_invalidated = false; // an accepted fill must be discarded on completion
     std::uint32_t pins                 = 0;
     std::uint32_t live_snapshots_below = 0;
 };
@@ -174,6 +175,7 @@ struct SnapshotView {
     std::uint32_t disk_ref     = kNoId;
     CopyState disk             = CopyState::Absent;
     bool disk_committed        = false;
+    bool disk_invalidated = false;
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
@@ -300,7 +302,8 @@ public:
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
     // device-resident pinned node (write-through destination). Absent when no slab can be freed.
-    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
+    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node,
+                                                              bool disk_backfill = false);
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
     // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed.
@@ -336,8 +339,12 @@ public:
     void begin_node_disk_fill(NodeRef node, std::uint32_t disk_ref);
     // A failed or abandoned write returns the node to disk-Absent.
     void abort_node_disk_fill(NodeRef node);
-    // Returns a committed disk-backed snapshot's Host slabs to the tier: the disk closure
-    // keeps the image, tail and every anchor block durable, so the Host copy is a duplicate.
+    // A failed read invalidates only this record generation, including dependent persistent
+    // parent links. Valid volatile sources and accepted transfer leases remain owned.
+    void invalidate_disk_block(NodeRef node, std::uint32_t expected_record);
+    void invalidate_disk_snapshot(SnapshotRef snapshot, std::uint32_t expected_record);
+    // Releases a committed Host copy after its last source lease ends. A request made while
+    // pinned is remembered and completes at the final unpin.
     void release_snapshot_host_copy(SnapshotRef snapshot);
 
     // Reclaims unpinned disk records, dead closures first: superseded committed closures in
@@ -349,27 +356,19 @@ public:
     // the disk tier is disabled.
     std::uint32_t evict_disk_entries(std::uint32_t records);
 
-    // Unseals a full directory with no committed-snapshot victim: releases up to `count` pure
-    // block records (deepest-first along unbranched chains no live snapshot anchors on, unpinned
-    // and disk-Resident) through drop_node_disk_copy. Each release keeps the node valid through
-    // its volatile copies, so `begin_*_write` can reserve the freed slots again. A disk-only
-    // node is taken only at a leaf no snapshot anchors on (children, direct anchors and every
-    // below-count zero): its content reached no closure and no resume can ever read it, so the
-    // node goes with its record. Returns the number released.
+    // Unseals a full directory by releasing up to `count` unpinned, unreachable block records.
+    // All branches and suffixes beyond a live shallow snapshot are visited deepest-first.
+    // A parent yields only after its children hold no disk references; a node with no volatile
+    // copy is retired only when no snapshot can read its subtree.
     std::uint32_t release_disk_record_range(std::uint32_t count);
 
-    // Returns the Host slabs of `nodes` a committed disk closure has made redundant. A node keeps
-    // its Host copy while a live snapshot anchored below it still lacks a committed disk closure:
-    // only such a resume needs the volatile copy. Pinned nodes are skipped. The disk tier calls
-    // this when a demotion commits (docs/maintainer/hybrid-prefix-cache-disk-tier.md §4 step 4):
-    // it is the Host space the demotion set out to free. Returns the slabs released.
+    // A finished disk block is a valid mixed-tier source before its snapshot closes. Releasing
+    // its Host duplicate funds the next backfill; pinned sources defer release to their unpin.
     std::uint32_t release_redundant_host_copies(std::span<const NodeRef> nodes);
 
-    // Host-pressure demotion candidates: unpinned Host-resident snapshots without a committed
-    // disk closure, at most `count`. Superseded ones come first, oldest supersession first
-    // (their content is dead for the running lineages and a closure keeps it restartable);
-    // retained ones follow by ascending GDSF priority. The tier's cold-data choice (§4.2 step 3)
-    // layers its own superseded grace window on this order.
+    // Host-resident candidates precede complete Device-only images that need a Host refill.
+    // Within each group: superseded oldest first, then retained by GDSF. In-flight fills and
+    // pinned or invalidated snapshots never re-enter the queue.
     [[nodiscard]] std::vector<SnapshotRef>
     collect_demotion_candidates(std::uint32_t count) const;
 
@@ -459,6 +458,9 @@ private:
         std::uint32_t disk_ref   = kNoId;
         CopyState disk           = CopyState::Absent;
         std::uint32_t pins       = 0;
+        bool host_release_pending = false;
+        bool disk_invalidated = false;
+        bool invalidated = false;
         std::uint32_t live_below = 0;
         // Live snapshots anchored at or below this node whose disk closure is not committed: the
         // ones whose resume still needs this node's volatile copies (§4 dependency accounting).
@@ -486,6 +488,9 @@ private:
         CopyState disk                = CopyState::Absent;
         bool disk_committed           = false;
         std::uint32_t pins            = 0;
+        bool host_release_pending = false;
+        bool disk_invalidated = false;
+        bool invalidated = false;
         SnapshotKind kind             = SnapshotKind::Tap;
         std::uint32_t hits            = 0;
         double priority               = 0.0; // GDSF H = priority_base + F * C / Z
@@ -545,7 +550,8 @@ private:
     // slabs are free, but no retained snapshot with a priority above `claim`.
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
-                                      double claim = std::numeric_limits<double>::infinity());
+                                      double claim = std::numeric_limits<double>::infinity(),
+                                      std::uint32_t reserve = 0);
     void free_slab(std::uint32_t slab);
 
     void remove_snapshot(std::uint32_t snapshot);
@@ -578,6 +584,9 @@ private:
     void adjust_live(std::uint32_t anchor, int delta);
     // The same walk for undisked_below: a snapshot appearing, committing its closure or leaving.
     void adjust_undisked(std::uint32_t anchor, int delta);
+    void invalidate_snapshot_disk(std::uint32_t snapshot);
+    [[nodiscard]] bool subtree_pinned(std::uint32_t root) const noexcept;
+    void reap_invalidated();
     // Every Device residency and slot-state change goes through these so the gauges stats()
     // reports stay O(1): the Engine publishes statistics after every decode round.
     void set_device(Node& node, CopyState state) noexcept;
@@ -597,6 +606,8 @@ private:
 
     std::vector<Snapshot> snapshots_;
     std::vector<std::uint32_t> free_snapshots_;
+    std::vector<NodeRef> invalid_nodes_;
+    std::vector<SnapshotRef> invalid_snapshots_;
 
     std::vector<LruLink> lru_links_;
     std::array<LruList, 2> lru_{};

@@ -71,6 +71,22 @@ ninfer_add_test(ninfer_prefix_disk_catalog_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_disk_catalog.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_prefix_disk_worker_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_disk_worker.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_hybrid_disk_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_hybrid_disk_cpu.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_runtime_support)
+
+ninfer_add_test(ninfer_prefix_disk_crash_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_disk_crash.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_prefix_disk_reference_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_disk_reference.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_file_read_queue_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_read_queue.cpp"
   LIBRARIES ninfer_core)

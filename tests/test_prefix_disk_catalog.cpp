@@ -105,7 +105,7 @@ PrefixDiskCatalog& crash_session(const PrefixDiskCatalog::Options& options,
 // A committed closure: an anchor block, every image segment, a partial-block tail and the commit.
 std::uint32_t write_tailed_snapshot(PrefixDiskCatalog& catalog, std::uint32_t seed) {
     const std::uint32_t anchor = write_block(catalog, PrefixDiskCatalog::kNoRecord, seed);
-    const std::uint32_t snap   = catalog.begin_snapshot_write();
+    const std::uint32_t snap   = catalog.begin_snapshot_write(true);
     check(snap != PrefixDiskCatalog::kNoRecord, "snapshot reservation succeeds");
     for (std::uint32_t segment = 0; segment < kSegments; ++segment) {
         check(catalog.write_image_segment(snap, segment,
@@ -115,7 +115,7 @@ std::uint32_t write_tailed_snapshot(PrefixDiskCatalog& catalog, std::uint32_t se
     check(catalog.write_tail(snap, payload(kBlockBytes, seed + 3U)), "tail lands");
     PrefixDiskCatalog::SnapIdentityRec identity;
     identity.anchor   = anchor;
-    identity.frontier = 2U * kBlockTokens + 5U;
+    identity.frontier = kBlockTokens + 5U;
     identity.tail_len = 5;
     identity.kind     = SnapshotKind::Boundary;
     identity.hits     = seed;
@@ -155,7 +155,7 @@ void lifecycle_and_restart(const std::filesystem::path& root) {
               "block payload reads back byte for byte");
 
         // A snapshot closure: image segments plus a tail, then the commit.
-        snap = catalog.begin_snapshot_write();
+        snap = catalog.begin_snapshot_write(true);
         check(snap != PrefixDiskCatalog::kNoRecord, "snapshot reservation succeeds");
         check(catalog.write_image_segment(snap, 0, payload(kSegmentBytes, 3)),
               "image segment 0 lands");
@@ -305,7 +305,7 @@ void snapshot_removal(const std::filesystem::path& root) {
         PrefixDiskCatalog catalog(options_of(directory), geometry(), fingerprint);
         check(catalog.open(), "open");
         const std::uint32_t anchor = write_block(catalog, PrefixDiskCatalog::kNoRecord, 40);
-        snap                       = catalog.begin_snapshot_write();
+        snap                       = catalog.begin_snapshot_write(false);
         check(catalog.write_image_segment(snap, 0, payload(kSegmentBytes, 41)), "segment");
         check(catalog.write_image_segment(snap, 1, payload(kSegmentBytes, 42)), "segment");
         PrefixDiskCatalog::SnapIdentityRec identity;
@@ -384,11 +384,11 @@ void unjournaled_payload_alias(const std::filesystem::path& root) {
               "a fresh record never reuses a recovered id");
         const auto bytes = payload(kBlockBytes, 62);
         check(catalog.write_block(fresh, bytes), "the fresh payload lands");
+        catalog.finish_block(fresh, block_identity(PrefixDiskCatalog::kNoRecord, 62));
         std::vector<std::byte> read_back(kBlockBytes);
         catalog.read_block(fresh, read_back);
         check(std::memcmp(read_back.data(), bytes.data(), kBlockBytes) == 0,
               "a fresh record never reads the crashed write's bytes");
-        catalog.finish_block(fresh, block_identity(PrefixDiskCatalog::kNoRecord, 62));
     }
 }
 
@@ -408,7 +408,7 @@ void orphan_keys_recover_allocator(const std::filesystem::path& root) {
         PrefixDiskCatalog& catalog = crash_session(options, geometry(), fingerprint);
         const std::uint32_t block = catalog.begin_block_write();
         check(catalog.write_block(block, payload(kBlockBytes, 90)), "the block payload lands");
-        snap = catalog.begin_snapshot_write();
+        snap = catalog.begin_snapshot_write(true);
         check(snap != PrefixDiskCatalog::kNoRecord, "the snapshot reservation succeeds");
         check(catalog.write_image_segment(snap, 0, payload(kSegmentBytes, 91)),
               "the image segment lands");
@@ -430,11 +430,11 @@ void orphan_keys_recover_allocator(const std::filesystem::path& root) {
               "a fresh record never reuses a recovered id");
         const auto bytes = payload(kBlockBytes, 93);
         check(catalog.write_block(fresh, bytes), "the fresh payload lands");
+        catalog.finish_block(fresh, block_identity(PrefixDiskCatalog::kNoRecord, 93));
         std::vector<std::byte> read_back(kBlockBytes);
         catalog.read_block(fresh, read_back);
         check(std::memcmp(read_back.data(), bytes.data(), kBlockBytes) == 0,
               "the fresh record reads its own bytes");
-        catalog.finish_block(fresh, block_identity(PrefixDiskCatalog::kNoRecord, 93));
     }
 }
 
@@ -624,6 +624,118 @@ void checkpoint_journal_window(const std::filesystem::path& root) {
     covered_journal_replays_nothing();
 }
 
+void removal_failure_is_retryable(const std::filesystem::path& root) {
+    for (const bool image : {false, true}) {
+        const auto directory = root / (image ? "retry-image-removal" : "retry-block-removal");
+        const auto options = options_of(directory);
+        const std::string fingerprint = "retry-removal";
+        auto& catalog = crash_session(options, geometry(), fingerprint);
+        const auto ref = image ? write_tailed_snapshot(catalog, 101)
+                               : write_block(catalog, PrefixDiskCatalog::kNoRecord, 101);
+        catalog.checkpoint();
+        const auto before = catalog.stats();
+        const auto journal = directory / "catalog.journal";
+        check(std::filesystem::create_directory(journal), "inject a journal-open failure");
+        bool failed = false;
+        try { catalog.remove(ref); } catch (const std::exception&) { failed = true; }
+        check(failed, "failed journal publication must be observable");
+        check(catalog.stats().block_slots_free == before.block_slots_free &&
+                  catalog.stats().segment_slots_free == before.segment_slots_free,
+              "failed publication must not release a payload slot for reuse");
+        check(std::filesystem::remove(journal), "remove the injected filesystem fault");
+        catalog.remove(ref);
+        const auto after = catalog.stats();
+        check(after.block_slots_free == before.block_slots_free + 1 &&
+                  after.segment_slots_free == before.segment_slots_free + (image ? kSegments : 0),
+              "retry must actually remove the retained record and refund all of its capacity");
+        catalog.remove(ref);
+        check(catalog.stats().block_slots_free == after.block_slots_free,
+              "a completed removal must be idempotent");
+        PrefixDiskCatalog reopened(options, geometry(), fingerprint);
+        check(reopened.open(), "reopen without a shutdown checkpoint");
+        check(reopened.replayed_snapshots().empty() &&
+                  reopened.replayed_blocks().size() == (image ? 1U : 0U),
+              "journal replay must not resurrect either removed record");
+    }
+}
+
+void exact_tail_reservation_and_late_writes(const std::filesystem::path& root) {
+    auto options = options_of(root / "tail-reservation");
+    options.block_capacity_bytes = kBlockBytes;
+    PrefixDiskCatalog catalog(options, geometry(), "tail-reservation");
+    check(catalog.open(), "open exact one-block capacity");
+    const auto snapshot = catalog.begin_snapshot_write(true);
+    check(snapshot != PrefixDiskCatalog::kNoRecord && catalog.stats().block_slots_free == 0,
+          "accepting an image with a tail must reserve the tail before worker execution");
+    const auto next = catalog.stats().next_id;
+    check(catalog.begin_block_write() == PrefixDiskCatalog::kNoRecord &&
+              catalog.begin_snapshot_write(true) == PrefixDiskCatalog::kNoRecord &&
+              catalog.stats().next_id == next,
+          "capacity refusals consume neither an id nor another reservation");
+    check(catalog.write_image_segment(snapshot, 0, payload(kSegmentBytes, 102)), "image bytes land");
+    check(catalog.write_tail(snapshot, payload(kBlockBytes, 103)), "reserved tail bytes land");
+    catalog.abandon(snapshot);
+    check(catalog.stats().block_slots_free == 1 && catalog.stats().segment_slots_free == 16,
+          "abandon refunds both landed and unwritten reservation slots");
+    check(!catalog.write_image_segment(snapshot, 1, payload(kSegmentBytes, 104)) &&
+              !catalog.write_tail(snapshot, payload(kBlockBytes, 105)),
+          "late work must not recreate payload keys for an abandoned reservation");
+    const auto block = catalog.begin_block_write();
+    check(block != PrefixDiskCatalog::kNoRecord, "refunded block capacity can be reserved");
+    catalog.abandon(block);
+    check(!catalog.write_block(block, payload(kBlockBytes, 106)),
+          "a late block write must also reject the retired reservation");
+}
+
+void partial_closure_cannot_commit(const std::filesystem::path& root) {
+    PrefixDiskCatalog catalog(options_of(root / "partial-closure"), geometry(), "partial-closure");
+    check(catalog.open(), "open partial closure test");
+    const auto parent = write_block(catalog, PrefixDiskCatalog::kNoRecord, 107);
+    const auto snapshot = catalog.begin_snapshot_write(true);
+    check(catalog.write_image_segment(snapshot, 0, payload(kSegmentBytes, 108)), "first segment");
+    check(catalog.write_image_segment(snapshot, 0, payload(kSegmentBytes, 109)), "same segment again");
+    PrefixDiskCatalog::SnapIdentityRec identity;
+    identity.anchor = parent;
+    identity.frontier = kBlockTokens + 3;
+    identity.tail_len = 3;
+    auto rejected = [&] {
+        bool failed = false;
+        try { catalog.commit_snapshot(snapshot, identity); } catch (const std::exception&) { failed = true; }
+        check(failed && catalog.stats().committed == 0, "partial closures must never publish");
+    };
+    rejected();
+    check(catalog.write_image_segment(snapshot, 1, payload(kSegmentBytes, 110)), "second segment");
+    rejected(); // still no tail
+    check(catalog.write_tail(snapshot, payload(kBlockBytes, 111)), "tail");
+    catalog.commit_snapshot(snapshot, identity);
+    check(catalog.stats().committed == 1, "only the complete image, tail and ancestry may publish");
+}
+
+void missing_ancestry_prunes_replayed_closure(const std::filesystem::path& root) {
+    const auto options = options_of(root / "missing-ancestry");
+    {
+        PrefixDiskCatalog catalog(options, geometry(), "missing-ancestry");
+        check(catalog.open(), "open missing ancestry test");
+        const auto parent = write_block(catalog, PrefixDiskCatalog::kNoRecord, 112);
+        const auto child = write_block(catalog, parent, 113);
+        const auto snapshot = catalog.begin_snapshot_write(false);
+        for (std::uint32_t segment = 0; segment < kSegments; ++segment) {
+            check(catalog.write_image_segment(snapshot, segment, payload(kSegmentBytes, 114 + segment)),
+                  "land dependent image segment");
+        }
+        PrefixDiskCatalog::SnapIdentityRec identity;
+        identity.anchor = child;
+        identity.frontier = 2 * kBlockTokens;
+        catalog.commit_snapshot(snapshot, identity);
+        catalog.remove(parent); // replay must reject the surviving stale parent links
+    }
+    PrefixDiskCatalog catalog(options, geometry(), "missing-ancestry");
+    check(catalog.open(), "reopen missing ancestry test");
+    check(catalog.replayed_blocks().empty() && catalog.replayed_snapshots().empty() &&
+              catalog.stats().block_slots_free == 16 && catalog.stats().segment_slots_free == 16,
+          "replay must prune the entire invalid closure and reclaim every unreachable payload");
+}
+
 } // namespace
 
 int main() {
@@ -641,6 +753,10 @@ int main() {
         journal_append_after_torn_tail(root);
         tailed_snapshot_restart(root);
         checkpoint_journal_window(root);
+        removal_failure_is_retryable(root);
+        exact_tail_reservation_and_late_writes(root);
+        partial_closure_cannot_commit(root);
+        missing_ancestry_prunes_replayed_closure(root);
         std::filesystem::remove_all(root);
     } catch (const std::exception& error) {
         std::cerr << "prefix disk catalog test: " << error.what() << '\n';

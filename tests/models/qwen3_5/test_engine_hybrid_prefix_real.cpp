@@ -882,9 +882,10 @@ int exercise_disk_demotion(const char* artifact) {
     const Observed disk = run(options(1ULL << 30, true));
 
     int failures = 0;
-    if (disk.stats.hybrid_disk_demoted_blocks == 0) {
-        std::cerr << "disk-demotion: nothing was demoted (demoted="
-                  << disk.stats.hybrid_disk_demoted_blocks << ")\n";
+    if (disk.stats.hybrid_disk_demoted_blocks == 0 || disk.stats.hybrid_disk_demoted_images == 0) {
+        std::cerr << "disk-demotion: no complete disk closure was published (blocks="
+                  << disk.stats.hybrid_disk_demoted_blocks << " images="
+                  << disk.stats.hybrid_disk_demoted_images << ")\n";
         ++failures;
     }
     if (disk.stats.hybrid_disk_write_bytes == 0) {
@@ -941,8 +942,8 @@ int exercise_disk_restore(const char* artifact) {
     const ninfer::RuntimeStats stats = engine.runtime_stats();
 
     int failures = 0;
-    if (stats.hybrid_disk_demoted_blocks == 0) {
-        std::cerr << "disk-restore: nothing was demoted; the scenario did not run\n";
+    if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+        std::cerr << "disk-restore: no complete disk closure was published\n";
         ++failures;
         return failures;
     }
@@ -984,10 +985,10 @@ int exercise_disk_restart(const char* artifact) {
             saver.generate(saver.prepare_tokens(first), greedy(8)).generated_token_ids;
         (void)saver.generate(saver.prepare_tokens(pressure), greedy(4));
         (void)saver.generate(saver.prepare_tokens(pressure2), greedy(4));
-        const ninfer::RuntimeStats before = saver.runtime_stats();
         reference = saver.generate(saver.prepare_tokens(second), greedy(24)).generated_token_ids;
-        if (before.hybrid_disk_demoted_blocks == 0) {
-            std::cerr << "disk-restart: nothing was demoted; the scenario did not run\n";
+        const ninfer::RuntimeStats before = saver.runtime_stats();
+        if (before.hybrid_disk_demoted_blocks == 0 || before.hybrid_disk_demoted_images == 0) {
+            std::cerr << "disk-restart: no complete disk closure was published\n";
             return 1;
         }
     }
@@ -1065,7 +1066,7 @@ int exercise_disk_tail_restore(const char* artifact) {
     (void)engine.generate(engine.prepare_tokens(first), greedy(8));
     // Push the endpoint's closure to the disk tier and its Host copy out of the slab pool.
     for (std::uint32_t index = 0; index < 4; ++index) {
-        if (engine.runtime_stats().hybrid_disk_demoted_blocks != 0) { break; }
+        if (engine.runtime_stats().hybrid_disk_demoted_images != 0) { break; }
         (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, 42 + index)), greedy(4));
     }
     const ninfer::RuntimeStats demoted = engine.runtime_stats();
@@ -1074,8 +1075,8 @@ int exercise_disk_tail_restore(const char* artifact) {
     const ninfer::RuntimeStats stats = engine.runtime_stats();
 
     int failures = 0;
-    if (demoted.hybrid_disk_demoted_blocks == 0) {
-        std::cerr << "disk-tail-restore: nothing was demoted; the scenario did not run\n";
+    if (demoted.hybrid_disk_demoted_blocks == 0 || demoted.hybrid_disk_demoted_images == 0) {
+        std::cerr << "disk-tail-restore: no complete disk closure was published\n";
         ++failures;
         return failures;
     }
@@ -1122,14 +1123,14 @@ int exercise_disk_small_capacity(const char* artifact) {
         ninfer::Engine engine(options());
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         for (std::uint32_t index = 0; index < 4; ++index) {
-            if (engine.runtime_stats().hybrid_disk_demoted_blocks != 0) { break; }
+            if (engine.runtime_stats().hybrid_disk_demoted_images != 0) { break; }
             (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, 63 + index)),
                                   greedy(4));
         }
         expected = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
         const ninfer::RuntimeStats stats = engine.runtime_stats();
-        if (stats.hybrid_disk_demoted_blocks == 0) {
-            std::cerr << "disk-small-capacity: nothing was demoted; the scenario did not run\n";
+        if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+            std::cerr << "disk-small-capacity: no complete disk closure was published\n";
             return 1;
         }
         if (stats.hybrid_disk_write_bytes == 0) {
@@ -1191,8 +1192,8 @@ int exercise_disk_long_chain(const char* artifact) {
     const ninfer::RuntimeStats stats = engine.runtime_stats();
 
     int failures = 0;
-    if (stats.hybrid_disk_demoted_blocks == 0) {
-        std::cerr << "disk-long-chain: nothing was demoted; the scenario did not run\n";
+    if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+        std::cerr << "disk-long-chain: no complete disk closure was published\n";
         ++failures;
         return failures;
     }

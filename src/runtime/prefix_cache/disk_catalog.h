@@ -30,7 +30,12 @@
 // `has_tail` on replay.
 //
 // Threading: one I/O worker performs the writes and reads; the Engine worker owns metadata
-// decisions. An internal mutex keeps those two roles from interleaving half-updated state.
+// decisions. Two locks keep the roles from interleaving half-updated state. The metadata mutex
+// guards only the in-memory tables: find_block, the begin_* reservations and stats run under it
+// and never touch a store, a file or a syscall. The I/O mutex serializes every payload, journal
+// and checkpoint operation; I/O paths take the I/O mutex first and the metadata mutex inside it,
+// briefly, around their decisions. No metadata operation ever waits on payload, journal or
+// checkpoint I/O, and one lock order (I/O mutex, then metadata mutex) rules out deadlock.
 
 #include "runtime/prefix_cache/block_hash.h"
 #include "runtime/prefix_cache/prefix_index.h"
@@ -142,20 +147,27 @@ public:
     void abandon(std::uint32_t ref);
 
     // ---- snapshot closures ---------------------------------------------------------------------
-    // Reserves a snapshot record id. kNoRecord when neither capacity nor id space remains.
-    [[nodiscard]] std::uint32_t begin_snapshot_write();
+    // Reserves a snapshot record id, its image-segment slots and — when `has_tail` — the tail's
+    // block slot, all before any byte moves. kNoRecord when capacity or the id space is
+    // exhausted; a refused reservation consumes neither an id nor capacity.
+    [[nodiscard]] std::uint32_t begin_snapshot_write(bool has_tail);
     // False when the image store is full (the record stays reserved; abandon it).
     bool write_image_segment(std::uint32_t ref, std::uint32_t segment,
                              std::span<const std::byte> payload);
     bool write_tail(std::uint32_t ref, std::span<const std::byte> payload);
-    // Journals the closure and marks it committed (restartable). The anchor path, image
-    // segments and tail must have landed; their records must be finished/committed.
+    // Journals the closure and marks it committed (restartable). Verifies that the whole parent
+    // chain of the anchor is finished and not being removed, that every image segment has
+    // landed, and that the reserved tail (when there is one) has landed.
     void commit_snapshot(std::uint32_t ref, const SnapIdentityRec& identity);
-    // Removes a record and its payloads (a snapshot takes its image segments and tail with
-    // it). Journals the removal so a replay never resurrects it. No-op for unknown records.
+    // Removes a record and its payloads (a snapshot takes its image segments and tail with it).
+    // The removal is journaled before any payload or metadata is released, so a failed or
+    // interrupted removal is always retryable and a replay never resurrects the record. From the
+    // first call — even one whose journal append failed — the record is unfindable and unusable
+    // as a commit anchor. Retries are idempotent: a ref whose Remove record landed is cleaned up
+    // without publishing the removal twice. No-op for unknown records.
     void remove(std::uint32_t ref);
-    // Reclaims provisional (reserved, never finished) records: bounded abandoned-record
-    // collection (§6 step 5). Returns the number reclaimed.
+    // Reclaims provisional records after the I/O worker has stopped. Never call while accepted
+    // jobs can still publish: their reservations are live ownership, not abandoned records.
     std::uint32_t reclaim_abandoned();
 
     // ---- reads ----------------------------------------------------------------------------------
@@ -182,6 +194,11 @@ private:
         std::uint64_t sequence = 0;
         bool finished          = false;
         bool reserved          = false;
+        bool payload_landed    = false; // the bundle's bytes are in the store
+        // A removal was requested: unfindable and unusable as an anchor from now on. Whether
+        // its Remove journal record landed decides what a retry still has to do.
+        bool removing          = false;
+        bool removal_journaled = false;
     };
 
     struct SnapshotRecord {
@@ -190,7 +207,14 @@ private:
         std::uint64_t sequence = 0;
         bool committed         = false;
         bool reserved          = false;
+        bool tail_reserved     = false; // the tail's block slot was charged at begin
         bool has_tail          = false;
+        bool removing          = false;
+        bool removal_journaled = false;
+        // Image segments whose bytes are in the store: a bit set (segment < 256) plus its
+        // popcount, maintained under the metadata mutex.
+        std::array<std::uint64_t, 4> segment_mask{};
+        std::uint32_t segments_landed = 0;
     };
 
     enum class RecordKind : std::uint8_t { Block = 1, SnapshotCommit = 2, Remove = 3 };
@@ -202,11 +226,27 @@ private:
 
     class Store;
 
-    [[nodiscard]] std::uint32_t allocate_id();
-    // Appends one record and returns the journal sequence it was written under.
+    // Appends under io_mutex_, with no metadata lock held. Publication precedes a subsequent
+    // checkpoint_if_needed(), so every covered sequence is represented by the captured tables.
     [[nodiscard]] std::uint64_t journal_bytes(RecordKind kind, std::uint32_t ref, const void* body,
                                               std::size_t body_bytes);
-    void write_checkpoint_locked();
+    // Checkpointing runs under the I/O mutex in three steps: capture a consistent copy of the
+    // state under the metadata mutex, write the file with no lock held, then republish the
+    // journal counters. The republish keeps the journal when its sequence moved past the
+    // capture, so a checkpoint can never drop records it does not contain.
+    struct CheckpointCapture {
+        std::uint32_t next_id          = 0;
+        std::uint64_t covered_sequence = 0;
+        std::vector<BlockRecord> blocks;
+        std::vector<SnapshotRecord> snapshots;
+    };
+    [[nodiscard]] CheckpointCapture capture_checkpoint_locked();
+    void write_checkpoint_file(const CheckpointCapture& capture);
+    void publish_checkpoint_locked(std::uint64_t covered_sequence);
+    void checkpoint_if_needed();
+    // Memory-only erases, under mutex_, after the physical payload release has completed.
+    void erase_block_locked(std::uint32_t ref);
+    void erase_snapshot_locked(std::uint32_t ref);
     ReplayOutcome replay_stream(std::FILE* file, bool checkpoint, std::uint64_t* valid_bytes);
     // Recovers the allocator from the payload stores and reclaims the payloads that no replayed
     // record reaches, so a restart never reuses an id whose bytes survived the crash.
@@ -218,6 +258,10 @@ private:
     std::string fingerprint_;
 
     mutable std::mutex mutex_;
+    // Serializes journal appends, checkpoints, payload writes/reads, evictions and store index
+    // flushes. Runtime I/O runs on the single worker, but tests and destructors may race them,
+    // so every I/O path takes this lock. Always taken before the metadata mutex, never after.
+    mutable std::mutex io_mutex_;
     std::unique_ptr<Store> store_;
     std::unordered_map<std::uint32_t, BlockRecord> blocks_;
     std::unordered_map<std::uint32_t, SnapshotRecord> snapshots_;
@@ -232,6 +276,11 @@ private:
     std::uint64_t journal_since_ckpt_  = 0;
     std::uint64_t journal_valid_bytes_ = 0;
     std::uint64_t journal_sequence_    = 0;
+    // Reservation budgets, in slots per store, maintained from the record tables alone: each
+    // begin_* charges its reservation upfront and every erase refunds exactly that charge, so
+    // find/begin/stats never read the store's free count (which would wait behind store I/O).
+    std::uint32_t block_budget_   = 0;
+    std::uint32_t segment_budget_ = 0;
     bool opened_                       = false;
     bool foreign_                      = false;
     std::vector<ReplayedBlock> replayed_blocks_;

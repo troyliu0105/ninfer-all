@@ -233,10 +233,12 @@ PrefixDiskCatalog::PrefixDiskCatalog(Options options, Geometry geometry,
 }
 
 PrefixDiskCatalog::~PrefixDiskCatalog() {
-    std::lock_guard lock(mutex_);
+    std::lock_guard io_lock(io_mutex_);
     if (opened_ && !foreign_) {
         try {
-            write_checkpoint_locked();
+            const CheckpointCapture capture = capture_checkpoint_locked();
+            write_checkpoint_file(capture);
+            publish_checkpoint_locked(capture.covered_sequence);
             store_->flush();
         } catch (...) { // a destructor never throws
         }
@@ -252,11 +254,14 @@ void PrefixDiskCatalog::reset_state() {
     journal_since_ckpt_  = 0;
     journal_valid_bytes_ = 0;
     journal_sequence_    = 0;
+    block_budget_        = 0;
+    segment_budget_      = 0;
     replayed_blocks_.clear();
     replayed_snapshots_.clear();
 }
 
 bool PrefixDiskCatalog::open() {
+    std::lock_guard io_lock(io_mutex_);
     std::lock_guard lock(mutex_);
     reset_state();
 
@@ -335,6 +340,8 @@ bool PrefixDiskCatalog::open() {
         (void)has_tail;
         replayed_snapshots_.push_back(ReplayedSnapshot{ref, snapshots_.at(ref).identity});
     }
+    block_budget_ = store_->block_slots_free();
+    segment_budget_ = store_->segment_slots_free();
     opened_ = true;
     return true;
 }
@@ -348,47 +355,91 @@ bool PrefixDiskCatalog::open() {
 // surviving tail restores `has_tail` before reachability is decided, and a tail the crash lost
 // stays absent (a later read misses).
 void PrefixDiskCatalog::recover_payloads() {
-    auto next_above = [this](std::uint32_t ref) {
-        const std::uint64_t candidate = std::uint64_t{ref} + 1U;
-        if (candidate <= next_id_) { return; }
-        next_id_ = candidate >= kNoRecord ? kNoRecord : static_cast<std::uint32_t>(candidate);
-    };
-    std::uint32_t reclaimed = 0;
-    for (const DiskKVIdentity& key : store_->block_keys()) {
-        const auto decoded = Store::decode_key(key);
-        if (decoded && decoded->kind == Store::PayloadKey::Kind::Block) {
-            next_above(decoded->ref);
-            if (blocks_.contains(decoded->ref)) { continue; }
-            if (const auto snapshot = snapshots_.find(decoded->ref);
-                snapshot != snapshots_.end() && snapshot->second.identity.tail_len != 0) {
-                // The block-sized payload under a closure's id is its tail: nothing else
-                // persists that fact, so its presence restores has_tail for the read and
-                // removal paths.
-                snapshot->second.has_tail = true;
-                continue;
-            }
+    const auto block_keys = store_->block_keys();
+    const auto image_keys = store_->image_keys();
+    const auto next_above = [this](std::uint32_t ref) {
+        const auto next = std::uint64_t{ref} + 1;
+        if (next > next_id_) {
+            next_id_ = next >= kNoRecord ? kNoRecord : static_cast<std::uint32_t>(next);
         }
-        // No replayed record reaches this key: an interrupted write's payload, or a slot left by
-        // another geometry, whose bytes this format cannot name. Its id stays consumed above.
+    };
+    for (const auto& key : block_keys) {
+        const auto decoded = Store::decode_key(key);
+        if (!decoded || decoded->kind != Store::PayloadKey::Kind::Block) { continue; }
+        next_above(decoded->ref);
+        if (const auto block = blocks_.find(decoded->ref); block != blocks_.end()) {
+            block->second.payload_landed = true;
+        } else if (const auto snapshot = snapshots_.find(decoded->ref);
+                   snapshot != snapshots_.end() && snapshot->second.identity.tail_len != 0) {
+            snapshot->second.has_tail = true;
+        }
+    }
+    for (const auto& key : image_keys) {
+        const auto decoded = Store::decode_key(key);
+        if (!decoded || decoded->kind != Store::PayloadKey::Kind::Segment) { continue; }
+        next_above(decoded->ref);
+        const auto snapshot = snapshots_.find(decoded->ref);
+        if (snapshot == snapshots_.end() || decoded->segment >= geometry_.image_segments) { continue; }
+        const auto bit = std::uint64_t{1} << (decoded->segment % 64U);
+        auto& record = snapshot->second;
+        if ((record.segment_mask[decoded->segment / 64U] & bit) == 0) {
+            record.segment_mask[decoded->segment / 64U] |= bit;
+            ++record.segments_landed;
+        }
+    }
+    // Metadata whose payload or ancestry disappeared is a miss before the tree is rebuilt.
+    // Stable ids order parents before children, so one pass removes every broken descendant.
+    std::vector<std::uint32_t> ids;
+    ids.reserve(blocks_.size());
+    for (const auto& [ref, record] : blocks_) { (void)record; ids.push_back(ref); }
+    std::sort(ids.begin(), ids.end());
+    for (const auto ref : ids) {
+        const auto& record = blocks_.at(ref);
+        const auto parent = record.identity.parent;
+        if (!record.payload_landed ||
+            (parent != kNoRecord && (parent >= ref || !blocks_.contains(parent)))) {
+            blocks_.erase(ref);
+        }
+    }
+    for (auto& [ref, record] : snapshots_) {
+        (void)ref;
+        record.tail_reserved = record.identity.tail_len != 0;
+    }
+    std::erase_if(snapshots_, [&](const auto& item) {
+        const auto& record = item.second;
+        return record.identity.tail_len >= kBlockTokens ||
+               record.segments_landed != geometry_.image_segments ||
+               (record.tail_reserved && !record.has_tail) ||
+               (record.identity.anchor != kNoRecord && !blocks_.contains(record.identity.anchor));
+    });
+    std::uint32_t reclaimed = 0;
+    for (const auto& key : block_keys) {
+        const auto decoded = Store::decode_key(key);
+        if (decoded && decoded->kind == Store::PayloadKey::Kind::Block &&
+            (blocks_.contains(decoded->ref) ||
+             (snapshots_.contains(decoded->ref) && snapshots_.at(decoded->ref).has_tail))) { continue; }
         store_->drop_block_key(key);
         ++reclaimed;
     }
-    for (const DiskKVIdentity& key : store_->image_keys()) {
+    for (const auto& key : image_keys) {
         const auto decoded = Store::decode_key(key);
-        if (decoded && decoded->kind == Store::PayloadKey::Kind::Segment) {
-            next_above(decoded->ref);
-            if (snapshots_.contains(decoded->ref) &&
-                decoded->segment < geometry_.image_segments) {
-                continue;
-            }
+        if (decoded && decoded->kind == Store::PayloadKey::Kind::Segment &&
+            snapshots_.contains(decoded->ref) && decoded->segment < geometry_.image_segments) {
+            continue;
         }
         store_->drop_image_key(key);
         ++reclaimed;
+    }
+    children_.clear();
+    for (const auto& [ref, record] : blocks_) {
+        children_[std::uint64_t{record.identity.parent} << 40U ^ record.identity.lookup_hash]
+            .push_back(ref);
     }
     if (reclaimed != 0) { store_->flush(); }
 }
 
 void PrefixDiskCatalog::wipe() {
+    std::lock_guard io_lock(io_mutex_);
     std::lock_guard lock(mutex_);
     store_.reset();
     std::error_code error;
@@ -400,13 +451,11 @@ void PrefixDiskCatalog::wipe() {
     reset_state();
     store_   = std::make_unique<Store>(options_, geometry_);
     foreign_ = false;
+    block_budget_ = store_->block_slots_free();
+    segment_budget_ = store_->segment_slots_free();
     opened_  = true;
 }
 
-std::uint32_t PrefixDiskCatalog::allocate_id() {
-    if (next_id_ == kNoRecord) { throw std::runtime_error("disk catalog id space exhausted"); }
-    return next_id_++;
-}
 
 std::optional<std::uint32_t> PrefixDiskCatalog::find_block(std::uint32_t parent,
                                                            std::uint64_t lookup_hash,
@@ -418,7 +467,9 @@ std::optional<std::uint32_t> PrefixDiskCatalog::find_block(std::uint32_t parent,
     if (family == children_.end()) { return std::nullopt; }
     for (const std::uint32_t ref : family->second) {
         const auto record = blocks_.find(ref);
-        if (record == blocks_.end() || !record->second.finished) { continue; }
+        if (record == blocks_.end() || !record->second.finished || record->second.removing) {
+            continue;
+        }
         const BlockIdentityRec& identity = record->second.identity;
         if (identity.parent != parent || identity.lookup_hash != lookup_hash ||
             identity.extra != extra ||
@@ -432,165 +483,283 @@ std::optional<std::uint32_t> PrefixDiskCatalog::find_block(std::uint32_t parent,
 
 std::uint32_t PrefixDiskCatalog::begin_block_write() {
     std::lock_guard lock(mutex_);
-    std::uint32_t outstanding = 0;
-    for (const auto& [ref, record] : blocks_) {
-        (void)ref;
-        if (record.reserved && !record.finished) { ++outstanding; }
-    }
-    if (outstanding >= store_->block_slots_free()) { return kNoRecord; }
-    const std::uint32_t ref = allocate_id();
-    blocks_[ref]            = BlockRecord{.id = ref, .reserved = true};
+    if (block_budget_ == 0 || next_id_ == kNoRecord) { return kNoRecord; }
+    const std::uint32_t ref = next_id_;
+    BlockRecord record;
+    record.id = ref;
+    record.reserved = true;
+    blocks_.emplace(ref, record);
+    ++next_id_;
+    --block_budget_;
     return ref;
 }
 
 bool PrefixDiskCatalog::write_block(std::uint32_t ref, std::span<const std::byte> payload) {
-    std::lock_guard lock(mutex_);
-    return store_->write_block(ref, payload);
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = blocks_.find(ref);
+        if (record == blocks_.end() || !record->second.reserved || record->second.removing) {
+            return false;
+        }
+    }
+    const bool landed = store_->write_block(ref, payload);
+    if (landed) {
+        std::lock_guard lock(mutex_);
+        blocks_.at(ref).payload_landed = true;
+    }
+    return landed;
 }
 
 void PrefixDiskCatalog::finish_block(std::uint32_t ref, const BlockIdentityRec& identity) {
-    std::lock_guard lock(mutex_);
-    const auto record = blocks_.find(ref);
-    if (record == blocks_.end() || !record->second.reserved) {
-        throw std::runtime_error("disk catalog finishes an unknown block record");
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = blocks_.find(ref);
+        if (record == blocks_.end() || !record->second.reserved || record->second.removing ||
+            !record->second.payload_landed) {
+            throw std::runtime_error("disk catalog finishes an unknown or unwritten block");
+        }
+        if (identity.parent != kNoRecord) {
+            const auto parent = blocks_.find(identity.parent);
+            if (identity.parent >= ref || parent == blocks_.end() ||
+                !parent->second.finished || parent->second.removing) {
+                throw std::runtime_error("disk catalog block lacks its finished parent");
+            }
+        }
+        // Allocate the lookup entry before the journal append. Unfinished entries are never
+        // findable, and retries do not accumulate duplicates.
+        auto& family = children_[std::uint64_t{identity.parent} << 40U ^ identity.lookup_hash];
+        if (std::find(family.begin(), family.end(), ref) == family.end()) { family.push_back(ref); }
+        record->second.identity = identity;
     }
-    record->second.identity = identity;
-    record->second.finished = true;
-    record->second.reserved = false;
-    children_[std::uint64_t{identity.parent} << 40U ^ identity.lookup_hash].push_back(ref);
-    record->second.sequence = journal_bytes(RecordKind::Block, ref, &record->second.identity,
-                                            sizeof(record->second.identity));
+    const auto sequence = journal_bytes(RecordKind::Block, ref, &identity, sizeof(identity));
+    {
+        std::lock_guard lock(mutex_);
+        auto& record = blocks_.at(ref);
+        record.sequence = sequence;
+        record.finished = true;
+        record.reserved = false;
+    }
+    checkpoint_if_needed();
+}
+
+void PrefixDiskCatalog::erase_block_locked(std::uint32_t ref) {
+    const auto record = blocks_.find(ref);
+    if (record == blocks_.end()) { return; }
+    const auto& identity = record->second.identity;
+    const auto family = children_.find(std::uint64_t{identity.parent} << 40U ^ identity.lookup_hash);
+    if (family != children_.end()) {
+        std::erase(family->second, ref);
+        if (family->second.empty()) { children_.erase(family); }
+    }
+    blocks_.erase(record);
+    ++block_budget_;
+}
+
+void PrefixDiskCatalog::erase_snapshot_locked(std::uint32_t ref) {
+    const auto record = snapshots_.find(ref);
+    if (record == snapshots_.end()) { return; }
+    if (record->second.tail_reserved) { ++block_budget_; }
+    segment_budget_ += geometry_.image_segments;
+    snapshots_.erase(record);
 }
 
 void PrefixDiskCatalog::abandon(std::uint32_t ref) {
+    std::lock_guard io_lock(io_mutex_);
+    bool block = false;
+    bool tail = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto record = blocks_.find(ref); record != blocks_.end()) {
+            if (record->second.finished || record->second.removing) { return; }
+            block = true;
+        } else if (const auto record = snapshots_.find(ref); record != snapshots_.end()) {
+            if (record->second.committed || record->second.removing) { return; }
+            tail = record->second.tail_reserved;
+        } else { return; }
+    }
+    if (block) { store_->evict_block(ref); }
+    else { store_->evict_snapshot(ref, geometry_.image_segments, tail); }
     std::lock_guard lock(mutex_);
-    if (const auto record = blocks_.find(ref);
-        record != blocks_.end() && !record->second.finished) {
-        store_->evict_block(ref);
-        blocks_.erase(record);
-        return;
-    }
-    if (const auto snapshot = snapshots_.find(ref);
-        snapshot != snapshots_.end() && !snapshot->second.committed) {
-        store_->evict_snapshot(ref, geometry_.image_segments, snapshot->second.has_tail);
-        snapshots_.erase(snapshot);
-    }
+    if (block) { erase_block_locked(ref); }
+    else { erase_snapshot_locked(ref); }
 }
 
-std::uint32_t PrefixDiskCatalog::begin_snapshot_write() {
+std::uint32_t PrefixDiskCatalog::begin_snapshot_write(bool has_tail) {
     std::lock_guard lock(mutex_);
-    std::uint32_t outstanding = 0;
-    for (const auto& [ref, record] : snapshots_) {
-        (void)ref;
-        if (record.reserved && !record.committed) { ++outstanding; }
-    }
-    if (store_->segment_slots_free() <
-        (outstanding + 1U) * geometry_.image_segments) {
-        return kNoRecord;
-    }
-    const std::uint32_t ref = allocate_id();
-    snapshots_[ref]         = SnapshotRecord{.id = ref, .reserved = true};
+    if (segment_budget_ < geometry_.image_segments || (has_tail && block_budget_ == 0) ||
+        next_id_ == kNoRecord) { return kNoRecord; }
+    const auto ref = next_id_;
+    SnapshotRecord record;
+    record.id = ref;
+    record.reserved = true;
+    record.tail_reserved = has_tail;
+    snapshots_.emplace(ref, record);
+    ++next_id_;
+    segment_budget_ -= geometry_.image_segments;
+    if (has_tail) { --block_budget_; }
     return ref;
 }
 
 bool PrefixDiskCatalog::write_image_segment(std::uint32_t ref, std::uint32_t segment,
                                             std::span<const std::byte> payload) {
-    std::lock_guard lock(mutex_);
     if (segment >= geometry_.image_segments) {
         throw std::out_of_range("disk catalog image segment index");
     }
-    return store_->write_segment(ref, segment, payload);
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = snapshots_.find(ref);
+        if (record == snapshots_.end() || !record->second.reserved || record->second.removing) {
+            return false;
+        }
+    }
+    const bool landed = store_->write_segment(ref, segment, payload);
+    if (landed) {
+        std::lock_guard lock(mutex_);
+        auto& record = snapshots_.at(ref);
+        const auto bit = std::uint64_t{1} << (segment % 64U);
+        if ((record.segment_mask[segment / 64U] & bit) == 0) {
+            record.segment_mask[segment / 64U] |= bit;
+            ++record.segments_landed;
+        }
+    }
+    return landed;
 }
 
 bool PrefixDiskCatalog::write_tail(std::uint32_t ref, std::span<const std::byte> payload) {
-    std::lock_guard lock(mutex_);
-    const auto record = snapshots_.find(ref);
-    if (record == snapshots_.end()) { return false; }
-    if (!store_->write_block(ref, payload)) { return false; }
-    record->second.has_tail = true;
-    return true;
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = snapshots_.find(ref);
+        if (record == snapshots_.end() || !record->second.reserved ||
+            !record->second.tail_reserved || record->second.removing) { return false; }
+    }
+    const bool landed = store_->write_block(ref, payload);
+    if (landed) {
+        std::lock_guard lock(mutex_);
+        snapshots_.at(ref).has_tail = true;
+    }
+    return landed;
 }
 
 void PrefixDiskCatalog::commit_snapshot(std::uint32_t ref, const SnapIdentityRec& identity) {
-    std::lock_guard lock(mutex_);
-    const auto record = snapshots_.find(ref);
-    if (record == snapshots_.end() || !record->second.reserved) {
-        throw std::runtime_error("disk catalog commits an unknown snapshot record");
-    }
-    if (identity.anchor != kNoRecord) {
-        const auto anchor = blocks_.find(identity.anchor);
-        if (anchor == blocks_.end() || !anchor->second.finished) {
-            throw std::runtime_error("disk catalog snapshot commit lacks its anchor record");
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = snapshots_.find(ref);
+        if (record == snapshots_.end() || !record->second.reserved || record->second.removing ||
+            record->second.segments_landed != geometry_.image_segments ||
+            record->second.tail_reserved != (identity.tail_len != 0) ||
+            (record->second.tail_reserved && !record->second.has_tail)) {
+            throw std::runtime_error("disk catalog commits an incomplete snapshot");
         }
+        for (auto ancestor = identity.anchor; ancestor != kNoRecord;) {
+            const auto node = blocks_.find(ancestor);
+            if (node == blocks_.end() || !node->second.finished || node->second.removing) {
+                throw std::runtime_error("disk catalog snapshot lacks its finished anchor chain");
+            }
+            ancestor = node->second.identity.parent;
+        }
+        record->second.identity = identity;
     }
-    record->second.identity = identity;
-    record->second.committed = true;
-    record->second.reserved  = false;
-    record->second.sequence  = journal_bytes(RecordKind::SnapshotCommit, ref,
-                                             &record->second.identity,
-                                             sizeof(record->second.identity));
+    const auto sequence = journal_bytes(RecordKind::SnapshotCommit, ref, &identity, sizeof(identity));
+    {
+        std::lock_guard lock(mutex_);
+        auto& record = snapshots_.at(ref);
+        record.sequence = sequence;
+        record.committed = true;
+        record.reserved = false;
+    }
+    checkpoint_if_needed();
 }
 
 void PrefixDiskCatalog::remove(std::uint32_t ref) {
-    std::lock_guard lock(mutex_);
-    if (const auto record = blocks_.find(ref); record != blocks_.end()) {
-        store_->evict_block(ref);
-        const BlockIdentityRec& identity = record->second.identity;
-        if (const auto family =
-                children_.find(std::uint64_t{identity.parent} << 40U ^ identity.lookup_hash);
-            family != children_.end()) {
-            std::erase(family->second, ref);
-        }
-        blocks_.erase(record);
-        (void)journal_bytes(RecordKind::Remove, ref, nullptr, 0);
-        return;
+    std::lock_guard io_lock(io_mutex_);
+    bool block = false;
+    bool tail = false;
+    bool journaled = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto record = blocks_.find(ref); record != blocks_.end()) {
+            record->second.removing = true;
+            journaled = record->second.removal_journaled;
+            block = true;
+        } else if (const auto record = snapshots_.find(ref); record != snapshots_.end()) {
+            record->second.removing = true;
+            journaled = record->second.removal_journaled;
+            tail = record->second.tail_reserved;
+        } else { return; }
     }
-    if (const auto snapshot = snapshots_.find(ref); snapshot != snapshots_.end()) {
-        store_->evict_snapshot(ref, geometry_.image_segments, snapshot->second.has_tail);
-        snapshots_.erase(snapshot);
+    if (!journaled) {
         (void)journal_bytes(RecordKind::Remove, ref, nullptr, 0);
+        std::lock_guard lock(mutex_);
+        if (block) { blocks_.at(ref).removal_journaled = true; }
+        else { snapshots_.at(ref).removal_journaled = true; }
     }
+    if (block) { store_->evict_block(ref); }
+    else { store_->evict_snapshot(ref, geometry_.image_segments, tail); }
+    {
+        std::lock_guard lock(mutex_);
+        if (block) { erase_block_locked(ref); }
+        else { erase_snapshot_locked(ref); }
+    }
+    checkpoint_if_needed();
 }
 
 std::uint32_t PrefixDiskCatalog::reclaim_abandoned() {
-    std::lock_guard lock(mutex_);
-    std::uint32_t reclaimed = 0;
-    for (auto it = blocks_.begin(); it != blocks_.end();) {
-        if (it->second.reserved && !it->second.finished) {
-            store_->evict_block(it->first);
-            it = blocks_.erase(it);
-            ++reclaimed;
-            continue;
+    // Only the stopped executor may call this bulk operation. Runtime abandonment names the
+    // exact record explicitly, so an accepted job's reservation can never be swept away.
+    std::vector<std::uint32_t> records;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [ref, record] : blocks_) {
+            if (record.reserved && !record.finished) { records.push_back(ref); }
         }
-        ++it;
-    }
-    for (auto it = snapshots_.begin(); it != snapshots_.end();) {
-        if (it->second.reserved && !it->second.committed) {
-            store_->evict_snapshot(it->first, geometry_.image_segments, it->second.has_tail);
-            it = snapshots_.erase(it);
-            ++reclaimed;
-            continue;
+        for (const auto& [ref, record] : snapshots_) {
+            if (record.reserved && !record.committed) { records.push_back(ref); }
         }
-        ++it;
     }
-    return reclaimed;
+    for (const auto ref : records) { abandon(ref); }
+    return static_cast<std::uint32_t>(records.size());
 }
 
 void PrefixDiskCatalog::read_block(std::uint32_t ref, std::span<std::byte> out) const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = blocks_.find(ref);
+        if (record == blocks_.end() || !record->second.finished || record->second.removing) {
+            throw std::runtime_error("disk catalog block is unavailable");
+        }
+    }
     store_->read_block(ref, out);
 }
 
 void PrefixDiskCatalog::read_image_segment(std::uint32_t ref, std::uint32_t segment,
                                            std::span<std::byte> out) const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = snapshots_.find(ref);
+        if (record == snapshots_.end() || !record->second.committed || record->second.removing ||
+            segment >= geometry_.image_segments) {
+            throw std::runtime_error("disk catalog image is unavailable");
+        }
+    }
     store_->read_segment(ref, segment, out);
 }
 
 void PrefixDiskCatalog::read_tail(std::uint32_t ref, std::span<std::byte> out) const {
-    std::lock_guard lock(mutex_);
-    if (!snapshots_.at(ref).has_tail) {
-        throw std::runtime_error("disk catalog snapshot has no tail record");
+    std::lock_guard io_lock(io_mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        const auto record = snapshots_.find(ref);
+        if (record == snapshots_.end() || !record->second.committed || record->second.removing ||
+            !record->second.has_tail) {
+            throw std::runtime_error("disk catalog tail is unavailable");
+        }
     }
     store_->read_block(ref, out);
 }
@@ -598,7 +767,7 @@ void PrefixDiskCatalog::read_tail(std::uint32_t ref, std::span<std::byte> out) c
 bool PrefixDiskCatalog::has_tail(std::uint32_t ref) const {
     std::lock_guard lock(mutex_);
     const auto record = snapshots_.find(ref);
-    return record != snapshots_.end() && record->second.has_tail;
+    return record != snapshots_.end() && !record->second.removing && record->second.has_tail;
 }
 
 const std::vector<PrefixDiskCatalog::ReplayedBlock>&
@@ -626,16 +795,24 @@ PrefixDiskCatalog::DiskCatalogStats PrefixDiskCatalog::stats() const {
         if (record.committed) { ++out.committed; }
         if (record.reserved && !record.committed) { ++out.abandoned; }
     }
-    out.block_slots_free   = store_->block_slots_free();
-    out.segment_slots_free = store_->segment_slots_free();
+    // The budgets are the reservations' own accounting: exactly the store slots the record
+    // tables hold from their reservations. Reading the store would wait behind payload I/O,
+    // which metadata callers (Engine find/reserve/stats) must never do.
+    out.block_slots_free   = block_budget_;
+    out.segment_slots_free = segment_budget_;
     out.journal_records    = journal_records_;
     out.next_id            = next_id_;
     return out;
 }
 
 void PrefixDiskCatalog::checkpoint() {
-    std::lock_guard lock(mutex_);
-    write_checkpoint_locked();
+    // I/O mutex across the whole operation; the metadata mutex only around the capture and the
+    // journal republish. The state written is a consistent snapshot; records journaled after the
+    // capture keep the journal alive so no sequence is dropped between checkpoint and journal.
+    std::lock_guard io_lock(io_mutex_);
+    const CheckpointCapture capture = capture_checkpoint_locked();
+    write_checkpoint_file(capture);
+    publish_checkpoint_locked(capture.covered_sequence);
     store_->flush();
 }
 
@@ -643,6 +820,9 @@ void PrefixDiskCatalog::checkpoint() {
 
 std::uint64_t PrefixDiskCatalog::journal_bytes(RecordKind kind, std::uint32_t ref, const void* body,
                                                std::size_t body_bytes) {
+    // Caller holds io_mutex_ (never the metadata mutex): the append is real I/O. Counter
+    // updates take the metadata mutex briefly; the automatic checkpoint runs inside the same
+    // I/O serialization so no second journal appender can interleave.
     if (!opened_ || foreign_) {
         throw std::runtime_error("disk catalog writes before a successful open");
     }
@@ -679,7 +859,11 @@ std::uint64_t PrefixDiskCatalog::journal_bytes(RecordKind kind, std::uint32_t re
     // The sequence only ever grows and a checkpoint stores its current value, so every record that
     // landed before that checkpoint is at or below it, and the journal it covers replays as
     // covered. A write that fails still consumes its sequence, which only widens that margin.
-    const std::uint64_t sequence = ++journal_sequence_;
+    std::uint64_t sequence = 0;
+    {
+        std::lock_guard lock(mutex_);
+        sequence = ++journal_sequence_;
+    }
     const std::uint32_t crc =
         body_bytes != 0 ? DiskKVStore::crc32(std::span<const std::byte>(
                               static_cast<const std::byte*>(body), body_bytes))
@@ -695,17 +879,53 @@ std::uint64_t PrefixDiskCatalog::journal_bytes(RecordKind kind, std::uint32_t re
                     write_all(file, &crc, 4U) && std::fflush(file) == 0;
     std::fclose(file);
     if (!ok) { throw std::runtime_error("disk catalog journal write failed"); }
-    journal_valid_bytes_ = record_offset + kRecordPrefixBytes + body_bytes + 4U;
-    ++journal_records_;
-    if (++journal_since_ckpt_ >= options_.journal_flush_records) {
-        write_checkpoint_locked();
-        store_->flush();
+    {
+        std::lock_guard lock(mutex_);
+        journal_valid_bytes_ = record_offset + kRecordPrefixBytes + body_bytes + 4U;
+        ++journal_records_;
+        ++journal_since_ckpt_;
     }
     return sequence;
 }
 
-void PrefixDiskCatalog::write_checkpoint_locked() {
-    const std::filesystem::path path     = checkpoint_path(options_.directory);
+void PrefixDiskCatalog::checkpoint_if_needed() {
+    {
+        std::lock_guard lock(mutex_);
+        if (journal_since_ckpt_ < options_.journal_flush_records) { return; }
+    }
+    const auto capture = capture_checkpoint_locked();
+    write_checkpoint_file(capture);
+    publish_checkpoint_locked(capture.covered_sequence);
+    store_->flush();
+}
+
+PrefixDiskCatalog::CheckpointCapture PrefixDiskCatalog::capture_checkpoint_locked() {
+    CheckpointCapture capture;
+    {
+        std::lock_guard lock(mutex_);
+        capture.next_id = next_id_;
+        capture.covered_sequence = journal_sequence_;
+        capture.blocks.reserve(blocks_.size());
+        for (const auto& [ref, record] : blocks_) {
+            (void)ref;
+            if (record.finished && !record.removing) { capture.blocks.push_back(record); }
+        }
+        capture.snapshots.reserve(snapshots_.size());
+        for (const auto& [ref, record] : snapshots_) {
+            (void)ref;
+            if (record.committed && !record.removing) { capture.snapshots.push_back(record); }
+        }
+    }
+    std::sort(capture.blocks.begin(), capture.blocks.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    std::sort(capture.snapshots.begin(), capture.snapshots.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    return capture;
+}
+
+void PrefixDiskCatalog::write_checkpoint_file(const CheckpointCapture& capture) {
+    // Caller holds io_mutex_, never the metadata mutex: this is pure disk work.
+    const std::filesystem::path path      = checkpoint_path(options_.directory);
     const std::filesystem::path temporary = path.string() + ".tmp";
     std::FILE* file = std::fopen(temporary.string().c_str(), "wb");
     if (file == nullptr) {
@@ -717,10 +937,11 @@ void PrefixDiskCatalog::write_checkpoint_locked() {
     std::memcpy(head.data() + 8, &kFormatVersion, 4U);
     const std::uint32_t length = static_cast<std::uint32_t>(fingerprint.size());
     std::memcpy(head.data() + 12, &length, 4U);
-    const std::uint32_t next_id = next_id_;
-    // The state below reflects every journal record up to `journal_sequence_`; a stale journal
-    // left by an interrupted replacement replays those as covered instead of applying them again.
-    const std::uint64_t covered_sequence = journal_sequence_;
+    const std::uint32_t next_id = capture.next_id;
+    // The state below reflects every journal record up to the captured covered sequence; a stale
+    // journal left by an interrupted replacement replays those as covered instead of applying
+    // them again.
+    const std::uint64_t covered_sequence = capture.covered_sequence;
     bool ok = write_all(file, head.data(), head.size()) &&
               write_all(file, fingerprint.data(), fingerprint.size()) &&
               write_all(file, &next_id, 4U) && write_all(file, &covered_sequence, 8U);
@@ -739,17 +960,13 @@ void PrefixDiskCatalog::write_checkpoint_locked() {
         ok = ok && write_all(file, prefix.data(), prefix.size()) &&
              (body_bytes == 0 || write_all(file, body, body_bytes)) && write_all(file, &crc, 4U);
     };
-    for (const auto& [ref, record] : blocks_) {
-        if (record.finished) {
-            emit(RecordKind::Block, ref, record.sequence, &record.identity,
-                 sizeof(record.identity));
-        }
+    for (const auto& record : capture.blocks) {
+        emit(RecordKind::Block, record.id, record.sequence, &record.identity,
+             sizeof(record.identity));
     }
-    for (const auto& [ref, record] : snapshots_) {
-        if (record.committed) {
-            emit(RecordKind::SnapshotCommit, ref, record.sequence, &record.identity,
-                 sizeof(record.identity));
-        }
+    for (const auto& record : capture.snapshots) {
+        emit(RecordKind::SnapshotCommit, record.id, record.sequence, &record.identity,
+             sizeof(record.identity));
     }
     ok = ok && std::fflush(file) == 0;
     std::fclose(file);
@@ -764,8 +981,18 @@ void PrefixDiskCatalog::write_checkpoint_locked() {
         std::filesystem::remove(temporary, error);
         throw std::runtime_error("cannot replace " + path.string() + ": " + error.message());
     }
-    // The checkpoint covers everything: the journal restarts empty.
+}
+
+void PrefixDiskCatalog::publish_checkpoint_locked(std::uint64_t covered_sequence) {
+    // Caller holds io_mutex_; the metadata mutex comes up only for the counter updates. When
+    // journal records landed between the capture and this republish, the new checkpoint does not
+    // contain them: keeping the journal (and its later records appending behind the covered
+    // prefix) is what stops the checkpoint from dropping sequences it never stored.
+    // io_mutex_ excludes appenders. The unlink itself must not hold the Engine's metadata lock.
+    std::error_code error;
     std::filesystem::remove(journal_path(options_.directory), error);
+    std::lock_guard lock(mutex_);
+    if (journal_sequence_ > covered_sequence) { return; }
     journal_records_     = 0;
     journal_since_ckpt_  = 0;
     journal_valid_bytes_ = 0;
