@@ -1,4 +1,5 @@
 #include "guarded_main.h"
+#include "artifact/reader.h"
 #include "core/device.h"
 #include "cuda_availability.h"
 #include "models/qwen3_5/load.h"
@@ -39,10 +40,16 @@ int run() {
         }
         CUDA_CHECK(status);
         ninfer::DeviceContext device;
+        ninfer::artifact::Reader reader(artifact);
+        // Low-level load options name a resolved head, and the engine's Auto contract is the
+        // artifact's optimized proposal head when it stores one (model_instance.cpp): resolve
+        // against the artifact the same way instead of forcing Optimized onto Full-only ones.
         ninfer::models::LoadOptions selected;
         selected.vision        = true;
         selected.speculative   = ninfer::SpeculativeBackend::Mtp;
-        selected.proposal_head = ninfer::ProposalHead::Optimized;
+        selected.proposal_head = reader.directory().component("text").proposal.has_value()
+                                     ? ninfer::ProposalHead::Optimized
+                                     : ninfer::ProposalHead::Full;
         auto model             = qwen::load_model(artifact, selected, device);
         const qwen::execution::Parameters parameters(*model);
         const auto capacity = [&](std::uint32_t max_context) {
@@ -53,7 +60,7 @@ int run() {
             options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
             options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
             options.speculative.draft_tokens         = 3;
-            options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+            options.speculative.proposal_head        = selected.proposal_head;
             options.enable_vision                    = true;
             options.use_cuda_graph                   = false;
             options.context_cache.device_state_slots = 1;

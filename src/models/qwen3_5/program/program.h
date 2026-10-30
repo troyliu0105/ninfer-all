@@ -1273,6 +1273,10 @@ public:
     [[nodiscard]] bool hybrid_prepare_progress();
     [[nodiscard]] bool hybrid_prepare_pending() const noexcept;
     void hybrid_prepare_abandon(std::uint64_t publication_order) noexcept;
+    // Started disk-tier demotion or record removals are still in flight; the Engine worker
+    // keeps stepping while this holds so completions are adopted and pressure drains without
+    // a request.
+    [[nodiscard]] bool hybrid_retention_pending() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);

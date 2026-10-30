@@ -113,6 +113,10 @@ Gateway 是 CLI、HTTP server 或其他产品入口，拥有：
 - response schema、usage 和产品侧错误；
 - Gateway 自身的并发与连接生命周期。
 
+`src/media/decode/` 解码调用者已拥有的字节；成功和异常路径都释放临时 codec、format 与 IO
+资源，返回的 owning RGB/帧数据归调用者。自定义 FFmpeg AVIO 的当前 buffer 由 decoder
+释放；libavformat 在探测或读取时替换 buffer，不改变这一所有权。
+
 Gateway 不选择请求顺序、缓存来源、active lane 或 KV page。
 
 ### 2.2 Frontend
@@ -247,6 +251,11 @@ arena 中除空闲 KV 页之外的字节复制到 host（`DeviceSnapshot`），�
 时的 direct-I/O 路径重新上传）或 host 副本恢复权重，再写回 persistent 字节。workspace 在请求之间不承载
 状态，恢复后直接使用新的物理内存。ModelInstance 编排两者的顺序与失败回滚；EngineCore 持有挂起状态、
 snapshot 和自动恢复策略，worker 在挂起期间不执行任何单元。
+
+Engine 未显式传入 admission deadline 的请求使用 `pending_timeout_ms`，从提交开始计时；
+worker 为该请求同步执行的自动 resume 也在准入之前，不会重置这个绝对 deadline。
+恢复测试应在失败时同时记录队列预算、等待总时长以及 `last_resume` 的权重/状态恢复时长，
+区分恢复消耗了预算与真正的准入无进展；不得用增加超时或捕获异常跳过来代替诊断。
 
 ### 3.5 固定执行与原生参数
 

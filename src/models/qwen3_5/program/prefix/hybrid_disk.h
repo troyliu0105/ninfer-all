@@ -77,7 +77,10 @@ public:
     // Startup only: replay before starting the I/O executor.
     [[nodiscard]] RestoreSummary restore_into(pc::PrefixCacheIndex& index);
     void maybe_demote(pc::PrefixCacheIndex& index, const HostTransfers& transfers);
-    void publish_completions(pc::PrefixCacheIndex& index);
+    // One Engine cadence: adopt completed I/O, then continue bounded retention. Returns
+    // whether completions were adopted; an unchanged poll must not re-arm admission.
+    bool poll(pc::PrefixCacheIndex& index, const HostTransfers& transfers);
+    bool publish_completions(pc::PrefixCacheIndex& index);
     // Failure/rebuild barrier, never part of serving admission or transfer draining.
     void settle_sources(pc::PrefixCacheIndex& index) {
         worker_->wait_idle();

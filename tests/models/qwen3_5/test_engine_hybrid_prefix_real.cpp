@@ -42,6 +42,14 @@ bool select_kv_storage(std::string_view name) {
         kv_storage = ninfer::KvCacheStorage::Nvfp4Group16;
     } else if (name == "k8v4") {
         kv_storage = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+    } else if (name == "rk8v4") {
+        kv_storage = ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
+    } else if (name == "rk4v4") {
+        kv_storage = ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    } else if (name == "rk4v4-e8") {
+        kv_storage = ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueE8;
+    } else if (name == "rk2v4-e8") {
+        kv_storage = ninfer::KvCacheStorage::RotatedE8RootKeyInt4Value;
     } else {
         return false;
     }
@@ -74,7 +82,6 @@ ninfer::EngineOptions hybrid_options(const char* artifact, ninfer::SpeculativeBa
     options.max_pending_requests = 1;
     if (backend == ninfer::SpeculativeBackend::Mtp) {
         options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     } else if (backend == ninfer::SpeculativeBackend::DFlash2) {
         options.speculative.draft_tokens = 7;
     }
@@ -745,6 +752,17 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
     options.max_concurrency       = 4;
     options.max_pending_requests  = 8;
     options.concurrent_prefill    = backend == ninfer::SpeculativeBackend::Mtp;
+    // Compare fixed attention reductions without changing the numerical acceptance gate.
+    // Projections and GDN retain their own schedules; this is a localization control.
+    if (const char* invariant = std::getenv("NINFER_SHARED_PREFILL_INVARIANT_ATTENTION")) {
+        const std::string_view value(invariant);
+        if (value != "0" && value != "1") {
+            std::cerr << name << ": NINFER_SHARED_PREFILL_INVARIANT_ATTENTION must be 0 or 1\n";
+            return 1;
+        }
+        options.invariant_attention = value == "1";
+    }
+    std::cerr << name << ": invariant_attention=" << options.invariant_attention << '\n';
 
     struct Read {
         ninfer::TokenLogprob logprob;
@@ -790,9 +808,8 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
                   << " requests); expected one pass of " << questions.size() << '\n';
         ++failures;
     }
-    // The pass's wider projections round differently and the head's logits are BF16: a value may
-    // move by one BF16 step of its logit (0.125 between 16 and 32, 0.25 up to 64; measured on an
-    // RTX 3090: at most 0.125).
+    // Keep the regression bound while diagnosing model/Op arithmetic. Matching greedy tokens
+    // alone does not establish that the returned probabilities are numerically correct.
     constexpr float kTolerance = 0.26F;
     for (std::size_t index = 0; index < questions.size(); ++index) {
         const Read& a = alone[index];
@@ -800,17 +817,26 @@ int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend bac
         float worst   = std::fabs(a.logprob.logprob - b.logprob.logprob);
         bool shaped   = a.logprob.readout.size() == read.execution.readout_tokens.size() &&
                       b.logprob.readout.size() == a.logprob.readout.size();
+        bool finite = std::isfinite(a.logprob.logprob) && std::isfinite(b.logprob.logprob);
         for (std::size_t k = 0; shaped && k < a.logprob.readout.size(); ++k) {
+            finite = finite && std::isfinite(a.logprob.readout[k]) &&
+                     std::isfinite(b.logprob.readout[k]);
             worst = std::max(worst, std::fabs(a.logprob.readout[k] - b.logprob.readout[k]));
         }
         std::cerr << name << ": read " << index << " token " << b.logprob.id << " reused "
                   << b.reused << ", largest log probability change " << worst << '\n';
-        if (a.logprob.id != b.logprob.id || a.reused != b.reused || !shaped ||
+        if (a.logprob.id != b.logprob.id || a.reused != b.reused || !shaped || !finite ||
             !(worst <= kTolerance)) {
             std::cerr << name << ": read " << index << " together gave token " << b.logprob.id
                       << " (logprob " << b.logprob.logprob << ", reused " << b.reused
                       << "), alone token " << a.logprob.id << " (logprob " << a.logprob.logprob
                       << ", reused " << a.reused << ")\n";
+            for (std::size_t k = 0; shaped && k < a.logprob.readout.size(); ++k) {
+                std::cerr << "  readout token " << read.execution.readout_tokens[k]
+                          << " alone=" << a.logprob.readout[k]
+                          << " together=" << b.logprob.readout[k]
+                          << " delta=" << b.logprob.readout[k] - a.logprob.readout[k] << '\n';
+            }
             ++failures;
         }
     }
@@ -909,51 +935,60 @@ int exercise_disk_demotion(const char* artifact) {
 int exercise_disk_restore(const char* artifact) {
     const std::filesystem::path dir = disk_tier_dir("restore");
     const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 21);
-    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
+    std::vector<ninfer::TokenId> second = first;
     const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 22);
     second.insert(second.end(), suffix.begin(), suffix.end());
-
-    // The Device pool stays tight so the pressure lineages evict the first prompt's Device
-    // blocks; the Host budget covers the tier's pinned staging and the slab pool's minimum, so
-    // the pressure lineages' write-through overflows it and the first prompt's Host copies are
-    // demoted while its committed disk records keep the prefix restorable. The reusing prompt
-    // restores through staged disk bytes.
-    ninfer::EngineOptions opts =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 7168, 1ULL << 30, 2);
-    opts.context_cache.disk_kv_path           = dir;
-    opts.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
-    ninfer::Engine engine(std::move(opts));
-    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-    // Three distinct legal pressure lineages (prompt + generation stay inside max_context)
-    // accumulate past the Device pool, evicting the first prompt's copies tier by tier.
-    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3800, 23)), greedy(296));
-    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(1024, 24)), greedy(296));
-    (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3800, 25)), greedy(296));
-    // A re-issue of the original prompt drives the Engine's poll while the demotion closure
-    // is still in flight (an idle Engine does not poll), so by the next admission the closure
-    // has committed and released the Host copy.
-    (void)engine.generate(engine.prepare_tokens(first), greedy(512));
-    // The warm attempt stages the disk-only blocks for the reusing prefix; admission retries
-    // while the staging reads land, and the measured attempt restores through them. Both send
-    // the reusing prompt, so the candidate is the demoted terminal snapshot itself.
-    (void)engine.generate(engine.prepare_tokens(second), greedy(8));
-    const ninfer::GenerationResult result =
-        engine.generate(engine.prepare_tokens(second), greedy(24));
-    const ninfer::RuntimeStats stats = engine.runtime_stats();
-
+    const auto options = [&](bool disk) {
+        ninfer::EngineOptions result =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 7168, 1ULL << 30, 2);
+        if (disk) {
+            result.context_cache.disk_kv_path = dir;
+            result.context_cache.disk_kv_capacity_bytes = 4ULL << 30;
+        }
+        return result;
+    };
+    std::vector<ninfer::TokenId> reference;
+    std::uint32_t reference_reuse = 0;
+    {
+        ninfer::Engine engine(options(false));
+        (void)engine.generate(engine.prepare_tokens(first, true, true), greedy(8));
+        const auto result = engine.generate(engine.prepare_tokens(second), greedy(24));
+        reference = result.generated_token_ids;
+        reference_reuse = result.reused_prompt_tokens;
+    }
+    {
+        ninfer::Engine saver(options(true));
+        // A raw prompt has no semantic boundary unless the caller requests one.
+        (void)saver.generate(saver.prepare_tokens(first, true, true), greedy(8));
+        (void)saver.generate(saver.prepare_tokens(synthetic_tokens(3800, 23)), greedy(296));
+        (void)saver.generate(saver.prepare_tokens(synthetic_tokens(1024, 24)), greedy(296));
+        (void)saver.generate(saver.prepare_tokens(synthetic_tokens(3800, 25)), greedy(296));
+        const auto stats = saver.runtime_stats();
+        if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+            std::cerr << "disk-restore: no complete disk closure was published\n";
+            return 1;
+        }
+    }
+    // A fresh Engine has no volatile copies. A warm retry would hide an untested source.
+    ninfer::Engine loader(options(true));
+    auto handle = loader.submit(loader.prepare_tokens(second), greedy(24),
+                                ninfer::OutputConsumerMode::Aggregate, {},
+                                std::chrono::steady_clock::now() + std::chrono::minutes(2));
+    const auto result = handle.wait();
+    const auto stats = loader.runtime_stats();
+    const auto expected_reuse = static_cast<std::uint32_t>(first.size() - 1U);
     int failures = 0;
-    if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
-        std::cerr << "disk-restore: no complete disk closure was published\n";
-        ++failures;
-        return failures;
-    }
-    if (result.reused_prompt_tokens < 2 * kPrefillChunk) {
+    if (reference_reuse != expected_reuse || result.reused_prompt_tokens != expected_reuse) {
         std::cerr << "disk-restore: reuse=" << result.reused_prompt_tokens
-                  << " lost the demoted prefix\n";
+                  << " reference=" << reference_reuse << " expected=" << expected_reuse << '\n';
         ++failures;
     }
-    if (stats.hybrid_disk_read_bytes == 0) {
-        std::cerr << "disk-restore: no staged disk source was read\n";
+    if (stats.hybrid_disk_restored_blocks == 0 || stats.hybrid_disk_read_bytes == 0) {
+        std::cerr << "disk-restore: the first reuse did not consume a disk source\n";
+        ++failures;
+    }
+    if (result.generated_token_ids != reference) {
+        std::cerr << "disk-restore: generation diverged from the matching no-disk restore\n";
         ++failures;
     }
     return failures;
@@ -1031,70 +1066,69 @@ int exercise_disk_restart(const char* artifact) {
     return failures;
 }
 
-// A snapshot whose frontier is not a 64-token multiple needs its tail, and a demoted one needs it
-// from the disk tier's staging (the Host copy is gone). Resuming one extra token past the
-// endpoint requires exactly that tail: the fill must accept the disk-committed tail source.
+// A requested raw-prompt anchor is deliberately off the 64-token block boundary.
+// A fresh Engine must reconstruct its tail from disk, not reuse a volatile copy.
 int exercise_disk_tail_restore(const char* artifact) {
     const std::filesystem::path dir = disk_tier_dir("tail-restore");
-    // 1500 tokens: the terminal endpoint carries a 92-token tail.
     const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 41);
     std::vector<ninfer::TokenId> extended(first);
     extended.push_back(static_cast<ninfer::TokenId>(first.back() + 1U));
-
+    // anchor_prompt_end captures 1499: 23 complete blocks and a 27-token tail.
+    const auto expected_reuse = static_cast<std::uint32_t>(first.size() - 1U);
     const auto options = [&](bool disk) {
         ninfer::EngineOptions result =
             hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
         if (disk) {
-            result.context_cache.disk_kv_path           = dir;
-            result.context_cache.disk_kv_capacity_bytes = 1ULL << 30;
+            result.context_cache.disk_kv_path = dir;
+            result.context_cache.disk_kv_capacity_bytes = 4ULL << 30;
         }
         return result;
     };
-    // The reference keeps the endpoint's Host copy and resumes over it; the disk engine must
-    // restore the same bytes from its committed closure.
     std::vector<ninfer::TokenId> reference;
     std::uint32_t reference_reuse = 0;
     {
         ninfer::Engine engine(options(false));
-        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-        const ninfer::GenerationResult result =
-            engine.generate(engine.prepare_tokens(extended), greedy(24));
-        reference         = result.generated_token_ids;
-        reference_reuse   = result.reused_prompt_tokens;
+        (void)engine.generate(engine.prepare_tokens(first, true, true), greedy(8));
+        const auto result = engine.generate(engine.prepare_tokens(extended), greedy(24));
+        reference = result.generated_token_ids;
+        reference_reuse = result.reused_prompt_tokens;
     }
-    ninfer::Engine engine(options(true));
-    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-    // Push the endpoint's closure to the disk tier and its Host copy out of the slab pool.
-    for (std::uint32_t index = 0; index < 4; ++index) {
-        if (engine.runtime_stats().hybrid_disk_demoted_images != 0) { break; }
-        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(3900, 42 + index)), greedy(4));
+    if (reference_reuse != expected_reuse) {
+        std::cerr << "disk-tail-restore: the reference did not capture the requested tail (reuse="
+                  << reference_reuse << ", expected=" << expected_reuse << ")\n";
+        return 1;
     }
-    const ninfer::RuntimeStats demoted = engine.runtime_stats();
-    const ninfer::GenerationResult result =
-        engine.generate(engine.prepare_tokens(extended), greedy(24));
-    const ninfer::RuntimeStats stats = engine.runtime_stats();
-
+    {
+        ninfer::Engine saver(options(true));
+        (void)saver.generate(saver.prepare_tokens(first, true, true), greedy(8));
+        for (std::uint32_t index = 0; index < 4; ++index) {
+            (void)saver.generate(saver.prepare_tokens(synthetic_tokens(3900, 42 + index)), greedy(4));
+        }
+        const auto stats = saver.runtime_stats();
+        if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+            std::cerr << "disk-tail-restore: no complete disk closure was published\n";
+            return 1;
+        }
+    }
+    // Replay cannot use the saving Engine's Host or Device tail.
+    ninfer::Engine loader(options(true));
+    auto handle = loader.submit(loader.prepare_tokens(extended), greedy(24),
+                                ninfer::OutputConsumerMode::Aggregate, {},
+                                std::chrono::steady_clock::now() + std::chrono::minutes(2));
+    const auto result = handle.wait();
+    const auto stats = loader.runtime_stats();
     int failures = 0;
-    if (demoted.hybrid_disk_demoted_blocks == 0 || demoted.hybrid_disk_demoted_images == 0) {
-        std::cerr << "disk-tail-restore: no complete disk closure was published\n";
-        ++failures;
-        return failures;
-    }
-    // 1408 is the last full block of the shared prefix: reuse past it can only come from the
-    // endpoint's tail.
-    constexpr std::uint32_t kLastFullBlock = 1408;
-    if (result.reused_prompt_tokens <= kLastFullBlock) {
+    if (result.reused_prompt_tokens != expected_reuse) {
         std::cerr << "disk-tail-restore: reuse=" << result.reused_prompt_tokens
-                  << " did not resume over the snapshot tail (reference=" << reference_reuse
-                  << ")\n";
+                  << " did not resume at the requested tail (expected=" << expected_reuse << ")\n";
         ++failures;
     }
-    if (stats.hybrid_disk_read_bytes == 0) {
-        std::cerr << "disk-tail-restore: the tail was not read from the disk tier\n";
+    if (stats.hybrid_disk_restored_blocks == 0 || stats.hybrid_disk_read_bytes == 0) {
+        std::cerr << "disk-tail-restore: the cold tail closure was not read from disk\n";
         ++failures;
     }
     if (result.generated_token_ids != reference) {
-        std::cerr << "disk-tail-restore: generation diverged from the no-disk reference\n";
+        std::cerr << "disk-tail-restore: generation diverged from the matching no-disk restore\n";
         ++failures;
     }
     return failures;

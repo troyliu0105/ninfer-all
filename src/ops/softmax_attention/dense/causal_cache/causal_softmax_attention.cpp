@@ -44,7 +44,11 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t kv
                                            std::int32_t width, std::int32_t batch_size,
                                            KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
-    if (causal_attention_model_query_heads(q_heads, kv_heads) == 16) return 6;
+    // The chunked route launches the small-T kernels, whose row domain is eight query rows for
+    // the 24-head geometry and six for the 16- and 8-head ones: their dispatchers instantiate
+    // no seventh or eighth row tile, and causal_attention_split_capacity refuses the profile.
+    // The old "== 16" test predated the 8-head geometry and handed it the 24-head chunks.
+    if (causal_attention_model_query_heads(q_heads, kv_heads) != 24) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&

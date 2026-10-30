@@ -335,16 +335,28 @@ bool ProgramImpl::hybrid_prepare_pending() const noexcept {
     return hybrid_disk_ && cold_preparation_.pending(*hybrid_disk_);
 }
 
+bool ProgramImpl::hybrid_retention_pending() const noexcept {
+    return hybrid_disk_ && (hybrid_disk_->busy() || hybrid_->transfers_pending());
+}
+
 void ProgramImpl::hybrid_prepare_abandon(std::uint64_t publication_order) noexcept {
     if (hybrid_disk_) { cold_preparation_.abandon(publication_order, *hybrid_disk_); }
 }
 
 bool ProgramImpl::hybrid_prepare_progress() {
-    if (!hybrid_prepare_pending() || has_context_transaction() || hybrid_->restore_open()) {
+    if ((!hybrid_prepare_pending() && !hybrid_retention_pending()) ||
+        has_context_transaction() || hybrid_->restore_open()) {
         return false;
     }
+    const auto copy_revision = hybrid_->copy_completion_revision();
     hybrid_->poll();
-    hybrid_disk_poll(false);
+    const bool disk_changed = hybrid_disk_poll();
+    const bool residency_changed =
+        disk_changed || copy_revision != hybrid_->copy_completion_revision();
+    if (!hybrid_prepare_pending()) {
+        if (residency_changed) { advance_resource_revision(); }
+        return residency_changed;
+    }
     const ColdPreparation::Copies copies{
         this, hybrid_->copy_completion_revision(),
         [](void* p) {
@@ -361,8 +373,8 @@ bool ProgramImpl::hybrid_prepare_progress() {
     const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     const bool changed = cold_preparation_.progress(hybrid_->index(), *hybrid_disk_, now, copies);
-    if (changed) { advance_resource_revision(); }
-    return changed;
+    if (changed || residency_changed) { advance_resource_revision(); }
+    return changed || residency_changed;
 }
 
 HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
@@ -479,7 +491,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         throw std::out_of_range("hybrid admission lane is out of range");
     }
     hybrid_->poll();
-    if (hybrid_disk_) { hybrid_disk_poll(true); }
+    if (hybrid_disk_) { (void)hybrid_disk_poll(); }
     const RequestBasePlanImpl& plan = *base.impl_;
     const auto n                    = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n == 0 || n != plan.summary.prompt_tokens) {
@@ -1576,7 +1588,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || !sequence.kv) { return; }
     hybrid_->poll();
-    if (hybrid_disk_) { hybrid_disk_poll(true); }
+    if (hybrid_disk_) { (void)hybrid_disk_poll(); }
     std::uint32_t frontier = sequence.text_kv_valid;
     // Every enabled pool must hold the whole block. The DFlash2 draft ring is StateImage content,
     // not block content, so it does not bound block publication.
@@ -1603,10 +1615,9 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     if (!lane.pending.empty()) { hybrid_publish_pending(sequence, false); }
 }
 
-void ProgramImpl::hybrid_disk_poll(bool allow_demotion) {
-    if (hybrid_disk_ == nullptr) { return; }
+bool ProgramImpl::hybrid_disk_poll() {
+    if (hybrid_disk_ == nullptr) { return false; }
     pc::PrefixCacheIndex& index = hybrid_->index();
-    hybrid_disk_->publish_completions(index);
     // Staging releases on landing marks, not a coarse pending check. A restored image goes to
     // the admission's own state slot — the snapshot's index device_slot stays empty — so the
     // cache's restore batches are the image's landing signal. The tail's device copy and the
@@ -1629,8 +1640,6 @@ void ProgramImpl::hybrid_disk_poll(bool allow_demotion) {
             tail_staged_inflight_ = false;
         }
     }
-    if (!allow_demotion) { return; }
-    // Demotion after the bookkeeping: the completions it observes are current.
     struct CopyContext {
         HybridPrefixCache& cache;
         cudaStream_t producer;
@@ -1649,7 +1658,7 @@ void ProgramImpl::hybrid_disk_poll(bool allow_demotion) {
             auto& copy = *static_cast<CopyContext*>(context);
             copy.cache.start_block_host_writes({&node, 1}, copy.producer, copy.transfer, true);
         }};
-    hybrid_disk_->maybe_demote(index, transfers);
+    return hybrid_disk_->poll(index, transfers);
 }
 
 std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPages& source,

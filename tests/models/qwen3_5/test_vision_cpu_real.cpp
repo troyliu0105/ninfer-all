@@ -7,13 +7,23 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
-// The CPU Vision residency against the resident device encoder on the same image and prompt: the
-// first answer token's distributions must agree -- the most likely alternatives largely coincide,
-// and each run's two likeliest tokens are likely in the other run too, within a small margin of
-// log probability. The CPU encoder computes in FP32 where the device rounds activations to BF16,
-// so equality is not expected, and a near tie for the first token may break either way.
+// The CPU Vision residency against the resident device encoder on the same image and prompt. The
+// two encoders differ by design in activation precision (the CPU computes FP32 where the device
+// rounds to BF16, docs/serving.md "Vision residency"), so the tower's embeddings agree closely but
+// not bit for bit, and the test's 0.25 log-probability margin over the first token's likeliest
+// alternatives is a regression bound against the device's embeddings, not a derived error bound.
+// The check:
+//
+//   1. the distributions agree: at least six of each run's eight likeliest tokens appear in the
+//      other run's eight, and each run's two likeliest tokens agree with their value in the other
+//      run within the margin;
+//   2. typed readouts provide additional probability diagnostics for image-answer words; they
+//      do not replace an independent oracle for either tower's embeddings.
+//
+// Identical displayed text establishes none of this by itself and is printed, not asserted.
 namespace {
 
 std::vector<std::uint8_t> test_image(int width, int height) {
@@ -37,7 +47,20 @@ std::vector<std::uint8_t> test_image(int width, int height) {
 struct Outcome {
     ninfer::GenerationResult result;
     double load_seconds = 0.0;
+    std::vector<ninfer::TokenId> readout_ids;
 };
+
+// The single-token encodings of the words the image can be answered with. Words the artifact's
+// tokenizer splits contribute no candidate; at least two must survive for a decision to exist.
+std::vector<ninfer::TokenId> answer_candidates(const ninfer::Engine& engine) {
+    std::vector<ninfer::TokenId> ids;
+    for (const char* word : {"red", "circle", "blue", "square", "green", "dot", "round", "ball"}) {
+        const std::string spaced = std::string(" ") + word;
+        const std::vector<ninfer::TokenId> tokens = engine.tokenize_text(spaced, false);
+        if (tokens.size() == 1) { ids.push_back(tokens.front()); }
+    }
+    return ids;
+}
 
 Outcome run_with(const char* artifact, ninfer::VisionResidency residency) {
     ninfer::EngineOptions options;
@@ -52,6 +75,7 @@ Outcome run_with(const char* artifact, ninfer::VisionResidency residency) {
     options.max_pending_requests             = 1;
     options.context_cache.device_state_slots = 1;
     ninfer::Engine engine(std::move(options));
+    std::vector<ninfer::TokenId> readout_ids = answer_candidates(engine);
 
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -74,9 +98,10 @@ Outcome run_with(const char* artifact, ninfer::VisionResidency residency) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
     request.execution.logprobs                = true;
+    request.execution.readout_tokens          = readout_ids;
     request.stop.include_model_defaults       = false;
-    return Outcome{engine.generate(engine.prepare(std::move(input)), request),
-                   engine.load_summary().load_seconds};
+    return Outcome{engine.generate(engine.prepare(std::move(input)), std::move(request)),
+                   engine.load_summary().load_seconds, std::move(readout_ids)};
 }
 
 int run() {
@@ -105,8 +130,10 @@ int run() {
     };
     std::size_t shared = 0;
     float margin       = 0.0F;
+    bool finite = std::isfinite(a.logprob) && std::isfinite(b.logprob);
     for (std::size_t i = 0; i < kTop; ++i) {
         shared += std::isfinite(logprob_in(b, a.top_ids[i])) ? 1U : 0U;
+        finite = finite && std::isfinite(a.top_values[i]) && std::isfinite(b.top_values[i]);
     }
     for (std::size_t i = 0; i < 2; ++i) {
         margin = std::max({margin, std::abs(a.top_values[i] - logprob_in(b, a.top_ids[i])),
@@ -114,15 +141,32 @@ int run() {
     }
     std::cout << "first token " << a.id << '/' << b.id << " logprob " << a.logprob << '/'
               << b.logprob << ", top-8 shared " << shared << ", top-2 margin " << margin << '\n';
-    if (shared < 6 || !(margin <= 0.25F)) {
+    int failures = 0;
+    if (shared < 6 || !finite || !(margin <= 0.25F)) {
         std::cerr << "the CPU encoder's embeddings steer the model away from the device's\n";
+        ++failures;
+    }
+    // Report values even when the existing numerical gate failed.
+    if (device.readout_ids.size() < 2 || device.readout_ids != cpu.readout_ids ||
+        a.readout.size() != device.readout_ids.size() ||
+        b.readout.size() != cpu.readout_ids.size()) {
+        std::cerr << "a run reported no typed readout for the answer candidates\n";
         return 1;
+    }
+    for (std::size_t i = 0; i < a.readout.size(); ++i) {
+        std::cout << "readout token " << device.readout_ids[i]
+                  << " resident=" << a.readout[i] << " cpu=" << b.readout[i]
+                  << " delta=" << b.readout[i] - a.readout[i] << '\n';
+        if (!std::isfinite(a.readout[i]) || !std::isfinite(b.readout[i])) {
+            std::cerr << "a run reported a non-finite image-answer readout\n";
+            ++failures;
+        }
     }
     if (cpu.result.timings.vision_seconds <= 0.0) {
         std::cerr << "the CPU run reported no Vision time\n";
         return 1;
     }
-    return 0;
+    return failures == 0 ? 0 : 1;
 }
 
 } // namespace

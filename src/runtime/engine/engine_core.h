@@ -3387,8 +3387,12 @@ private:
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
-                    if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                    if (!active || suspended_.load(std::memory_order_acquire)) {
+                        queue_cv_.wait(lock, [&] {
+                            return stopping_ || !pending_.empty() ||
+                                   (!suspended_.load(std::memory_order_acquire) &&
+                                    preparation_work_pending_);
+                        });
                     }
                 }
                 if (stopping_) {
@@ -3473,7 +3477,8 @@ private:
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
                 if constexpr (!kLegacyContextCache) {
-                    preparation_work_pending_ = resources_.preparation_pending(*instance_.program);
+                    preparation_work_pending_ = resources_.preparation_pending(*instance_.program) ||
+                                                resources_.retention_pending(*instance_.program);
                 }
 
                 // Cancellation is sampled once for the execution unit. A request arriving while

@@ -157,6 +157,9 @@ public:
     [[nodiscard]] bool preparation_pending(const Program& program) const noexcept {
         return program.hybrid_prepare_pending();
     }
+    [[nodiscard]] bool retention_pending(const Program& program) const noexcept {
+        return program.hybrid_retention_pending();
+    }
     void abandon_preparation(Program& program, std::uint64_t publication_order) noexcept {
         program.hybrid_prepare_abandon(publication_order);
     }

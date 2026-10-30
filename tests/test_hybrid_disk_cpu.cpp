@@ -573,6 +573,35 @@ void retry_removal_without_engine_io(const std::filesystem::path& path) {
     check(h.disk.stats().failed_closures == 0, "reclaimed capacity supports a new complete closure");
 }
 
+// No new request or cold preparation drives this cadence. Delayed physical copies and real
+// disk completions must still carry a started closure beyond the available Host capacity.
+void idle_engine_drains_retention(const std::filesystem::path& path) {
+    Capture captured;
+    {
+        Harness h(path);
+        captured = h.capture(prompt(91, 5), 991);
+        h.fill_image(captured);
+        h.fill_block(captured.path[0]);
+        h.fill_block(captured.path[1]);
+        (void)h.disk.poll(h.index, h.memory.transfers());
+        check(h.disk.busy() || !h.memory.pending.empty(), "retention started");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (h.disk.busy() || !h.memory.pending.empty()) {
+            check(std::chrono::steady_clock::now() < deadline, "idle retention stalled");
+            if (!h.memory.pending.empty()) { h.memory.land_one(); }
+            (void)h.disk.poll(h.index, h.memory.transfers());
+            h.check_state();
+            std::this_thread::yield();
+        }
+        check(h.index.snapshot(captured.snapshot).disk_committed,
+              "idle cadence must commit the complete image, tail and five-block chain");
+        check(h.index.stats().host_free_slabs == 6, "idle retention releases all source slabs");
+        check(!h.disk.poll(h.index, h.memory.transfers()), "settled poll reports no new adoption");
+    }
+    Harness restarted(path);
+    restarted.read_exact(captured);
+}
+
 // Physical copies can be delayed or refused. The production preparation owner decides when
 // to read, consume, retain and release staging; this fixture never drains reads on its behalf.
 struct ColdCopies {
@@ -816,6 +845,7 @@ int main() {
         cancelled_staging_readers(scratch.path / "staging-readers");
         failed_read_retires_old_generation(scratch.path / "bad-read");
         retry_removal_without_engine_io(scratch.path / "removal");
+        idle_engine_drains_retention(scratch.path / "idle-retention");
         cold_preparation_progress(scratch.path / "cold-preparation");
         std::cout << "hybrid disk CPU: production streaming, branches, exact restart, delayed copies, "
                      "cancelled interests, checksum fallback, stale generations and removal retry passed\n";

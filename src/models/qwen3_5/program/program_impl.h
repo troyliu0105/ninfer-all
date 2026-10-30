@@ -890,6 +890,10 @@ public:
     [[nodiscard]] bool hybrid_prepare_progress();
     [[nodiscard]] bool hybrid_prepare_pending() const noexcept;
     void hybrid_prepare_abandon(std::uint64_t publication_order) noexcept;
+    // Background disk-tier retention is still making progress: started demotion jobs or
+    // released records are in flight. The Engine worker keeps its loop stepping while this
+    // holds so an idle Engine still adopts completions and drives demotion to its watermarks.
+    [[nodiscard]] bool hybrid_retention_pending() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -1522,9 +1526,9 @@ private:
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
-    // Adopt disk completions and recycle landed image/tail staging. Preparation progress
-    // suppresses background demotion; ColdPreparation alone owns block-staging consumption.
-    void hybrid_disk_poll(bool allow_demotion);
+    // Recycle landed image/tail staging, adopt disk completions and continue retention.
+    // ColdPreparation alone owns block-staging consumption.
+    bool hybrid_disk_poll();
     [[nodiscard]] bool hybrid_prepare_auxiliary(runtime::prefix_cache::SnapshotRef snapshot,
                                                bool allow_reads);
     [[nodiscard]] std::uint32_t

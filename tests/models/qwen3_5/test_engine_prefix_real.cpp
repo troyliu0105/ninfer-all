@@ -41,7 +41,6 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.prefill_chunk                    = 1024;
     options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.enable_vision                    = true;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
@@ -57,7 +56,6 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     // This fixture asserts a complete Host restore. Extra Device checkpoint slots can leave the
@@ -79,7 +77,6 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = 1;
@@ -99,7 +96,6 @@ ninfer::EngineOptions anthropic_prefix_regression_engine_options(const char* art
     options.prefill_chunk                    = 512;
     options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
     options.context_cache.device_state_slots = 1;
@@ -119,7 +115,6 @@ ninfer::EngineOptions shared_rewrite_materialization_engine_options(const char* 
     options.kv_cache                         = ninfer::KvCacheStorage::Fp8E4M3Row256;
     options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
     options.context_cache.device_state_slots = 2;
@@ -192,7 +187,6 @@ ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = 3;
@@ -212,7 +206,6 @@ ninfer::EngineOptions concurrent_engine_options(const char* artifact) {
     options.prefill_chunk                    = 256;
     options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 8;
     options.max_pending_requests             = 8;
     options.context_cache.device_state_slots = 16;
@@ -352,7 +345,6 @@ ninfer::EngineOptions agent_engine_options(const char* artifact, std::uint32_t s
     options.prefill_chunk             = 256;
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.max_concurrency           = 2;
     options.max_pending_requests      = 2;
     options.context_cache.device_state_slots                = device_slots;
@@ -799,7 +791,6 @@ int exercise_disk_kv_shutdown_restore(const char* artifact) {
         value.prefill_chunk                    = 256;
         value.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
         value.speculative.draft_tokens         = 3;
-        value.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
         value.max_concurrency                  = 1;
         value.max_pending_requests             = 1;
         value.context_cache.device_state_slots = 1;
@@ -1419,7 +1410,6 @@ int exercise_shared_anchor_entitlement(const char* artifact) {
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = 1;
@@ -1506,7 +1496,6 @@ ninfer::EngineOptions automatic_anchor_engine_options(const char* artifact,
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = device_state_slots;
@@ -1634,7 +1623,6 @@ ninfer::EngineOptions slot_engine_options(const char* artifact, bool auto_save,
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = 2;
@@ -2088,7 +2076,6 @@ int exercise_worker_failure_recovery(const char* artifact) {
     options.prefill_chunk                        = 256;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
-    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
     options.context_cache.device_state_slots     = 1;
@@ -2412,7 +2399,6 @@ ninfer::EngineOptions endpoint_anchor_engine_options(const char* artifact,
     if (mtp) {
         options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     } else {
         options.speculative.backend = ninfer::SpeculativeBackend::None;
     }

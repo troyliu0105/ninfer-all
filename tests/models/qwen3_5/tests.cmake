@@ -199,7 +199,7 @@ set_tests_properties(
 
 ninfer_add_test(ninfer_qwen3_5_suspend_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_suspend_real.cpp"
-  LIBRARIES ninfer_engine ${NINFER_CUDART_TARGET})
+  LIBRARIES ninfer_engine ninfer_artifact ${NINFER_CUDART_TARGET})
 
 set_tests_properties(
   ninfer_qwen3_5_suspend_real_test

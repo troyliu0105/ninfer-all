@@ -4078,6 +4078,21 @@ int run_h8_kv2_cases() {
         failures += run_a3_case(h8, storage, {17, 31, 2048, next()}, MappingPattern::Fragmented);
         failures += run_a1_case(h8, storage, {66, 63, 129, next()}, MappingPattern::Fragmented);
 
+        // The chunked route's row-domain boundary. A chunk launches the small-T kernels, whose
+        // dispatchers instantiate eight query-row tiles only for the 24-head geometry -- six
+        // here. Sizing this geometry's chunks at eight made every 7-16-column chunked call
+        // throw "split capacity: invalid profile" (workspace query and execution alike); the
+        // first unsupported row count is seven, so the boundary is crossed from both sides.
+        failures += run_a1_case(h8, storage, {7, 2048, 4096, next()}, MappingPattern::Fragmented);
+        failures += run_a1_case(h8, storage, {8, 2048, 4096, next()}, MappingPattern::Fragmented);
+        // Fourteen lands past the BF16 9-12 balancing branch, which had returned six-row
+        // halves that happened to fit; thirteen to sixteen keep the chunked route on every
+        // storage and threw on every one of them.
+        failures += run_a3_case(h8, storage, {14, 2048, 4096, next()}, MappingPattern::Fragmented);
+        failures += run_batch_case(h8, storage,
+                                   {8, {2048, 2048}, {8, 5}, {1, 0}, MappingPattern::Identity,
+                                    next()});
+
         // The wide-verification route over a long context, and the graph-replay path, whose
         // capture asks the route and workspace queries for the whole replay interval.
         failures += run_a1_case(h8, storage,

@@ -300,10 +300,17 @@ void HybridDiskTier::maybe_demote(PrefixCacheIndex& index, const HostTransfers& 
     }
 }
 
-void HybridDiskTier::publish_completions(PrefixCacheIndex& index) {
-    if (!worker_) { return; }
+bool HybridDiskTier::poll(PrefixCacheIndex& index, const HostTransfers& transfers) {
+    const bool changed = publish_completions(index);
+    maybe_demote(index, transfers);
+    return changed;
+}
+
+bool HybridDiskTier::publish_completions(PrefixCacheIndex& index) {
+    if (!worker_) { return false; }
     retry_removals();
-    for (const auto& done : worker_->take_completions()) {
+    const auto completions = worker_->take_completions();
+    for (const auto& done : completions) {
         using Kind = PrefixDiskWorker::Kind;
         if (done.kind == Kind::Remove) {
             if (done.ok) { ++stats_.released_records; }
@@ -382,6 +389,7 @@ void HybridDiskTier::publish_completions(PrefixCacheIndex& index) {
         }
     }
     stats_.pending_removals = static_cast<std::uint32_t>(pending_removals_.size());
+    return !completions.empty();
 }
 
 bool HybridDiskTier::stage_blocks(const std::vector<NodeRef>& nodes, const PrefixCacheIndex& index) {

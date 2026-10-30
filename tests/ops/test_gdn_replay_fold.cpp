@@ -372,7 +372,53 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             return 1;
         }
     }
+    int failures             = 0;
+    const std::string suffix = " L=" + std::to_string(profile.layers) +
+                               " Hv=" + std::to_string(profile.value_heads) +
+                               " T=" + std::to_string(width) + " B=" + std::to_string(rows);
+    std::vector<float> actual_recurrent(recurrent_slot_elements);
+    const auto source_unchanged = [&](std::int32_t layer, std::int32_t row, const char* stage) {
+        const auto initial = initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
+        const Tensor source =
+            state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), source_slots[row]);
+        cuda_check(cudaMemcpy(actual_recurrent.data(), source.data, recurrent_slot_bytes,
+                              cudaMemcpyDeviceToHost),
+                   "download recurrent source");
+        if (std::memcmp(actual_recurrent.data(), initial.data(), recurrent_slot_bytes) == 0) {
+            return true;
+        }
+        const auto* actual_bytes = static_cast<const std::uint8_t*>(
+            static_cast<const void*>(actual_recurrent.data()));
+        const auto* expected_bytes =
+            static_cast<const std::uint8_t*>(static_cast<const void*>(initial.data()));
+        std::size_t offset = 0;
+        while (offset < recurrent_slot_bytes && actual_bytes[offset] == expected_bytes[offset]) {
+            ++offset;
+        }
+        const std::size_t element = offset / sizeof(float);
+        const Tensor destination =
+            state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), destination_slots[row]);
+        std::cerr << stage << suffix << " layer=" << layer << " row=" << row
+                  << " source_slot=" << source_slots[row]
+                  << " destination_slot=" << destination_slots[row]
+                  << " commit_columns=" << commits[static_cast<std::size_t>(row)]
+                  << " source_address=" << source.data
+                  << " destination_address=" << destination.data
+                  << " element=" << element << " actual=0x" << std::hex
+                  << std::bit_cast<std::uint32_t>(actual_recurrent[element])
+                  << " expected=0x" << std::bit_cast<std::uint32_t>(initial[element])
+                  << std::dec << '\n';
+        return false;
+    };
     if ((width == 16 && rows == 8) || (width >= 32 && rows == 1)) {
+        for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
+            for (std::int32_t row = 0; row < rows; ++row) {
+                if (destination_slots[row] != source_slots[row] &&
+                    !source_unchanged(layer, row, "pre-fold recurrent source differs from uploaded pattern")) {
+                    return 1;
+                }
+            }
+        }
         cuda_synchronize();
         DeviceBuffer original(state_bytes);
         cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
@@ -396,11 +442,6 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         cuda_synchronize();
     }
 
-    int failures             = 0;
-    const std::string suffix = " L=" + std::to_string(profile.layers) +
-                               " Hv=" + std::to_string(profile.value_heads) +
-                               " T=" + std::to_string(width) + " B=" + std::to_string(rows);
-    std::vector<float> actual_recurrent(recurrent_slot_elements);
     std::vector<float> expected_recurrent_host(recurrent_slot_elements);
     std::vector<std::uint16_t> actual_conv(conv_slot_elements);
     std::vector<std::uint16_t> expected_conv_host(conv_slot_elements);
@@ -442,16 +483,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 return failures + 1;
             }
             if (destination_slots[row] != source_slots[row]) {
-                const auto initial_values =
-                    initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
-                const Tensor source_state =
-                    state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), source_slots[row]);
-                const auto source_recurrent =
-                    from_device<float>(source_state.data, recurrent_slot_elements);
-                if (std::memcmp(source_recurrent.data(), initial_values.data(),
-                                recurrent_slot_bytes) != 0) {
-                    std::cerr << "fold modified recurrent source" << suffix << " layer=" << layer
-                              << " row=" << row << "\n";
+                if (!source_unchanged(layer, row, "fold modified recurrent source")) {
                     return failures + 1;
                 }
                 std::vector<std::uint16_t> initial_conv(conv_slot_elements);

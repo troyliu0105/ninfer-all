@@ -13,9 +13,12 @@
 #include "guarded_main.h"
 #include "ninfer/engine.h"
 
+#include "artifact/reader.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -91,6 +94,15 @@ std::vector<ninfer::TokenId> long_prompt() {
 }
 
 std::vector<ninfer::TokenId> short_prompt() { return {248045, 846, 198, 5834, 248046, 198}; }
+
+// The artifact really carries the capability behind an optional row: an MTP block component in
+// the artifact directory. A construction or execution failure with the capability present is a
+// defect and must fail the run, not skip the row. An unreadable directory fails closed: the
+// rows run and any real problem surfaces as an engine error, never as a skip.
+bool artifact_has_mtp(const char* path) {
+    ninfer::artifact::Reader reader(path);
+    return reader.directory().components.contains("mtp");
+}
 
 struct Outputs {
     std::vector<ninfer::TokenId> short_run;
@@ -191,8 +203,29 @@ void run_configuration(const char* artifact, const Configuration& configuration,
     std::vector<ninfer::TokenId> continuation = long_prompt();
     continuation.insert(continuation.end(), got.long_run.begin(), got.long_run.end());
     continuation.push_back(198);
-    const ninfer::GenerationResult continued =
-        engine.generate(engine.prepare_tokens(std::move(continuation)), greedy(8, true));
+    auto prepared = engine.prepare_tokens(std::move(continuation));
+    const auto submitted = std::chrono::steady_clock::now();
+    const ninfer::GenerationResult continued = [&] {
+        try {
+            return engine.generate(std::move(prepared), greedy(8, true));
+        } catch (const std::exception& error) {
+            const auto status = engine.residency();
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - submitted).count();
+            std::cerr << "  automatic resume request FAILED: " << error.what()
+                      << "; pending_timeout_ms=" << engine.options().pending_timeout_ms
+                      << " elapsed_seconds=" << elapsed
+                      << " resident=" << (status.state == ninfer::ModelResidency::Resident)
+                      << " resume_count=" << status.resume_count;
+            if (status.last_resume) {
+                std::cerr << " resume_seconds=" << status.last_resume->seconds
+                          << " weight_seconds=" << status.last_resume->weight_seconds
+                          << " state_seconds=" << status.last_resume->state_seconds;
+            }
+            std::cerr << '\n';
+            throw;
+        }
+    }();
     got.continued_run = continued.generated_token_ids;
     got.reused_tokens = continued.reused_prompt_tokens;
     const ninfer::ResidencyStatus resumed = engine.residency();
@@ -252,15 +285,15 @@ int run() {
         const Outputs hybrid = reference_of({.label = "hybrid", .hybrid_cache = true});
         run_configuration(artifact, {.label = "hybrid prefix cache", .hybrid_cache = true}, hybrid);
     } catch (const std::exception& error) {
-        std::cout << "hybrid rows skipped: " << error.what() << '\n';
+        std::cerr << "hybrid rows FAILED: " << error.what() << '\n';
+        ++failures;
     }
-    std::optional<Outputs> mtp;
-    try {
-        mtp = reference_of({.label = "mtp", .mtp = true});
-    } catch (const std::exception& error) {
-        std::cout << "MTP rows skipped: " << error.what() << '\n';
+    if (artifact_has_mtp(artifact)) {
+        run_configuration(artifact, {.label = "MTP", .mtp = true},
+                          reference_of({.label = "mtp", .mtp = true}));
+    } else {
+        std::cout << "MTP rows skipped: the artifact carries no mtp component\n";
     }
-    if (mtp) { run_configuration(artifact, {.label = "MTP", .mtp = true}, *mtp); }
     return failures == 0 ? 0 : 1;
 }
 

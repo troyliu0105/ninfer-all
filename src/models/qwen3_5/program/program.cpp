@@ -710,6 +710,10 @@ bool Program::hybrid_prepare_progress() { return impl_->hybrid_prepare_progress(
 
 bool Program::hybrid_prepare_pending() const noexcept { return impl_->hybrid_prepare_pending(); }
 
+bool Program::hybrid_retention_pending() const noexcept {
+    return impl_->hybrid_retention_pending();
+}
+
 void Program::hybrid_prepare_abandon(std::uint64_t publication_order) noexcept {
     impl_->hybrid_prepare_abandon(publication_order);
 }

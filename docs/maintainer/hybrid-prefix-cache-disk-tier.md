@@ -79,6 +79,21 @@ image/tail availability can change without new disk I/O or more free KV pages. O
 changes re-arm admission; an unchanged poll does not repeat matching/resource inspection or
 depend on another request.
 
+The idle-work signal covers retention as well as request-specific cold preparation: accepted disk
+jobs, unadopted completions, deferred removals and pending Host/Device copies keep a resident
+Engine's bounded cadence running. In particular, a Device-to-Host repair may remain in flight
+after the previous disk write was adopted; disk-worker `busy()` alone does not cover this gap.
+The worker records the combined signal under its execution lock and consults only that cached
+signal under the queue lock. A suspended Engine waits for a request rather than spinning on
+retention it cannot execute.
+
+Each retention cadence adopts completions and continues bounded demotion. Actual disk adoption
+or copy completion advances the resource revision and re-arms admission; an unchanged poll does
+neither. When no I/O or physical copy remains, the worker can sleep. Unpinned demotion interests
+alone do not keep it polling forever when no source or capacity can make progress. Retention
+remains best-effort; this cadence does not pin every cold closure or guarantee its survival under
+capacity pressure.
+
 Existing code offers these reuse boundaries:
 
 - [`DiskKVStore`](../../src/core/disk_kv_store.h) is CUDA-independent and supplies checksummed
@@ -724,6 +739,13 @@ Fallback poll does not re-arm admission unless readiness actually changes.
 A competing Device fill during an accepted disk read must keep its destination and bytes; the
 preparation owner releases the unused read buffer instead of attempting a second fill.
 
+The idle-retention case runs the same production `HybridDiskTier::poll` cadence without a
+request or cold-preparation owner. A five-block closure exceeds the available Host slabs;
+delayed physical repairs and real disk completions must commit the complete closure, release all
+source slabs, and recover exact block, StateImage and nonaligned-tail bytes after restart.
+The Engine's combined idle predicate and CUDA completion behavior still require GPU execution;
+the CPU case does not instantiate the Engine worker.
+
 The staging-slot lease includes a monotonically assigned generation, carried through Program
 queues and checked on release. A delayed duplicate release after the slot has changed owners
 cannot free the new reader's buffer; a free/busy bit alone does not protect this reuse boundary.
@@ -780,6 +802,39 @@ submits the extended prompt exactly once. It requires reuse of at least 17,000 t
 256 restored blocks, bounded completed read bytes and greedy outputs matching its no-disk
 reference. A warm second attempt cannot satisfy these assertions. This scenario still needs a
 real artifact/GPU run.
+
+`disk-restore` and `disk-tail-restore` explicitly request the raw prompt's private end anchor
+(`prepare_tokens(..., true, true)`). A 1,500-token prompt then has a checkpoint at 1,499,
+including a 27-token tail after 23 complete blocks. The no-disk reference must prove that frontier
+before a tail comparison is meaningful. The saving Engine is closed before the measured request
+in a fresh Engine, which must consume disk sources on its first attempt; demotion counters for
+an unrelated lineage or a warm retry are not proof that the intended source was tested.
+These transfer fixtures use a 4 GiB disk budget instead of their former 1 GiB budget so the
+pressure lineages do not turn a source-restore check into a small-catalog eviction check.
+`disk-small-capacity` separately retains the capacity-reclamation workload. This fixture change
+does not increase production defaults or establish a latency/performance result.
+
+The real Hybrid fixture accepts all product KV names through `NINFER_HYBRID_KV_DTYPE`: `bf16`,
+`int8`, `fp8`, `nvfp4`, `k8v4`, `rk8v4`, `rk4v4`, `rk4v4-e8` and `rk2v4-e8`. Prefix-cache
+correctness fixtures leave proposal-head selection at the Engine's `Auto`: an artifact with only
+the full head must not be rejected merely because it lacks the optional optimized head.
+
+`shared-prefill` and `shared-prefill-mtp` accept
+`NINFER_SHARED_PREFILL_INVARIANT_ATTENTION=0|1` to compare the existing attention reduction
+policy while retaining the same numerical gate. This localizes schedule effects; projections
+and GDN keep their own schedules, so the control neither proves full-model bit parity nor
+qualifies a failed default-mode comparison. Numerical failures remain failures even when
+the generated text matches. The fixture reports each requested readout's two log probabilities
+and delta on failure rather than treating text agreement as a numerical oracle.
+
+The complete GPU run that reported disk reuse/read failures predates these changes. Its retained
+catalogs show missing target closures, but final absence does not distinguish a closure that
+never committed from one subsequently evicted. The missing idle-retention cadence is a confirmed
+production liveness defect; attributing every reported miss to it, or claiming a recovered hit
+rate, requires a new real-engine run. GDN fold source mutation, shared-prefill readout differences,
+CPU Vision's numerical gate, suspend admission expiry and INT8 runtime-capacity refusals remain
+unresolved where the available logs cannot establish their production cause. Keep their exact
+state comparisons, numerical gates and resource limits intact.
 
 Compare restored KV and StateImage bytes exactly with their captured representation. Compare
 Disk and hot restores of the same snapshot under the same continuation path. Root-vs-resumed
