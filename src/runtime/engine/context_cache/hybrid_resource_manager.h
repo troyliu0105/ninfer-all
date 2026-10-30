@@ -30,7 +30,6 @@ public:
     using Program                      = typename ModelContract::Program;
     using PreparedPrompt               = typename ModelContract::PreparedPrompt;
     using RequestBasePlan              = typename ModelContract::RequestBasePlan;
-    using PersistentBackfillProof      = typename ModelContract::PersistentBackfillProof;
     using SequenceHandle               = typename ModelContract::SequenceHandle;
     using CaptureOffer                 = typename ModelContract::CaptureOffer;
     using StartResult                  = typename ModelContract::StartResult;
@@ -114,6 +113,7 @@ public:
     struct Inspection {
         Readiness readiness = Readiness::TemporarilyBlocked;
         std::optional<Choice> choice;
+        std::optional<MaterializationDiagnostics> diagnostics;
     };
 
     explicit HybridResourceManager(std::uint32_t lane_count) : lane_count_(lane_count) {
@@ -142,17 +142,23 @@ public:
             }
         }
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
-        Quote quote = program.hybrid_quote(prompt, base, *destination);
-        if (quote.readiness != Readiness::Ready) { return {.readiness = quote.readiness}; }
-        return {.readiness = Readiness::Ready, .choice = Choice(std::move(quote))};
+        Quote quote = program.hybrid_quote(prompt, base, *destination, publication_order);
+        if (quote.readiness != Readiness::Ready) {
+            return {.readiness = quote.readiness, .diagnostics = quote.diagnostics};
+        }
+        auto diagnostics = quote.diagnostics;
+        return {.readiness = Readiness::Ready, .choice = Choice(std::move(quote)),
+                .diagnostics = std::move(diagnostics)};
     }
 
-    // Backfill past a blocked head needs a persistent feasibility proof; the hybrid mode does
-    // not issue one, so a blocked head is never overtaken.
-    [[nodiscard]] std::optional<PersistentBackfillProof>
-    prove_persistent_backfill(Program&, const RequestBasePlan&, const Choice&,
-                              std::span<const SequenceHandle>) const {
-        return std::nullopt;
+    [[nodiscard]] bool progress_preparation(Program& program) {
+        return !open_lane_ && program.hybrid_prepare_progress();
+    }
+    [[nodiscard]] bool preparation_pending(const Program& program) const noexcept {
+        return program.hybrid_prepare_pending();
+    }
+    void abandon_preparation(Program& program, std::uint64_t publication_order) noexcept {
+        program.hybrid_prepare_abandon(publication_order);
     }
 
     // A blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits

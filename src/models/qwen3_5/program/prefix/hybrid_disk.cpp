@@ -354,8 +354,7 @@ void HybridDiskTier::publish_completions(PrefixCacheIndex& index) {
                                index.node(done.node).disk == CopyState::Resident &&
                                index.node(done.node).disk_ref == done.record;
             if (done.ok && valid) {
-                staged_blocks_.push_back({done.node, block_staging(done.slot), 0,
-                                          staging_leases_[done.slot]});
+                staged_blocks_.push_back({done.node, block_staging(done.slot), staging_leases_[done.slot]});
                 stats_.disk_read_bytes += done.bytes;
                 ++stats_.restored_blocks;
             } else {

@@ -131,9 +131,18 @@ struct MatchResult {
     std::vector<MatchCandidate> candidates; // valid snapshots, deepest first
 };
 
+// What choose() compared for one admission: the root price it starts from and, when a snapshot
+// won, the price and copy workload of the winner. Bounded scalars only: the diagnostics are
+// filled from it, one per request.
 struct AdmissionChoice {
     std::optional<std::size_t> candidate; // absent: root
     double predicted_seconds = 0.0;
+    // Recomputing the whole prompt from the root: the comparison baseline, and the incumbent
+    // when no candidate is selected.
+    double root_seconds            = 0.0;
+    double best_offered_seconds    = 0.0; // cheapest snapshot even when root wins; 0: none offered
+    std::uint64_t restore_bytes    = 0; // the winner's H2D workload (0 for a root decision)
+    std::uint64_t disk_read_bytes  = 0; // the winner's disk read (a subset of restore_bytes)
 };
 
 struct InsertResult {

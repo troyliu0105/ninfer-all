@@ -2425,7 +2425,7 @@ is also rejected if it resolves to the model artifact.
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.
 
-Every line is one `ninfer_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v30 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -2443,13 +2443,16 @@ they do not infer request behavior from process-global counter deltas.
 `requested_reasoning_effort` and `preserve_thinking` record the explicit options, or `null` when
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
-`request_done.materialization` is the context-cache decision committed for that request: predicted
+`request_done.materialization` records the committed context-cache decision, or the latest Hybrid
+inspection when cancellation happens before admission: predicted
 immediate, future-loss and total nanoseconds (`predicted_now_ns`, `predicted_future_loss_ns`,
 `predicted_total_ns`, and `initial_predicted_total_ns` before search); `targets_evaluated`,
 `projection_work`, `planning_elapsed_ns` and `search_elapsed_ns`; `stop_reason`; `budget_exhausted`;
 `selected_degradation_units` and `selected_maximal_fallback`; `best_reuse_prompt_tokens`, the most
-prompt reuse any admission candidate offered regardless of the plan chosen (beside a `root` plan, 0
-means no reusable prefix was found and a large value means the planner priced reuse out); and the
+prompt reuse offered before Hybrid feasibility filtering (with the checkpoint catalog, the most
+reuse offered by an admission candidate); a large value beside root does not itself identify why
+reuse lost. See [Hybrid disk attribution](maintainer/hybrid-prefix-cache-disk-tier.md#attribution-and-interpretation)
+for source decisions, filtering and offer prices. Also included is the
 optional-search accounting
 `first_improvement_ns` (or `null`), `incumbent_improvements`, `search_work`, `search_granted_ns`,
 `search_renewals`, `search_discovery_used`, `search_overshoot_ns`, `search_stop_phase` and
@@ -2458,19 +2461,19 @@ optional-search accounting
 means the wall or control allowance ran out, while a request too cheap to justify optional search
 reports `insufficient_expected_gain`. Search phases are `none`, `setup`, `construction`,
 `assessment`, `expansion` and `refinement`. Search is bounded and heuristic; these diagnostics do not
-claim model or global optimality, and aborted planning attempts are not published. With the
+claim model or global optimality. Aborted checkpoint planning attempts are not published. With the
 environment variable `NINFER_MAT_DEBUG` set, admission also writes its raw inputs to stderr: a
 `[candgen]` line for each catalogued checkpoint it did or did not turn into a candidate, and
 `[mat-debug]` lines for each identity cost, fast selection, assessed target and denied search step,
 the last with the gain and economic bound behind the denial.
 `cached_prefix_tokens`, `restored_host_bytes` and `restored_disk_bytes` describe a hybrid
 prefix-cache admission and are `0` with the checkpoint catalog. `cached_prefix_tokens` is the
-longest prompt prefix held as cached KV blocks, whether or not it was reusable: reuse also needs
-a state snapshot inside it, so a gap to `prefix_cache_hit_tokens` is prefix lost to snapshot
-placement. `restored_host_bytes` is what the admission copied back from the Host tier; those
-copies overlap the request's first prefill pass, so their time is part of its prefill.
-`restored_disk_bytes` is the part of that restore the disk tier delivered (disk-staged block
-payloads, the snapshot image and the tail bundle); it is `0` without the disk tier.
+longest exact prompt prefix held as cached KV blocks, whether or not it was reusable: reuse also
+needs a valid, feasible and economically selected state snapshot. A gap to
+`prefix_cache_hit_tokens` does not establish snapshot placement as the cause.
+`restored_host_bytes` counts Host/staging-to-Device copies attributed to preparation and admission;
+`restored_disk_bytes` is its disk-delivered subset. Cold preparation can occur while queued,
+before prefill; final Host restores can overlap the first prefill pass.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
@@ -2487,9 +2490,14 @@ turn that ended inside its unclosed thinking. Fallback reasons are `none`, `malf
 `invalid_tool_name`, `undeclared_tool`, and `trailing_content`. These counters contain no tool
 arguments or generated text.
 
-`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`, and under
+`request_done.timings_seconds` contains full-precision `prepare`, `vision`, `prefill`, `decode`,
+and `total` seconds. `ttft` is a number only when a first token was emitted; otherwise it is
+`null`, including a cancellation before output. Numeric zero remains a valid immediate first token.
+`request_done.result.computed_prefill_tokens` counts actual execution, including partial cancelled
+prefills, rather than the planned prompt-minus-hit suffix. Qwen3.5 `prefill` sums individual pass
+intervals; it excludes other lanes' inter-pass gaps and is not the complete prompt wall interval.
+The `speculative` object contains `backend`, `draft_window`, `rounds`, `drafted_tokens`,
+`accepted_tokens`, `fallback_steps`, and `accepted_per_position`, and under
 `--adaptive-mtp` also `window_transitions` and `rounds_per_window`. Rates can be derived downstream
 from raw token counts and seconds instead of rounded stderr strings. `ngram_rounds`,
 `ngram_drafted_tokens`, and `ngram_accepted_tokens` are the part of `rounds`, `drafted_tokens`, and
@@ -2592,9 +2600,10 @@ blocks after them from the cache.
 The `disk` sub-object reports the disk tier (`--disk-kv-path`): `resident_blocks` and
 `committed_snapshots` are end-of-interval gauges; `demoted_blocks`, `demoted_images`,
 `restored_blocks`, `read_bytes` and `write_bytes` are interval deltas of Host→disk demotion and
-disk→Host restore traffic. The periodic pretty throughput line appends `disk demoted N blocks
-(bytes)` and `disk restored N blocks (bytes)` when either moves in the interval, and a request
-whose admission restored disk-staged KV appends `<bytes> from disk` inside its `cache` count.
+disk→Host restore traffic. The periodic pretty line shows image-only demotion and byte-only
+reads even when no whole block moved. A request whose preparation/admission consumed disk-staged
+payloads appends `<bytes> from disk` inside its `cache` count. Disk reads are completed logical
+payload bytes, not physical SSD traffic.
 
 With Qwen3.8-Flash-Next and its n-gram table, `ngram_table` reports the interval's row reads:
 `rows` the rows the passes addressed (16 a token), `resident_rows` those RAM served

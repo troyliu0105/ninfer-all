@@ -455,6 +455,7 @@ void HybridPrefixCache::publish_write(PendingWrite& write) {
     }
     spare_events_.push_back(write.done);
     write.done = nullptr;
+    ++copy_completion_revision_;
 }
 
 void HybridPrefixCache::poll() {
@@ -801,6 +802,7 @@ void HybridPrefixCache::finish_landing(RestoreBatch& batch) {
     if (batch.tail) { index_->complete_tail_device_fill(*batch.tail); }
     if (batch.pinned_snapshot) { index_->unpin_snapshot(*batch.pinned_snapshot); }
     recycle_events(batch);
+    ++copy_completion_revision_;
 }
 
 void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {

@@ -21,26 +21,30 @@ class TerminalPanel;
 
 namespace ninfer::serve {
 
-// One completed request's contribution. Speculative totals from the Engine include n-gram rounds;
-// the model fields here are the remainder (MTP or DFlash drafting), so the two sources never double
-// count.
+struct ConsoleWorkCounters {
+    std::uint64_t prompt_tokens           = 0;
+    std::uint64_t cache_hit_tokens        = 0;
+    std::uint64_t computed_prefill_tokens = 0;
+    double prefill_seconds               = 0.0;
+    std::uint64_t decode_tokens           = 0;
+    double decode_seconds                = 0.0;
+    std::uint64_t model_rounds            = 0;
+    std::uint64_t model_drafted_tokens    = 0;
+    std::uint64_t model_accepted_tokens   = 0;
+    std::uint64_t ngram_rounds            = 0;
+    std::uint64_t ngram_drafted_tokens    = 0;
+    std::uint64_t ngram_accepted_tokens   = 0;
+    std::uint64_t archive_drafted_tokens  = 0;
+    std::uint64_t archive_accepted_tokens = 0;
+};
+
+// One completed request's contribution. Engine speculative totals include n-gram rounds;
+// the model fields are the remainder, so the two sources never double count.
 struct ConsoleRequestSample {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    double ttft_seconds                    = 0.0;
-    std::uint64_t prompt_tokens            = 0;
-    std::uint64_t cache_hit_tokens         = 0;
-    std::uint64_t computed_prefill_tokens  = 0;
-    double prefill_seconds                 = 0.0;
-    std::uint64_t decode_tokens            = 0;
-    double decode_seconds                  = 0.0;
-    std::uint64_t model_rounds             = 0;
-    std::uint64_t model_drafted_tokens     = 0;
-    std::uint64_t model_accepted_tokens    = 0;
-    std::uint64_t ngram_rounds             = 0;
-    std::uint64_t ngram_drafted_tokens     = 0;
-    std::uint64_t ngram_accepted_tokens    = 0;
-    std::uint64_t archive_drafted_tokens   = 0;
-    std::uint64_t archive_accepted_tokens  = 0;
+    // Absence means no first token, distinct from an immediate first token at numeric zero.
+    std::optional<double> ttft_seconds;
+    ConsoleWorkCounters work;
 };
 
 [[nodiscard]] ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcome);
@@ -49,7 +53,10 @@ struct ConsoleRequestSample {
 // weighs by its tokens and time rather than counting as one equal vote.
 struct ConsoleStatsTotals {
     std::uint64_t requests = 0;
-    ConsoleRequestSample sum;
+    // Requests that committed a first token; the TTFT mean divides by this, not by `requests`.
+    std::uint64_t first_token_requests = 0;
+    double ttft_seconds = 0.0;
+    ConsoleWorkCounters sum;
 
     void add(const ConsoleRequestSample& sample) noexcept;
 };

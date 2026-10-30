@@ -1335,6 +1335,7 @@ struct FlintCore::Impl {
         result.thinking                        = r.output.thinking_stats();
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
+        result.computed_prompt_tokens          = r.prefilled - r.reused;
         result.prefix_reuse_path               = r.reuse_path;
         result.branches                        = std::move(r.branch_results);
         if (drafts > 0) { result.speculative = r.speculative; }

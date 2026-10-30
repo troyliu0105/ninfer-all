@@ -101,6 +101,16 @@ bool PrefixDiskWorker::busy() const {
            !removals_.empty() || !completed_.empty();
 }
 
+void PrefixDiskWorker::wait_idle() {
+    std::unique_lock lock(mutex_);
+    if (!thread_.joinable() && (!writes_.empty() || !reads_.empty() || !removals_.empty())) {
+        throw std::logic_error("disk I/O settlement requires a started worker");
+    }
+    idle_.wait(lock, [&] {
+        return !running_ && writes_.empty() && reads_.empty() && removals_.empty();
+    });
+}
+
 void PrefixDiskWorker::shutdown() noexcept {
     {
         std::lock_guard lock(mutex_);
@@ -205,7 +215,9 @@ void PrefixDiskWorker::run() {
             lock.lock();
         }
         completed_.push_back(done);
+        completion_revision_.fetch_add(1, std::memory_order_release);
         running_ = false;
+        idle_.notify_all();
     }
 }
 

@@ -22,15 +22,23 @@ bool contains(std::string_view text, std::string_view needle) {
     return text.find(needle) != std::string_view::npos;
 }
 
-GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion, double ttft,
+GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion,
+                          std::uint32_t computed, double ttft,
                           double prefill_seconds, double decode_seconds) {
     GenerationOutcome result;
     result.prompt_tokens                   = prompt;
     result.completion_tokens               = completion;
     result.metrics.prefix_cache_hit_tokens = cache_hit;
+    result.metrics.computed_prefill_tokens = computed;
     result.metrics.ttft_seconds            = ttft;
     result.metrics.prefill_seconds         = prefill_seconds;
     result.metrics.decode_seconds          = decode_seconds;
+    return result;
+}
+
+GenerationOutcome outcome_without_ttft(int prompt, std::uint32_t cache_hit, int completion) {
+    GenerationOutcome result = outcome(prompt, cache_hit, completion, 0, 0.0, 0.0, 0.0);
+    result.metrics.ttft_seconds.reset();
     return result;
 }
 
@@ -40,7 +48,7 @@ int main() {
     int failures = 0;
 
     // Engine speculative totals include n-gram rounds; the model drafter gets only the remainder.
-    GenerationOutcome mixed                     = outcome(1000, 600, 101, 0.25, 0.2, 2.0);
+    GenerationOutcome mixed                     = outcome(1000, 600, 101, 400, 0.25, 0.2, 2.0);
     mixed.metrics.speculative_backend           = ninfer::SpeculativeBackend::DFlash2;
     mixed.metrics.speculative_rounds            = 30;
     mixed.metrics.speculative_draft_tokens      = 300;
@@ -51,20 +59,31 @@ int main() {
     mixed.metrics.ngram_archive_drafted_tokens  = 40;
     mixed.metrics.ngram_archive_accepted_tokens = 10;
     const ConsoleRequestSample sample           = make_console_request_sample(mixed);
-    failures += check(sample.computed_prefill_tokens == 400,
+    failures += check(sample.work.computed_prefill_tokens == 400,
                       "computed prefill must exclude cache-hit prompt tokens");
-    failures += check(sample.decode_tokens == 100,
+    failures += check(sample.work.decode_tokens == 100,
                       "decode tokens must exclude the first token emitted by prefill");
-    failures += check(sample.model_rounds == 20 && sample.model_drafted_tokens == 200 &&
-                          sample.model_accepted_tokens == 80,
+    failures += check(sample.work.model_rounds == 20 && sample.work.model_drafted_tokens == 200 &&
+                          sample.work.model_accepted_tokens == 80,
                       "model-drafter totals must exclude n-gram rounds");
-    failures += check(sample.ngram_rounds == 10 && sample.ngram_drafted_tokens == 100 &&
-                          sample.ngram_accepted_tokens == 70,
+    failures += check(sample.work.ngram_rounds == 10 && sample.work.ngram_drafted_tokens == 100 &&
+                          sample.work.ngram_accepted_tokens == 70,
                       "n-gram totals must be carried unchanged");
     failures += check(sample.speculative_backend == ninfer::SpeculativeBackend::DFlash2,
                       "a request with model drafts must name its drafter");
+    failures += check(sample.ttft_seconds.has_value() &&
+                          *sample.ttft_seconds == mixed.metrics.ttft_seconds,
+                      "a produced first token must carry its TTFT");
 
-    GenerationOutcome ngram_only                = outcome(10, 0, 5, 0.1, 0.01, 0.1);
+    GenerationOutcome cancelled = outcome_without_ttft(1000, 600, 0);
+    failures += check(!make_console_request_sample(cancelled).ttft_seconds.has_value(),
+                      "a request without output must not carry a TTFT");
+    cancelled.metrics.computed_prefill_tokens = 137;
+    cancelled.metrics.prefill_seconds = 0.2;
+    failures += check(make_console_request_sample(cancelled).work.computed_prefill_tokens == 137,
+                      "a partial cancellation must count executed work, not its planned suffix");
+
+    GenerationOutcome ngram_only                = outcome(10, 0, 5, 10, 0.1, 0.01, 0.1);
     ngram_only.metrics.speculative_backend      = ninfer::SpeculativeBackend::Mtp;
     ngram_only.metrics.speculative_rounds       = 2;
     ngram_only.metrics.speculative_draft_tokens = 8;
@@ -76,9 +95,9 @@ int main() {
 
     // Ratios and rates weigh requests by tokens and time; zero-duration phases do not dilute them.
     ConsoleStatsTotals totals;
-    totals.add(make_console_request_sample(outcome(1000, 900, 11, 0.1, 0.05, 0.5)));
-    totals.add(make_console_request_sample(outcome(3000, 0, 1, 0.3, 1.0, 0.0)));
-    totals.add(make_console_request_sample(outcome(500, 500, 21, 0.2, 0.0, 1.0)));
+    totals.add(make_console_request_sample(outcome(1000, 900, 11, 100, 0.1, 0.05, 0.5)));
+    totals.add(make_console_request_sample(outcome(3000, 0, 1, 3000, 0.3, 1.0, 0.0)));
+    totals.add(make_console_request_sample(outcome(500, 500, 21, 0, 0.2, 0.0, 1.0)));
     failures += check(totals.requests == 3, "totals must count every completed request");
     failures += check(totals.sum.prompt_tokens == 4500 && totals.sum.cache_hit_tokens == 1400,
                       "cache ratio must be token weighted");
@@ -87,6 +106,26 @@ int main() {
                       "prefill rate must pair tokens only with requests that ran prefill");
     failures += check(totals.sum.decode_tokens == 30 && totals.sum.decode_seconds == 1.5,
                       "decode rate must pair tokens only with requests that ran decode");
+
+    // A no-output cancellation leaves the request count and rates alone; the TTFT mean covers
+    // only the requests that produced a first token.
+    ConsoleStatsTotals with_absence;
+    with_absence.add(make_console_request_sample(outcome(1000, 0, 11, 1000, 0.1, 0.05, 0.5)));
+    with_absence.add(make_console_request_sample(outcome_without_ttft(1000, 1000, 0)));
+    failures += check(with_absence.requests == 2 && with_absence.first_token_requests == 1,
+                      "a first-token-less request must stay out of the TTFT mean only");
+    failures += check(with_absence.ttft_seconds == 0.1 &&
+                          std::abs(with_absence.ttft_seconds /
+                                       static_cast<double>(with_absence.first_token_requests) -
+                                   0.1) < 1e-12,
+                      "the TTFT mean must exclude absent TTFTs from its denominator");
+
+    // A zero TTFT is a produced first token, not an absence: a fully cached prompt that
+    // emitted its one token immediately keeps the mean and its denominator.
+    ConsoleStatsTotals valid_zero;
+    valid_zero.add(make_console_request_sample(outcome(1000, 1000, 1, 0, 0.0, 0.0, 0.0)));
+    failures += check(valid_zero.first_token_requests == 1 && valid_zero.ttft_seconds == 0.0,
+                      "an immediate first token must remain in the TTFT denominator");
 
     ConsoleStatsSnapshot snapshot;
     snapshot.completed           = 1;
@@ -130,7 +169,7 @@ int main() {
         ninfer::product::LoggingOptions{.logger_name = "console-stats-test"});
     ConsoleStatsPanel panel(logging->terminal_panel());
     for (int index = 0; index < 12; ++index) {
-        panel.request_done(outcome(100, 0, 2, index < 2 ? 5.0 : 0.5, 0.1, 0.1));
+        panel.request_done(outcome(100, 0, 2, 100, index < 2 ? 5.0 : 0.5, 0.1, 0.1));
     }
     panel.request_failure(
         RequestFailure{.classification = RequestFailureClass::ClientDisconnected});
@@ -138,7 +177,7 @@ int main() {
     const ConsoleStatsSnapshot rolled = panel.snapshot();
     failures += check(rolled.completed == 12 && rolled.session.requests == 12,
                       "session totals must keep every request");
-    failures += check(rolled.recent.requests == 10 && rolled.recent.sum.ttft_seconds == 5.0,
+    failures += check(rolled.recent.requests == 10 && rolled.recent.ttft_seconds == 5.0,
                       "recent totals must hold only the last requests");
     failures += check(rolled.cancelled == 1 && rolled.rejected == 1 && rolled.failed == 0,
                       "disconnects count as cancelled and admission refusals as rejected");

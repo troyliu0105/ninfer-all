@@ -178,6 +178,10 @@ void test_match_and_choice() {
             "device-resident candidate should need no restore");
     const AdmissionChoice choice = index.choose(match, static_cast<std::uint32_t>(tokens.size()));
     require(choice.candidate == 0U, "the deepest device-resident snapshot should be chosen");
+    require(choice.root_seconds > 0.0 && choice.predicted_seconds < choice.root_seconds,
+            "the winner must price below the recomputation baseline it was compared against");
+    require(choice.restore_bytes == 0 && choice.disk_read_bytes == 0,
+            "a device-resident winner needs no copies");
 
     // A prompt that ends exactly at the tap frontier cannot use it (at least one token prefills).
     const MatchResult exact = index.match(tokens, hashes, {}, 320);
@@ -1480,15 +1484,23 @@ void test_cost_model_source_ranking() {
 
     // Default model: the deeper disk source wins by the prefill it saves; the default disk rate
     // must be finite, or no disk candidate could ever be selected.
-    require(index.choose(match, kPrompt).candidate == std::optional<std::size_t>{1},
+    const AdmissionChoice disk_wins = index.choose(match, kPrompt);
+    require(disk_wins.candidate == std::optional<std::size_t>{1},
             "the deeper disk source must win by default");
+    require(disk_wins.root_seconds > disk_wins.predicted_seconds &&
+                disk_wins.restore_bytes == 6U << 20U &&
+                disk_wins.disk_read_bytes == 6U << 20U,
+            "the winner's price and disk workload must be reported for attribution");
 
     // A zero disk rate excludes disk candidates and leaves the Host-only source chooseable.
     PrefixIndexConfig disabled = disk_config();
     disabled.cost.disk_read_bytes_per_second = 0.0;
     PrefixCacheIndex no_disk(disabled, backend);
-    require(no_disk.choose(match, kPrompt).candidate == std::optional<std::size_t>{0},
+    const AdmissionChoice host_wins = no_disk.choose(match, kPrompt);
+    require(host_wins.candidate == std::optional<std::size_t>{0},
             "a disabled disk rate must exclude only the disk source");
+    require(host_wins.restore_bytes == 4U << 20U && host_wins.disk_read_bytes == 0,
+            "the Host-only winner must separate from a disk-reading one");
 
     // Slower disk throughput ranks the sources the other way: the disk source's restore stops
     // paying for the extra 960 tokens it saves.
@@ -1516,8 +1528,14 @@ void test_cost_model_source_ranking() {
     costly.restore_bytes   = 8ULL << 30U;
     MatchResult costly_match;
     costly_match.candidates = {costly};
-    require(!index.choose(costly_match, 16384).candidate.has_value(),
+    const AdmissionChoice root_wins = index.choose(costly_match, 16384);
+    require(!root_wins.candidate.has_value(),
             "a restore worth less than its prefill must not be selected");
+    require(root_wins.predicted_seconds == root_wins.root_seconds &&
+                root_wins.restore_bytes == 0,
+            "a priced-out match must leave the root as the incumbent with no copies");
+    require(root_wins.best_offered_seconds > root_wins.root_seconds,
+            "a priced-out snapshot must retain its actual offered cost, not report none");
 }
 
 // Device pressure sheds the snapshot tail's Device copy (its own LRU entry). A snapshot whose

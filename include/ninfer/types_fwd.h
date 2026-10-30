@@ -120,6 +120,7 @@ struct ThinkingBudgetStats;
 enum class PrefixReusePath : std::uint8_t;
 enum class MaterializationStopReason : std::uint8_t;
 enum class MaterializationSearchPhase : std::uint8_t;
+enum class PrefixSourceDecision : std::uint8_t;
 struct MaterializationDiagnostics;
 struct NgramArchiveStats;
 

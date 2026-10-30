@@ -1,4 +1,6 @@
 #include "models/qwen3_5/program/prefix/hybrid_disk.h"
+#include "models/qwen3_5/program/prefix/cold_preparation.h"
+#include "runtime/contract/resources.h"
 
 #include <algorithm>
 #include <array>
@@ -570,6 +572,239 @@ void retry_removal_without_engine_io(const std::filesystem::path& path) {
     h.until([&] { return h.index.snapshot(replacement.snapshot).disk_committed; });
     check(h.disk.stats().failed_closures == 0, "reclaimed capacity supports a new complete closure");
 }
+
+// Physical copies can be delayed or refused. The production preparation owner decides when
+// to read, consume, retain and release staging; this fixture never drains reads on its behalf.
+struct ColdCopies {
+    using Preparation = models::qwen3_5::detail::ColdPreparation;
+    Harness& h;
+    std::deque<HybridDiskTier::StagedBlock> pending;
+    bool blocked = false;
+    bool auxiliary_blocked = false;
+    std::uint64_t source_revision = 0;
+    std::uint32_t submitted = 0;
+    explicit ColdCopies(Harness& harness) : h(harness) {}
+    Preparation::Copies callbacks() {
+        return {this, source_revision,
+            [](void* p) { return static_cast<ColdCopies*>(p)->blocked ? 0U : 2U; },
+            [](void* p, std::span<const HybridDiskTier::StagedBlock> blocks,
+               std::span<const NodeRef>) {
+                auto& self = *static_cast<ColdCopies*>(p);
+                if (self.blocked) { return 0U; }
+                const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(2, blocks.size()));
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const auto destination = self.h.memory.allocate(Bytes(kPayload, std::byte{0xA1}));
+                    self.h.index.pin_node(blocks[i].node);
+                    self.h.index.begin_device_fill(blocks[i].node, destination);
+                    self.pending.push_back(blocks[i]);
+                    ++self.submitted;
+                }
+                return count;
+            },
+            [](void* p, SnapshotRef snapshot, bool allow_reads) {
+                auto& self = *static_cast<ColdCopies*>(p);
+                if (self.auxiliary_blocked) { return false; }
+                const auto view = self.h.index.snapshot(snapshot);
+                self.h.disk.release_staged_image_except(snapshot);
+                self.h.disk.release_staged_tail_except(snapshot);
+                if (view.device_slot == kNoId && view.host != CopyState::Resident) {
+                    if (allow_reads) { (void)self.h.disk.stage_image(snapshot, self.h.index); }
+                    if (self.h.disk.take_staged_image(snapshot) == nullptr) { return false; }
+                }
+                if (view.tail_len != 0 && view.tail_device_copy != CopyState::Resident &&
+                    view.host != CopyState::Resident) {
+                    if (allow_reads) { (void)self.h.disk.stage_tail(snapshot, self.h.index); }
+                    if (self.h.disk.staged_tail(snapshot) == nullptr) { return false; }
+                }
+                return true;
+            }};
+    }
+    void land_one() {
+        const auto block = pending.front();
+        pending.pop_front();
+        const auto view = h.index.node(block.node);
+        std::copy_n(block.bytes, kPayload, h.memory.device.at(view.device_id).begin());
+        h.index.complete_device_fill(block.node);
+        h.index.unpin_node(block.node);
+        ++source_revision;
+    }
+};
+
+void cold_preparation_progress(const std::filesystem::path& path) {
+    using Preparation = models::qwen3_5::detail::ColdPreparation;
+    check(runtime::blocked_head_action(runtime::Readiness::Preparing, false) ==
+              runtime::BlockedHeadAction::Prepare,
+          "an idle Engine must prepare an asynchronous cold source, not reject capacity");
+    check(runtime::blocked_head_action(runtime::Readiness::TemporarilyBlocked, false) ==
+              runtime::BlockedHeadAction::RejectIdle &&
+          runtime::blocked_head_action(runtime::Readiness::TemporarilyBlocked, true) ==
+              runtime::BlockedHeadAction::WaitForCapacity,
+          "real capacity blocks still reject idle placement or wait for active owners");
+    Capture first, second;
+    {
+        Harness h(path);
+        first = h.capture(prompt(81, 12), 881);
+        second = h.capture(prompt(82, 12), 882);
+        h.fill_image(first);
+        h.fill_block(first.path[0]);
+        h.fill_block(first.path[1]);
+        h.until([&] { return h.index.snapshot(first.snapshot).disk_committed &&
+                             h.index.snapshot(second.snapshot).disk_committed; });
+    }
+    Harness h(path);
+    const auto find_path = [&](const Capture& capture) {
+        return h.index.match(capture.tokens, block_lookup_hashes(capture.tokens, {}), {},
+                             capture.tokens.size()).path;
+    };
+    auto first_path = find_path(first);
+    auto second_path = find_path(second);
+    const auto first_snapshot = h.find(first);
+    const auto second_snapshot = h.find(second);
+    Preparation preparation;
+    ColdCopies copies(h);
+    std::uint64_t now = 0;
+    preparation.select(1, first_snapshot, first_path, now, 1'000'000'000, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    h.disk.settle_sources(h.index);
+    // A ready disk read can race a better source's Device fill. That other copy owns its
+    // destination and does not read our staging; preparation must wait, not fill it twice.
+    const auto raced = first_path.front();
+    const auto destination = h.memory.allocate(
+        block_oracle({first.tokens.data(), kBlockTokens}));
+    h.index.pin_node(raced);
+    h.index.begin_device_fill(raced, destination);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(h.index.node(raced).device == CopyState::Filling,
+          "preparation preserves another consumer's pending Device destination");
+    h.index.complete_device_fill(raced);
+    h.index.unpin_node(raced);
+    ++copies.source_revision;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (preparation.state() != Preparation::State::Ready &&
+           std::chrono::steady_clock::now() < deadline) {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+        if (!copies.pending.empty()) { copies.land_one(); }
+        h.check_state();
+        std::this_thread::yield();
+    }
+    check(preparation.state() == Preparation::State::Ready,
+          "a cold chain larger than staging must reach admission readiness without a warm retry");
+    check(h.disk.stats().restored_blocks == first_path.size(),
+          "idle cold preparation reads each missing block once");
+    check(copies.submitted + 1 == first_path.size(),
+          "each missing Device destination is filled once, including the racing consumer");
+    for (std::size_t i = 0; i < first_path.size(); ++i) {
+        const auto expected = block_oracle({first.tokens.data() + i * kBlockTokens, kBlockTokens});
+        check(h.memory.device.at(h.index.node(first_path[i]).device_id) == expected,
+              "prepared Device bytes equal the independent token oracle");
+    }
+    copies.auxiliary_blocked = true;
+    preparation.select(1, first_snapshot, first_path, now, 1'000'000'000, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Preparing,
+          "an older image copy may temporarily own auxiliary staging");
+    const auto disk_revision = h.disk.completion_revision();
+    copies.auxiliary_blocked = false;
+    ++copies.source_revision;
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Ready &&
+              h.disk.completion_revision() == disk_revision,
+          "physical source completion wakes preparation without new disk I/O or free pages");
+    copies.auxiliary_blocked = true;
+    preparation.select(1, first_snapshot, first_path, now, 1'000'000'000, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Preparing,
+          "the deadline boundary starts with a real pending auxiliary source");
+    copies.auxiliary_blocked = false;
+    ++copies.source_revision;
+    now = 1'000'000'000;
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Ready,
+          "already ready sources at budget expiry must not be discarded for recomputation");
+    preparation.abandon(1, h.disk);
+    (void)h.index.evict_backed_device_blocks(128);
+    preparation.select(2, first_snapshot, first_path, now, 1'000'000'000, h.disk);
+    h.until([&] {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+        return !copies.pending.empty();
+    }, false, false);
+    const auto delayed = copies.pending.front();
+    const Bytes original(delayed.bytes, delayed.bytes + kPayload);
+    preparation.abandon(2, h.disk);
+    // Equal lengths are not identity: a new FIFO head with a different path must keep the
+    // old accepted transfer alive without letting a delayed cancellation clear the new owner.
+    preparation.select(3, second_snapshot, second_path, now, 1'000'000'000, h.disk);
+    preparation.abandon(2, h.disk);
+    check(preparation.owns(3), "old cancellation cannot retire a newer same-length FIFO head");
+    for (int i = 0; i < 100; ++i) {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    }
+    check(std::equal(original.begin(), original.end(), delayed.bytes),
+          "accepted H2D staging survives cancellation and repeated polls");
+    while (!copies.pending.empty()) { copies.land_one(); }
+    h.until([&] {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+        if (!copies.pending.empty()) { copies.land_one(); }
+        return preparation.state() == Preparation::State::Ready;
+    }, false, false);
+    preparation.abandon(3, h.disk);
+    (void)h.index.evict_backed_device_blocks(128);
+    copies.blocked = true;
+    now += 10;
+    preparation.select(4, first_snapshot, first_path, now, 20, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    now += 21;
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Fallback,
+          "lack of copy capacity consumes a monotonic budget, not unbounded retries");
+    ++now;
+    preparation.select(4, first_snapshot, first_path, now, 1000, h.disk);
+    check(preparation.state() == Preparation::State::Fallback,
+          "requoting the same FIFO head cannot reset its preparation budget");
+    preparation.abandon(4, h.disk);
+    h.until([&] {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+        return !preparation.pending(h.disk);
+    }, false, false);
+    copies.blocked = false;
+    preparation.select(5, first_snapshot, first_path, now, 1'000'000'000, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(h.disk.reads_pending(),
+          "rebuild cleanup starts with accepted reads, not an already idle worker");
+    h.disk.settle_sources(h.index);
+    preparation.clear_after_settlement(h.disk);
+    check(preparation.state() == Preparation::State::Idle && !preparation.pending(h.disk),
+          "settled cleanup leaves no preparation handles into a rebuilt cache");
+
+    preparation.select(6, first_snapshot, first_path, now, 20, h.disk);
+    h.until([&] {
+        (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+        const bool last_copies = !copies.pending.empty() &&
+            std::all_of(first_path.begin(), first_path.end(), [&](NodeRef node) {
+                return h.index.node(node).device != CopyState::Absent;
+            });
+        const bool auxiliary_ready = h.disk.take_staged_image(first_snapshot) != nullptr &&
+            (h.index.snapshot(first_snapshot).tail_len == 0 ||
+             h.disk.staged_tail(first_snapshot) != nullptr);
+        if (last_copies && auxiliary_ready) { return true; }
+        if (!copies.pending.empty()) { copies.land_one(); }
+        return false;
+    }, false, false);
+    const auto reads_at_expiry = h.disk.stats().disk_read_bytes;
+    now += 21;
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Fallback && preparation.pending(h.disk),
+          "expiry stops new work but retains already accepted copy leases");
+    while (!copies.pending.empty()) { copies.land_one(); }
+    ++now;
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    check(preparation.state() == Preparation::State::Ready &&
+              h.disk.stats().disk_read_bytes == reads_at_expiry,
+          "late accepted completions become usable without renewed budget or fresh disk reads");
+    preparation.abandon(6, h.disk);
+    (void)preparation.progress(h.index, h.disk, now, copies.callbacks());
+    h.check_state();
+}
 }
 
 int main() {
@@ -581,6 +816,7 @@ int main() {
         cancelled_staging_readers(scratch.path / "staging-readers");
         failed_read_retires_old_generation(scratch.path / "bad-read");
         retry_removal_without_engine_io(scratch.path / "removal");
+        cold_preparation_progress(scratch.path / "cold-preparation");
         std::cout << "hybrid disk CPU: production streaming, branches, exact restart, delayed copies, "
                      "cancelled interests, checksum fallback, stale generations and removal retry passed\n";
         return 0;

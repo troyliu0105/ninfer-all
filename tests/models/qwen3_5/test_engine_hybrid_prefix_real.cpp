@@ -1151,19 +1151,14 @@ int exercise_disk_small_capacity(const char* artifact) {
     return failures;
 }
 
-// A cold chain longer than any possible staging batch (the tier's block staging is capped below
-// 256 blocks) and longer than one prefetch batch (256 blocks) must still be prepared and
-// admitted: bounded streaming stages and copies a batch per cycle with progress, instead of
-// requesting more than the pool holds and never being admitted.
+// Restart removes every volatile copy: the first request must consume a cold chain larger
+// than the 256-block staging cap, without a warm attempt that could hide a preparation stall.
 int exercise_disk_long_chain(const char* artifact) {
     const std::filesystem::path dir = disk_tier_dir("long-chain");
     constexpr std::uint32_t kContext = 20480;
-    // 17000 prompt tokens share 16640 with the second prompt: 260 cold blocks, more than the
-    // staging cap and more than one prefetch batch.
-    std::vector<ninfer::TokenId> first = synthetic_tokens(17000, 71);
-    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 16640);
+    const std::vector<ninfer::TokenId> first = synthetic_tokens(17000, 71);
+    std::vector<ninfer::TokenId> second = first;
     const std::vector<ninfer::TokenId> suffix = synthetic_tokens(512, 72);
-    second.insert(second.end(), suffix.begin(), suffix.end());
     const auto options = [&](bool disk) {
         ninfer::EngineOptions result =
             hybrid_options(artifact, ninfer::SpeculativeBackend::None, kContext, 1ULL << 30, 8);
@@ -1174,34 +1169,65 @@ int exercise_disk_long_chain(const char* artifact) {
         }
         return result;
     };
+    std::vector<ninfer::TokenId> first_reference;
     std::vector<ninfer::TokenId> reference;
     {
         ninfer::Engine engine(options(false));
-        (void)engine.generate(engine.prepare_tokens(first), greedy(4));
+        first_reference =
+            engine.generate(engine.prepare_tokens(first), greedy(4)).generated_token_ids;
+        if (first_reference.size() != 4) {
+            std::cerr << "disk-long-chain: the reference did not complete its first continuation\n";
+            return 1;
+        }
+        second.insert(second.end(), first_reference.begin(), first_reference.end());
+        second.insert(second.end(), suffix.begin(), suffix.end());
         reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
     }
+    {
+        ninfer::Engine saver(options(true));
+        const auto captured =
+            saver.generate(saver.prepare_tokens(first), greedy(4)).generated_token_ids;
+        if (captured != first_reference) {
+            std::cerr << "disk-long-chain: initial generation changed with disk enabled\n";
+            return 1;
+        }
+        for (std::uint32_t index = 0; index < 2; ++index) {
+            (void)saver.generate(saver.prepare_tokens(synthetic_tokens(18000, 73 + index)),
+                                 greedy(4));
+        }
+        const ninfer::RuntimeStats stats = saver.runtime_stats();
+        if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
+            std::cerr << "disk-long-chain: no complete disk closure was published\n";
+            return 1;
+        }
+    }
     ninfer::Engine engine(options(true));
-    (void)engine.generate(engine.prepare_tokens(first), greedy(4));
-    // Distinct long lineages fill the slab pool and shed the shared chain's Device copies, so the
-    // chain reaches the disk tier.
-    for (std::uint32_t index = 0; index < 2; ++index) {
-        (void)engine.generate(engine.prepare_tokens(synthetic_tokens(18000, 73 + index)), greedy(4));
-    }
-    const ninfer::GenerationResult result =
-        engine.generate(engine.prepare_tokens(second), greedy(24));
+    // A stuck preparation must fail this scenario instead of waiting without a bound.
+    auto handle = engine.submit(engine.prepare_tokens(second), greedy(24),
+                                ninfer::OutputConsumerMode::Aggregate, {},
+                                std::chrono::steady_clock::now() + std::chrono::minutes(2));
+    const ninfer::GenerationResult result = handle.wait();
     const ninfer::RuntimeStats stats = engine.runtime_stats();
-
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    const std::uint64_t maximum_blocks = (second.size() + kBlock - 1U) / kBlock;
+    const std::uint64_t read_budget =
+        2U * (maximum_blocks * memory.host_kv_page_group_bytes +
+              memory.host_state_image_bytes + memory.host_kv_page_group_bytes);
     int failures = 0;
-    if (stats.hybrid_disk_demoted_blocks == 0 || stats.hybrid_disk_demoted_images == 0) {
-        std::cerr << "disk-long-chain: no complete disk closure was published\n";
-        ++failures;
-        return failures;
-    }
-    // 16640 shared tokens: the resume point must sit deep in the shared chain, not at a shallow
-    // survivor of the pressure.
-    if (result.reused_prompt_tokens + 256U < 16640U) {
+    if (result.reused_prompt_tokens < first.size()) {
         std::cerr << "disk-long-chain: reuse=" << result.reused_prompt_tokens
-                  << " lost the long shared chain\n";
+                  << " lost the committed endpoint\n";
+        ++failures;
+    }
+    if (stats.hybrid_disk_restored_blocks <= 256 ||
+        stats.hybrid_disk_restored_blocks > maximum_blocks) {
+        std::cerr << "disk-long-chain: block reads=" << stats.hybrid_disk_restored_blocks
+                  << " did not consume one bounded cold chain larger than staging\n";
+        ++failures;
+    }
+    if (stats.hybrid_disk_read_bytes == 0 || stats.hybrid_disk_read_bytes > read_budget) {
+        std::cerr << "disk-long-chain: bytes=" << stats.hybrid_disk_read_bytes
+                  << " exceeded the cold path and image read budget " << read_budget << '\n';
         ++failures;
     }
     if (result.generated_token_ids != reference) {

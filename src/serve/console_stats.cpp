@@ -82,11 +82,12 @@ std::string drafter_heading(SpeculativeBackend backend) {
 
 std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
                        bool show_archive) {
-    const ConsoleRequestSample& sum       = totals.sum;
+    const ConsoleWorkCounters& sum        = totals.sum;
     const std::string cells[kColumnCount] = {
-        totals.requests == 0 ? std::string(kNone)
-                             : product::format_pretty_duration(
-                                   sum.ttft_seconds / static_cast<double>(totals.requests)),
+        totals.first_token_requests == 0
+            ? std::string(kNone)
+            : product::format_pretty_duration(totals.ttft_seconds /
+                                              static_cast<double>(totals.first_token_requests)),
         ratio_cell(sum.cache_hit_tokens, sum.prompt_tokens),
         rate_cell(sum.computed_prefill_tokens, sum.prefill_seconds),
         rate_cell(sum.decode_tokens, sum.decode_seconds),
@@ -118,54 +119,57 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
             ? metrics.speculative_backend
             : SpeculativeBackend::None;
     return ConsoleRequestSample{
-        .speculative_backend     = backend,
-        .ttft_seconds            = metrics.ttft_seconds,
-        .prompt_tokens           = prompt_tokens,
-        .cache_hit_tokens        = cache_hit_tokens,
-        .computed_prefill_tokens = saturating_sub(prompt_tokens, cache_hit_tokens),
-        .prefill_seconds         = metrics.prefill_seconds,
-        // The first output token comes from prefill; the decode rate covers the rest, as the
-        // request-done record does.
-        .decode_tokens  = outcome.completion_tokens > 0
-                              ? static_cast<std::uint64_t>(outcome.completion_tokens - 1)
-                              : 0,
-        .decode_seconds = metrics.decode_seconds,
-        .model_rounds   = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
-        .model_drafted_tokens =
-            saturating_sub(metrics.speculative_draft_tokens, metrics.ngram_drafted_tokens),
-        .model_accepted_tokens =
-            saturating_sub(metrics.speculative_accepted_tokens, metrics.ngram_accepted_tokens),
-        .ngram_rounds            = metrics.ngram_rounds,
-        .ngram_drafted_tokens    = metrics.ngram_drafted_tokens,
-        .ngram_accepted_tokens   = metrics.ngram_accepted_tokens,
-        .archive_drafted_tokens  = metrics.ngram_archive_drafted_tokens,
-        .archive_accepted_tokens = metrics.ngram_archive_accepted_tokens,
+        .speculative_backend = backend,
+        .ttft_seconds        = metrics.ttft_seconds,
+        .work = {
+            .prompt_tokens           = prompt_tokens,
+            .cache_hit_tokens        = cache_hit_tokens,
+            .computed_prefill_tokens = metrics.computed_prefill_tokens,
+            .prefill_seconds         = metrics.prefill_seconds,
+            // Prefill emits the first output token; the decode rate covers the rest.
+            .decode_tokens = outcome.completion_tokens > 0
+                                 ? static_cast<std::uint64_t>(outcome.completion_tokens - 1) : 0,
+            .decode_seconds = metrics.decode_seconds,
+            .model_rounds = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
+            .model_drafted_tokens =
+                saturating_sub(metrics.speculative_draft_tokens, metrics.ngram_drafted_tokens),
+            .model_accepted_tokens =
+                saturating_sub(metrics.speculative_accepted_tokens, metrics.ngram_accepted_tokens),
+            .ngram_rounds            = metrics.ngram_rounds,
+            .ngram_drafted_tokens    = metrics.ngram_drafted_tokens,
+            .ngram_accepted_tokens   = metrics.ngram_accepted_tokens,
+            .archive_drafted_tokens  = metrics.ngram_archive_drafted_tokens,
+            .archive_accepted_tokens = metrics.ngram_archive_accepted_tokens,
+        },
     };
 }
 
 void ConsoleStatsTotals::add(const ConsoleRequestSample& sample) noexcept {
     ++requests;
-    sum.ttft_seconds += sample.ttft_seconds;
-    sum.prompt_tokens += sample.prompt_tokens;
-    sum.cache_hit_tokens += sample.cache_hit_tokens;
-    // Rates pair tokens with time only where the phase ran, so a request that reused its whole
-    // prompt or stopped after one token does not dilute the rate with zero-duration phases.
-    if (sample.prefill_seconds > 0.0) {
-        sum.computed_prefill_tokens += sample.computed_prefill_tokens;
-        sum.prefill_seconds += sample.prefill_seconds;
+    if (sample.ttft_seconds) {
+        ++first_token_requests;
+        ttft_seconds += *sample.ttft_seconds;
     }
-    if (sample.decode_seconds > 0.0) {
-        sum.decode_tokens += sample.decode_tokens;
-        sum.decode_seconds += sample.decode_seconds;
+    const auto& work = sample.work;
+    sum.prompt_tokens += work.prompt_tokens;
+    sum.cache_hit_tokens += work.cache_hit_tokens;
+    // Pair tokens with time only for phases that ran.
+    if (work.prefill_seconds > 0.0) {
+        sum.computed_prefill_tokens += work.computed_prefill_tokens;
+        sum.prefill_seconds += work.prefill_seconds;
     }
-    sum.model_rounds += sample.model_rounds;
-    sum.model_drafted_tokens += sample.model_drafted_tokens;
-    sum.model_accepted_tokens += sample.model_accepted_tokens;
-    sum.ngram_rounds += sample.ngram_rounds;
-    sum.ngram_drafted_tokens += sample.ngram_drafted_tokens;
-    sum.ngram_accepted_tokens += sample.ngram_accepted_tokens;
-    sum.archive_drafted_tokens += sample.archive_drafted_tokens;
-    sum.archive_accepted_tokens += sample.archive_accepted_tokens;
+    if (work.decode_seconds > 0.0) {
+        sum.decode_tokens += work.decode_tokens;
+        sum.decode_seconds += work.decode_seconds;
+    }
+    sum.model_rounds += work.model_rounds;
+    sum.model_drafted_tokens += work.model_drafted_tokens;
+    sum.model_accepted_tokens += work.model_accepted_tokens;
+    sum.ngram_rounds += work.ngram_rounds;
+    sum.ngram_drafted_tokens += work.ngram_drafted_tokens;
+    sum.ngram_accepted_tokens += work.ngram_accepted_tokens;
+    sum.archive_drafted_tokens += work.archive_drafted_tokens;
+    sum.archive_accepted_tokens += work.archive_accepted_tokens;
 }
 
 std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& snapshot) {

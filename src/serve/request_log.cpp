@@ -412,6 +412,18 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"cached_prefix_tokens", diagnostics.cached_prefix_tokens},
         {"restored_host_bytes", diagnostics.restored_host_bytes},
         {"restored_disk_bytes", diagnostics.restored_disk_bytes},
+        {"prefix_source_decision",
+         ninfer::prefix_source_decision_name(diagnostics.prefix_source_decision)},
+        {"matched_snapshots", diagnostics.matched_snapshots},
+        {"eligible_snapshots", diagnostics.eligible_snapshots},
+        {"filtered_filling_snapshots", diagnostics.filtered_filling_snapshots},
+        {"filtered_vision_snapshots", diagnostics.filtered_vision_snapshots},
+        {"filtered_capacity_snapshots", diagnostics.filtered_capacity_snapshots},
+        {"filtered_preparation_snapshots", diagnostics.filtered_preparation_snapshots},
+        {"selection_root_ns", diagnostics.selection_root_ns},
+        {"selection_best_offered_ns", diagnostics.selection_best_offered_ns},
+        {"selected_restore_bytes", diagnostics.selected_restore_bytes},
+        {"selected_disk_read_bytes", diagnostics.selected_disk_read_bytes},
     };
 }
 
@@ -599,12 +611,10 @@ std::string format_request_rejected(const RequestRejectionLogContext& context) {
 std::string format_request_done(const RequestLogContext& context,
                                 const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;
-    const double ttft_ms             = metrics.ttft_seconds * 1000.0;
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = static_cast<double>(metrics.computed_prefill_tokens);
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
@@ -612,9 +622,13 @@ std::string format_request_done(const RequestLogContext& context,
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
-        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
-        << std::setprecision(0) << ttft_ms << "ms"
-        << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
+        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=";
+    if (metrics.ttft_seconds) {
+        out << std::fixed << std::setprecision(0) << *metrics.ttft_seconds * 1000.0 << "ms";
+    } else {
+        out << "n/a";
+    }
+    out << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds) << " host=" << std::setprecision(2)
         << request_host_exposed_seconds(metrics.engine_timing) * 1000.0 << "ms";
@@ -659,6 +673,29 @@ std::string format_request_done(const RequestLogContext& context,
         out << " reasoning_loop=" << (outcome.thinking.applied ? "concluded" : "stopped")
             << " loop_thinking=" << outcome.thinking.loop_thinking_tokens
             << " loop_coverage=" << outcome.thinking.loop_coverage;
+    }
+    // Why a root (no-reuse) plan won, when the index had candidates on the table. One clause,
+    // silent for selected and none.
+    if (metrics.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        switch (metrics.materialization.prefix_source_decision) {
+        case ninfer::PrefixSourceDecision::RootNoSnapshot:
+            out << " no snapshot on path";
+            break;
+        case ninfer::PrefixSourceDecision::RootFiltered:
+            out << " snapshots filtered (filling "
+                << metrics.materialization.filtered_filling_snapshots << ", vision "
+                << metrics.materialization.filtered_vision_snapshots << ", capacity "
+                << metrics.materialization.filtered_capacity_snapshots << ", preparation budget "
+                << metrics.materialization.filtered_preparation_snapshots << ")";
+            break;
+        case ninfer::PrefixSourceDecision::RootPriced:
+            out << " reuse priced out";
+            break;
+        case ninfer::PrefixSourceDecision::None:
+        case ninfer::PrefixSourceDecision::Selected:
+        case ninfer::PrefixSourceDecision::Preparing:
+            break;
+        }
     }
     return out.str();
 }
@@ -956,13 +993,12 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      const GenerationOutcome& outcome) {
     Json record       = event_base(server_instance_id, timestamp, "request_done");
     record["request"] = request_json(context);
+    const bool has_ttft = outcome.metrics.ttft_seconds.has_value();
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
-             {"computed_prefill_tokens",
-              std::max(0, outcome.prompt_tokens -
-                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+             {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.requested_budget
@@ -981,7 +1017,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
+        {"prepare", outcome.metrics.prepare_seconds},
+        {"ttft", has_ttft ? Json(*outcome.metrics.ttft_seconds) : Json(nullptr)},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["vision_overlay"] = Json{{"windows", outcome.metrics.overlay_windows},
@@ -1234,7 +1271,10 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
                  {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
         // The disk tier (--disk-kv-path) sub-object appears only once it has moved data or holds
-        // records; it is all zeros otherwise.
+        // records; it is all zeros otherwise. `read_bytes` covers block payloads and the
+        // snapshot image and tail bundle reads, so an image-only or tail-only restore — no
+        // whole block moved — still opens the sub-object instead of hiding behind a zero
+        // `restored_blocks` delta.
         const std::uint64_t disk_demoted = delta(&RuntimeStats::hybrid_disk_demoted_blocks);
         const std::uint64_t disk_images  = delta(&RuntimeStats::hybrid_disk_demoted_images);
         const std::uint64_t disk_restored = delta(&RuntimeStats::hybrid_disk_restored_blocks);

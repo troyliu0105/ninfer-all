@@ -78,16 +78,28 @@ public:
     [[nodiscard]] RestoreSummary restore_into(pc::PrefixCacheIndex& index);
     void maybe_demote(pc::PrefixCacheIndex& index, const HostTransfers& transfers);
     void publish_completions(pc::PrefixCacheIndex& index);
+    // Failure/rebuild barrier, never part of serving admission or transfer draining.
+    void settle_sources(pc::PrefixCacheIndex& index) {
+        worker_->wait_idle();
+        publish_completions(index);
+    }
     [[nodiscard]] bool busy() const noexcept;
     void shutdown() noexcept;
     [[nodiscard]] Stats stats() const noexcept;
+    [[nodiscard]] std::uint64_t completion_revision() const noexcept {
+        return worker_ ? worker_->completion_revision() : 0;
+    }
+    [[nodiscard]] bool reads_pending() const noexcept {
+        return !reading_blocks_.empty() || reading_image_.has_value() ||
+               reading_tail_.has_value() || !staged_blocks_.empty();
+    }
+    [[nodiscard]] std::size_t block_payload_bytes() const noexcept { return host_.block_payload_bytes; }
 
     [[nodiscard]] bool stage_blocks(const std::vector<pc::NodeRef>& nodes,
                                     const pc::PrefixCacheIndex& index);
     struct StagedBlock {
         pc::NodeRef node;
         const std::byte* bytes = nullptr;
-        std::uint32_t age = 0;
         std::uint64_t lease = 0; // protects a reused physical slot from a stale release
     };
     [[nodiscard]] std::vector<StagedBlock> take_staged_blocks();

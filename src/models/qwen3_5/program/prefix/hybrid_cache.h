@@ -168,6 +168,9 @@ public:
                                  bool disk_backfill = false);
     // Publishes every completed Host write. Non-blocking.
     void poll();
+    [[nodiscard]] std::uint64_t copy_completion_revision() const noexcept {
+        return copy_completion_revision_;
+    }
 
     // Nodes and snapshots stay pinned while a Host write or a landing restore is in flight. When
     // those pins are all that stands between the pools and a request, waiting a few milliseconds
@@ -354,6 +357,7 @@ private:
     std::vector<std::uint32_t> free_blocks_;
     std::vector<StateImageHandle> images_;
     std::deque<PendingWrite> pending_;
+    std::uint64_t copy_completion_revision_ = 0;
     // Restore order within one forward pass, and the text KV planes each attention layer owns.
     std::vector<HybridRestoreLayer> layers_;
     std::size_t planes_per_attention_layer_ = 0;

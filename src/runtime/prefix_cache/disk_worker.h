@@ -2,6 +2,7 @@
 
 #include "runtime/prefix_cache/disk_catalog.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -69,6 +70,12 @@ public:
     void remove(std::uint32_t record);
     [[nodiscard]] std::vector<Completion> take_completions();
     [[nodiscard]] bool busy() const;
+    // Recovery/shutdown barrier only: finish accepted I/O before its source owner is cleared.
+    // Completed records are still adopted by the Engine, not by this wait.
+    void wait_idle();
+    [[nodiscard]] std::uint64_t completion_revision() const noexcept {
+        return completion_revision_.load(std::memory_order_acquire);
+    }
     void shutdown() noexcept;
 
 private:
@@ -84,6 +91,7 @@ private:
     std::uint32_t max_reads_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
+    std::condition_variable idle_;
     std::deque<std::variant<BlockWrite, ImageWrite>> writes_;
     std::deque<Read> reads_;
     std::deque<std::uint32_t> removals_;
@@ -91,6 +99,7 @@ private:
     std::vector<Completion> completed_;
     std::uint64_t write_bytes_ = 0;
     std::uint32_t read_count_ = 0;
+    std::atomic<std::uint64_t> completion_revision_{0};
     bool running_ = false;
     bool stopping_ = false;
     std::thread thread_;

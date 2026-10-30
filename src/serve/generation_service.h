@@ -26,7 +26,13 @@ struct RequestCapacity;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
-    double ttft_seconds    = 0.0;
+    // Set only when the request committed its first output token. A cancellation before any
+    // output has no TTFT; do not report the prepare time in its place.
+    std::optional<double> ttft_seconds = std::nullopt;
+    // Prompt tokens the Engine's prefill actually evaluated for this request, as the Engine
+    // reported per step: zero when no prefill ran (a held-branch memo hit, a waiting
+    // cancellation), the partial count of a cancelled prefill, the full suffix otherwise.
+    std::uint32_t computed_prefill_tokens = 0;
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
     std::uint32_t overlay_windows           = 0;

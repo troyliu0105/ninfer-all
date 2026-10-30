@@ -246,6 +246,7 @@ struct HybridAdmissionQuote {
     runtime::Readiness readiness = runtime::Readiness::TemporarilyBlocked;
     runtime::LaneId destination{};
     runtime::RequestPlanSummary summary;
+    MaterializationDiagnostics diagnostics;
     std::shared_ptr<detail::HybridQuoteImpl> impl;
 };
 
@@ -1251,7 +1252,8 @@ public:
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept;
     [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPrompt& prompt,
                                                     const RequestBasePlan& base,
-                                                    runtime::LaneId destination);
+                                                    runtime::LaneId destination,
+                                                    std::uint64_t publication_order);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPrompt&& prompt,
                                    runtime::CancellationFlagView cancellation);
@@ -1266,6 +1268,11 @@ public:
                                                                const RequestBasePlan& base);
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    // Cold preparation is cache work outside a lane/global context transaction. Only real
+    // completion, resource or budget changes re-arm the FIFO head's admission.
+    [[nodiscard]] bool hybrid_prepare_progress();
+    [[nodiscard]] bool hybrid_prepare_pending() const noexcept;
+    void hybrid_prepare_abandon(std::uint64_t publication_order) noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);

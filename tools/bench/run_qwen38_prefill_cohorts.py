@@ -128,6 +128,8 @@ def run_cohort(cohort: int) -> dict:
     (out / "responses.json").write_text(json.dumps(clients, indent=2), encoding="utf-8")
     records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
     done = [record for record in records if record.get("event") == "request_done"]
+    if any(record["timings_seconds"]["ttft"] is None for record in done):
+        raise RuntimeError("cohort contains a request with no first token; inspect request log")
     prompt_tokens = sum(record["result"]["computed_prefill_tokens"] for record in done)
     max_prefill_seconds = max(record["timings_seconds"]["prefill"] for record in done)
     result = {

@@ -244,12 +244,16 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
                                          std::uint32_t prompt_tokens) const {
     AdmissionChoice best;
     best.predicted_seconds     = config_.cost.prefill_seconds(0, prompt_tokens);
+    best.root_seconds          = best.predicted_seconds;
     std::uint64_t best_restore = 0;
     for (std::size_t i = 0; i < match.candidates.size(); ++i) {
         const MatchCandidate& candidate = match.candidates[i];
         const double seconds =
             config_.cost.restore_seconds(candidate.restore_bytes, candidate.disk_read_bytes) +
             config_.cost.prefill_seconds(candidate.frontier, prompt_tokens - candidate.frontier);
+        if (i == 0 || seconds < best.best_offered_seconds) {
+            best.best_offered_seconds = seconds;
+        }
         const bool better = seconds < best.predicted_seconds ||
                             (seconds == best.predicted_seconds && best.candidate &&
                              candidate.restore_bytes < best_restore);
@@ -257,6 +261,8 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
             best.candidate         = i;
             best.predicted_seconds = seconds;
             best_restore           = candidate.restore_bytes;
+            best.restore_bytes     = candidate.restore_bytes;
+            best.disk_read_bytes   = candidate.disk_read_bytes;
         }
     }
     return best;

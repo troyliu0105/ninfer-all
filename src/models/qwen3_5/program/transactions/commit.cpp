@@ -1113,6 +1113,15 @@ ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
         if (device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
         }
+        try {
+            hybrid_->drain();
+            if (hybrid_disk_) {
+                hybrid_disk_->settle_sources(hybrid_->index());
+                cold_preparation_.clear_after_settlement(*hybrid_disk_);
+                image_staged_inflight_ = false;
+                tail_staged_inflight_ = false;
+            }
+        } catch (...) { return std::nullopt; }
         hybrid_->clear();
     }
     // The orderly stop writes the catalogued continuations still resident to the disk tier before
@@ -1230,6 +1239,7 @@ bool ProgramImpl::rebuild_context_stores() noexcept {
         hybrid_.reset();
         try {
             create_hybrid_prefix_cache(StartupObserver{});
+            if (hybrid_disk_) { hybrid_->attach_disk_tier(hybrid_disk_.get()); }
         } catch (...) { return false; }
     }
     advance_resource_revision();

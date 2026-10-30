@@ -257,13 +257,19 @@ def metrics(A, cold_seeds):
     budget = ((A["start"] or {}).get("server") or {}).get("default_thinking_budget")
     tp = sum(r["prompt"] for r in rows)
     th = sum(r["hit"] for r in rows)
+    ttft_samples = sum(r["ttft"] is not None for r in rows)
     m = {
         "n": len(rows),
         "n_failed": sum(1 for r in A["requests"] if r["cls"] != "aborted" and not r.get("server")),
+        "n_ttft": ttft_samples,
+        "n_no_first_token": len(rows) - ttft_samples,
         "ttft_mean": mean([r["ttft"] for r in rows]),
         "ttft_median": median([r["ttft"] for r in rows]),
         "ttft_p90": pct([r["ttft"] for r in rows], 0.9),
-        "service_ttft_mean": mean([r["ttft"] - r["queue_s"] for r in rows]),
+        # An absent TTFT (a cancellation before any first token) is not a number and must not
+        # enter the arithmetic; mean() drops the None entries.
+        "service_ttft_mean": mean([r["ttft"] - r["queue_s"] for r in rows
+                                   if r["ttft"] is not None]),
         "queue_mean": mean([r["queue_s"] for r in rows]),
         "ttft_cont_mean": mean([r["ttft"] for r in cont]),
         "ttft_cont_median": median([r["ttft"] for r in cont]),
@@ -388,6 +394,9 @@ def headline_specs(c):
     its interval from `intervals` when it has one. Change kinds: `rel` percent, `pp` points,
     `abs` count difference."""
     return [
+        ("Requests with an observed first token", ("n_ttft",), f0, "abs", None),
+        ("Requests without a first token (excluded from TTFT)", ("n_no_first_token",),
+         f0, "abs", None),
         ("Average time to first token (s, lower is better)", ("ttft_mean",), f1, "rel", None),
         ("Median time to first token (s, lower is better)", ("ttft_median",), f2, "rel", None),
         ("90th-percentile time to first token (s, lower is better)", ("ttft_p90",), f1, "rel",
@@ -614,6 +623,10 @@ def aggregate(out_dir, run_dirs):
                 ntok(first["config"].get("max_context")), first["control"]["n"]))
     problems = ["seed %d %s: %d failed request(s)" % (seed, a, s[a]["n_failed"])
                 for seed, (_, s) in zip(seeds, runs) for a in arms if s[a]["n_failed"]]
+    problems += ["seed %d %s: %d request(s) produced no first token" %
+                 (seed, a, s[a]["n_no_first_token"])
+                 for seed, (_, s) in zip(seeds, runs) for a in arms
+                 if s[a]["n_no_first_token"]]
     if problems:
         L.append("**Validity warnings:** " + "; ".join(problems) + "\n")
     L.append("## Headline (mean over seeds, min-max in brackets)\n")
@@ -704,6 +717,9 @@ def main(argv):
         if ms[a]["n_failed"]:
             problems.append("%s: %d workload request(s) have no request_done record"
                             % (a, ms[a]["n_failed"]))
+        if ms[a]["n_no_first_token"]:
+            problems.append("%s: %d workload request(s) produced no first token" %
+                            (a, ms[a]["n_no_first_token"]))
         if ms[a]["context_guards"]:
             problems.append("%s: the client context guard fired %d time(s)"
                             % (a, ms[a]["context_guards"]))

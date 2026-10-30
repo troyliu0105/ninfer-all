@@ -44,10 +44,6 @@ CUmemAllocationProp allocation_properties(int device) {
     return prop;
 }
 
-std::size_t align_up(std::size_t value, std::size_t alignment) {
-    return (value + alignment - 1) / alignment * alignment;
-}
-
 } // namespace
 
 std::size_t granularity(int device) {

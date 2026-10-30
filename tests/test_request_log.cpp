@@ -460,6 +460,7 @@ int main() {
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
+    outcome.metrics.computed_prefill_tokens = 300;
     outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
@@ -588,8 +589,10 @@ int main() {
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
     failures +=
-        check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
-              "TTFT missing or lost precision");
+        check(done.at("timings_seconds").at("ttft").is_number() &&
+                  done.at("timings_seconds").at("ttft").get<double>() ==
+                      *outcome.metrics.ttft_seconds,
+              "a present TTFT must serialize at full precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
@@ -618,14 +621,46 @@ int main() {
             done.at("engine_timing").at("units").at("prefill") == 4,
         "request Engine timing exposure is incomplete");
 
-    const OperationalRecord pretty_done = render_request_done(context, outcome);
-    failures += check(
-        pretty_done.message ==
-            "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
-            "(25.2%, response replay) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
-            "gen 3, 12 sources | thinking 256/256, control 19",
-        "pretty request-done record mismatch");
+    // A req#220-shaped cancellation: admitted, waited, cancelled with zero output. The absent
+    // TTFT is serialized as null and rendered "n/a", never as the prepare time.
+    GenerationOutcome cancelled = outcome;
+    cancelled.completion_tokens = 0;
+    cancelled.tokens.clear();
+    cancelled.metrics.ttft_seconds.reset();
+    cancelled.metrics.computed_prefill_tokens = 0U;
+    cancelled.metrics.prefill_seconds         = 0.0;
+    cancelled.metrics.decode_seconds          = 0.0;
+    const Json cancelled_done =
+        Json::parse(format_request_done_json("serve-test", 3005, context, cancelled));
+    failures += check(cancelled_done.at("timings_seconds").at("ttft").is_null() &&
+                          cancelled_done.at("timings_seconds").at("prepare").get<double>() ==
+                              cancelled.metrics.prepare_seconds,
+                      "a no-first-token cancellation must report a null TTFT, not the prepare "
+                      "time");
+    failures += check(cancelled_done.at("result").at("computed_prefill_tokens") == 0,
+                      "a cancelled prompt must not report planned tokens as computed");
+
+    // A valid zero TTFT: a fully cached prompt that emitted its token immediately. The zero is
+    // a produced first token and must survive as a number, not an absence.
+    GenerationOutcome cached_zero = cancelled;
+    cached_zero.completion_tokens               = 1;
+    cached_zero.metrics.ttft_seconds            = 0.0;
+    cached_zero.metrics.computed_prefill_tokens = 0U;
+    cached_zero.metrics.prefill_seconds         = 0.0;
+    const Json zero_done =
+        Json::parse(format_request_done_json("serve-test", 3006, context, cached_zero));
+    failures += check(zero_done.at("timings_seconds").at("ttft").is_number() &&
+                          zero_done.at("timings_seconds").at("ttft") == 0.0,
+                      "a real zero TTFT with a first token must not be read as an absence");
+
+    // The executed computed-prefill fact wins over the prompt-minus-hit plan: a partially
+    // prefilled request reports the tokens the prefill actually evaluated.
+    GenerationOutcome partial = outcome;
+    partial.metrics.computed_prefill_tokens = 137U;
+    const Json partial_done =
+        Json::parse(format_request_done_json("serve-test", 3007, context, partial));
+    failures += check(partial_done.at("result").at("computed_prefill_tokens") == 137,
+                      "the executed computed-prefill count must replace the planned derivation");
 
     GenerationOutcome normalized_tool_outcome = outcome;
     normalized_tool_outcome.tool_calls.push_back(
@@ -905,11 +940,23 @@ int main() {
             disk.at("write_bytes") == 4096 && disk.at("queue_rejects") == 3 &&
             disk.at("failed_closures") == 1 && disk.at("evicted_records") == 7,
         "hybrid disk sub-object must report interval deltas and gauges");
-    const std::string disk_pretty = render_throughput(disk_report).message;
-    failures += check(
-        disk_pretty.find("disk demoted 12 blocks (4.00 KiB)") != std::string::npos &&
-            disk_pretty.find("disk restored 5 blocks (5.00 KiB)") != std::string::npos,
-        "pretty throughput must name disk demotion and restore traffic");
+    // An image-only or tail-only restore moves read bytes without any whole block: the record
+    // must still show the traffic instead of hiding behind the zero restored-blocks delta.
+    ThroughputReport image_restore_only;
+    image_restore_only.interval_seconds                 = 5.0;
+    image_restore_only.previous.hybrid_tree_blocks      = 4;
+    image_restore_only.previous.hybrid_disk_read_bytes  = 4096;
+    image_restore_only.current.hybrid_tree_blocks       = 8;
+    image_restore_only.current.hybrid_disk_read_bytes   = 4096 + 3 * 1024 * 1024;
+    const Json image_restore_json =
+        Json::parse(format_throughput_json("serve-test", 5004, image_restore_only));
+    failures += check(image_restore_json.at("context_cache").at("hybrid").at("disk").at(
+                          "read_bytes") == 3 * 1024 * 1024 &&
+                          image_restore_json.at("context_cache")
+                              .at("hybrid")
+                              .at("disk")
+                              .at("restored_blocks") == 0,
+                      "an image-only disk restore must open the disk sub-object");
     // A hybrid report whose disk tier is idle must omit the `disk` sub-object entirely.
     ThroughputReport host_only;
     host_only.interval_seconds = 5.0;

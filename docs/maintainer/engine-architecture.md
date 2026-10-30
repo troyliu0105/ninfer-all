@@ -675,6 +675,9 @@ repository-internal semantic Op contracts。`.ninfer` 是唯一 C++ 产品 artif
 兼容 shim 或第二套产品入口加载其他格式。CLI、server 和 inference benchmark 只通过公共 Engine
 推理；converter 不提供 Python model-inference route。
 
+新增这些领域头文件中的值类型时，同步补齐 `types_fwd.h` 的声明。提交前运行
+`python3.11 scripts/check-include-boundaries.py`；普通编译和 CTest 不替代这个独立的声明完整性与包含边界检查。
+
 Artifact 层拥有通用文件与驻留合同，模型实现拥有数学及状态操作，runtime 拥有公共运行合同与
 Engine 发布政策，product/serving 拥有输入获取及协议翻译。每个语义闭合的 Op（包括 fused、
 fixed-shape 和 device-specialized 实现）都归 `src/ops`。

@@ -4,13 +4,13 @@
 [Hybrid prefix cache](hybrid-prefix-cache-spec.md). Hybrid mode accepts `--disk-kv-path` with
 `--disk-kv-gib` (default 64 GiB) and opens its own catalog under the artifact-scoped directory;
 the Legacy-only `--disk-kv-restore` and `--disk-kv-directstorage` switches remain Legacy-only.
-Host-only tests cover the production demotion/staging/completion orchestration as well as source
-leases, bounded streaming repair, branched reclamation, failed-source fallback, exact catalog
-reservations/replay and real worker I/O, including blocked-journal isolation. The real-engine
-scenarios (`disk-demotion`, `disk-restore`,
-`disk-restart`, `disk-tail-restore`, `disk-small-capacity`, `disk-long-chain`) now require completed
-image demotion, not merely block writes. Those strengthened scenarios have not been requalified
-on a GPU for the current lifecycle changes. The feature remains opt-in and GPU-unqualified;
+Host-only tests cover production demotion, cold-preparation control, staging and completion
+orchestration, source leases, bounded repair, branched reclamation, failed-source fallback,
+catalog replay and real worker I/O, including blocked-journal isolation. The real-engine
+scenarios (`disk-demotion`, `disk-restore`, `disk-restart`, `disk-tail-restore`,
+`disk-small-capacity`, `disk-long-chain`) require completed image demotion. `disk-long-chain`
+additionally requires the first request after restart to restore more than the maximum staging
+batch, without a warm retry. These changed CUDA bindings and scenarios remain GPU-unqualified;
 neither numerical restore nor the performance contract (§9) follows from CPU coverage.
 
 The extension retains cold prefixes after the pinned Host cache comes under pressure, serves
@@ -66,15 +66,18 @@ cache base class, storage-plugin framework or a copy of the Legacy owner/catalog
 |---|---|
 | Core storage | Physical records, bounded I/O, payload checksums and read claims |
 | `runtime/prefix_cache` | Exact tree identity, snapshot dependencies, per-tier residency and victim selection; `PrefixDiskCatalog` owns persistent metadata and `PrefixDiskWorker` executes runtime storage I/O |
-| Qwen3.5 Program / `HybridPrefixCache` / `HybridDiskTier` | Program owns pinned staging, cache owns Host slabs and CUDA copy events; the CUDA-independent tier borrows staging and requests physical fills, then adopts disk completions on the Engine thread |
-| Program admission | Quote ready sources, validate resources, bind prepared data and activate a lane |
+| Qwen3.5 Program / `HybridPrefixCache` / `HybridDiskTier` | Program owns pinned staging and `ColdPreparation`; cache owns Host slabs and CUDA copy events; the CUDA-independent tier borrows staging, requests physical fills and adopts disk completions on the Engine thread |
+| Program admission | Prepare bounded cold batches outside the context transaction, then quote ready sources, validate resources, bind prepared data and activate a lane |
 | Engine | FIFO, deadlines, cancellation, execution order and publication |
 
 The Engine worker remains the only mutator of the tree and residency state. I/O workers receive
 immutable job descriptions and return completion records. They do not release logical pages,
-edit nodes or publish snapshots. The Engine must receive a completion notification that re-arms
-head preparation/admission, including when no GPU unit is running; polling must not busy-spin or
-rely solely on another request reaching a boundary.
+edit nodes or publish snapshots. The worker publishes an atomic completion revision, and the
+physical cache separately versions Host/Device copy completions. A queued preparation keeps
+Engine progress enabled even with no active lane. The bounded idle cadence observes both:
+image/tail availability can change without new disk I/O or more free KV pages. Only readiness
+changes re-arm admission; an unchanged poll does not repeat matching/resource inspection or
+depend on another request.
 
 Existing code offers these reuse boundaries:
 
@@ -104,6 +107,14 @@ pins and publishes Host residency only when the copy lands. Production callbacks
 existing CUDA paths. CPU tests supply distinct memory buffers and explicitly delayed completion
 events, while executing the same tier/index/catalog/worker code, not a second demotion algorithm.
 Program destroys the tier and settles its worker before freeing staging or Host source slabs.
+Pinned staging also outlives `HybridPrefixCache`: its detached prefetches use a private restore
+stream, not the Program's compute/transfer streams. Member destruction therefore stops disk
+jobs, synchronizes the cache's CUDA copies, then frees their staging. Synchronizing only the
+Program streams does not establish this source-lifetime boundary.
+
+Recovery also settles accepted disk source jobs and CUDA copies before clearing Host slabs,
+staging leases or index descriptors. The rebuilt cache reattaches the existing disk tier.
+This settlement barrier is confined to failure/rebuild and teardown, never normal admission.
 
 ## 3. Residency, identity and capacity
 
@@ -333,6 +344,8 @@ recomputation decision, and no Disk reads are staged for a root choice.
 Disk reads and cold preparation run while the FIFO head remains queued. They do not occupy the
 Engine's global context transaction or an active lane. Preserve FIFO; do not add backfill or run a
 second model prefill in a race against the read.
+Hybrid skips speculative backfill inspections altogether: its FIFO contract cannot grant those
+candidates admission, and inspection must not start reads or replace the true head's preparation.
 
 This boundary is required by the current Engine. In
 [`engine_core.h`](../../src/runtime/engine/engine_core.h), `snapshot_cancellations`,
@@ -342,10 +355,12 @@ completion and resource release even if their decode kernels continued to run.
 
 Cold preparation proceeds as follows:
 
-1. Lease the selected Disk records and establish a bounded, cancellable preparation job for the
-   head. Disk read leases protect storage records and metadata, not the Device LRU path.
-2. Read and verify a bounded batch into pinned staging. Coalesce suitable file extents and keep
-   read concurrency bounded. Give demanded reads priority over background demotion writes.
+1. Establish a preparation owned by the FIFO head's publication identity, selected snapshot and
+   exact path. Equal prompt lengths are not request or prefix identity. `Preparing` is distinct
+   from a capacity-blocked quote: an idle Engine progresses it instead of rejecting overload.
+   Disk read leases protect storage records and metadata, not the Device LRU path.
+2. Read and verify bounded block jobs into pinned staging. Give demanded reads priority over
+   background demotion writes; this implementation does not coalesce separate block records.
 
    The batch is the staging pool, never the whole cold path: `stage_blocks` queues what the pool
    can hold now and the next cadence point queues more, so a chain longer than the pool (which is
@@ -355,15 +370,21 @@ Cold preparation proceeds as follows:
    staging slot recycles only after the copy that consumed it lands — the node is device-Resident
    again, or no batch reads it — and a duplicate release is ignored, so two nodes can never be
    handed the same slot.
+   Readiness never requires the whole cold chain to occupy staging simultaneously, and polling
+   age never releases an unconsumed payload. `ColdPreparation` is the sole block-staging owner;
+   the physical Program callback consumes each ready batch and reports accepted Device fills.
+   Each delivered block is revalidated: another consumer's Filling/Resident Device destination
+   is not overwritten, and a newly ready Host copy takes the ordinary Host restore path.
 3. When bytes are ready and spare cache capacity exists, allocate cache-owned Device
    destinations, submit H2D on the restore stream and mark those destinations Filling.
    No Device destination stays pinned while waiting for an unsubmitted disk read.
 4. Publish copies after their CUDA events complete. Completed prefetched entries remain ordinary
    cache and may yield to active growth. Do not hold a whole cold path unevictable throughout a
    slow preparation.
-5. Once the chosen path, image and tail are ready on Device or Host, request a fresh admission
-   quote. The short existing transaction revalidates the source, reserves the execution
-   entitlement and binds/activates the lane. It waits on no unfinished disk read.
+5. Once the path is Device/Host-ready and its image/tail bytes are ready in their ordinary or
+   disk-staging locations, request a fresh admission quote. The short transaction revalidates
+   sources, reserves the execution entitlement and binds/activates the lane. It waits on no
+   unfinished disk read.
 
 The complete prefix need not fit in Host. Batches pass through staging to Device; optional Host
 promotion follows normal retention policy rather than becoming a prerequisite for admission.
@@ -376,10 +397,18 @@ change, or choose another feasible source. No cold reservation may borrow active
 After any eviction, stale quote or changed source, re-evaluate the ready subset instead of
 assuming prefetch reserved a future admission.
 
-A remaining-time budget limits waiting. If the disk choice loses its advantage or the request's
-deadline/cancellation intervenes, abandon that choice before admission and select another source
-when appropriate. Accepted I/O and CUDA work retain their buffers until completion; abandoning
-a request does not permit early buffer reuse.
+A monotonic per-head budget limits waiting: the minimum of the root estimate and feasible
+non-disk offer costs, minus the chosen suffix's predicted prefill cost, clamped at zero.
+Requoting the same head does not renew this budget. Already-ready sources win at expiry; checking
+them may not start another read. Otherwise expiry or a lost required source selects `Fallback`
+and excludes still-disk-dependent candidates for that head; a new head gets a new budget.
+Cancellation detaches only its matching publication identity. Accepted I/O and CUDA work retain
+their buffers until completion, including across replacement by an equal-length request.
+Completed fills remain
+ordinary evictable cache entries; no whole-path reservation spans a disk wait.
+An accepted copy that lands after expiry can still make the queued head ready: `Fallback`
+forbids renewed work/waiting, not reuse of completed data. That transition starts no new reads,
+does not renew the budget and cannot revive an abandoned head.
 
 ### Transfer isolation
 
@@ -392,6 +421,43 @@ Only a batch whose disk bytes are ready may join the bounded CUDA copy lifecycle
 staging only after the corresponding event. The compute stream receives no wait on an event
 whose production depends on a future disk read. Preserve the existing Host-only layer-pipelined
 restore; activation does not require introducing layer-pipelined disk consumption.
+
+### Attribution and interpretation
+
+Request-log schema 30 separates a KV match, a usable snapshot, the selection price and actual
+execution. Hybrid materialization diagnostics describe the latest inspection, retained even if
+the request is cancelled during preparation; they do not imply admission or executed prefill.
+
+| Field | Meaning |
+|---|---|
+| `cached_prefix_tokens` | Deepest exact KV-block match, independent of snapshot usability |
+| `best_reuse_prompt_tokens` | Deepest valid matched snapshot before feasibility filters |
+| `prefix_source_decision` | `none`, `preparing`, `selected`, `root_no_snapshot`, `root_filtered`, or `root_priced` |
+| `matched_snapshots`, `eligible_snapshots` | Candidate counts before and after filters |
+| `filtered_filling_snapshots`, `filtered_vision_snapshots`, `filtered_capacity_snapshots`, `filtered_preparation_snapshots` | Mutually exclusive first-rejection counts, in that order; the last is exhausted/failed preparation |
+| `selection_root_ns`, `selection_best_offered_ns` | Predicted root and cheapest eligible snapshot costs, including the offered price when root wins; use `eligible_snapshots` to distinguish no offer from a zero-cost offer |
+| `selected_restore_bytes`, `selected_disk_read_bytes` | Source-work estimates for the selected quote, not completed traffic |
+
+A gap between matched KV and actual reused tokens does not by itself identify snapshot placement,
+eviction or a pricing error. The old logs cannot distinguish these causes; identical matched
+lengths also do not establish identical prompts. The diagnostics add bounded scalar attribution,
+not prompt text or per-token traces, and do not retune selection or retention.
+
+`restored_host_bytes` includes Host/staging-to-Device copies attributed to cold preparation and
+admission; `restored_disk_bytes` is the disk-delivered subset. Preparation can precede prefill.
+Periodic disk `read_bytes` includes all completed logical payload reads, including image/tail-only
+intervals and retries, not physical SSD traffic. Image-only demotion and byte-only reads appear
+in the human throughput log even when the whole-block count is zero.
+
+`timings_seconds.ttft` is `null` when no first token was emitted, and a real immediate first token
+may have numeric zero. Console TTFT means exclude absent samples. `computed_prefill_tokens`
+counts executed work, including a partially prefilled cancellation, rather than the planned
+prompt-minus-hit suffix. Qwen3.5 `prefill` is summed pass time, not the entire elapsed interval
+from first to last prefill; queue wait and other lanes' gaps must not be inferred from it.
+Analysis excludes absent TTFTs from timing means but keeps those requests in request/work totals;
+its `n_ttft` and `n_no_first_token` counts and validity warnings expose that denominator.
+Benchmark cohorts requiring completed generations reject a missing first token instead of
+silently dropping the failed sample from their average.
 
 ## 6. Persistent records and restart
 
@@ -645,6 +711,19 @@ that cancellation of request interest never permits source reuse, accepted write
 budget until adoption, and held repair events do not accumulate pins. Real payload corruption,
 stale read completions and a failed tombstone journal exercise fallback and cleanup retries.
 
+The same executable also drives production `ColdPreparation` with a 12-block disk-only chain
+through two staging slots. It checks first-attempt readiness, exactly one read per block, and
+independent destination bytes. Delayed copy completion, cancellation, an equal-length different
+head, repeated idle polls, monotonic budget exhaustion and settled cleanup exercise the actual
+preparation state machine. Auxiliary-copy completion must wake preparation even with unchanged
+disk completion revision and free-page count. The physical callbacks are CPU buffers, not CUDA
+event/kernel qualification; the shared Engine readiness decision also checks that idle preparation
+is not mistaken for an impossible placement.
+Late completion after budget exhaustion must also reach Ready without another read; a repeated
+Fallback poll does not re-arm admission unless readiness actually changes.
+A competing Device fill during an accepted disk read must keep its destination and bytes; the
+preparation owner releases the unused read buffer instead of attempting a second fill.
+
 The staging-slot lease includes a monotonically assigned generation, carried through Program
 queues and checked on release. A delayed duplicate release after the slot has changed owners
 cannot free the new reader's buffer; a free/busy bit alone does not protect this reuse boundary.
@@ -695,6 +774,12 @@ silently come from Device, Host or the old persistence file. Verify a prefix lar
 pool, restart reconstruction, multiple shared branches, pressure during active growth and
 cancellation while disk reads or CUDA copies remain outstanding. Include an idle Engine so job
 completion itself must wake admission.
+
+`disk-long-chain` now closes the saving Engine, reopens the persisted cache in a fresh Engine and
+submits the extended prompt exactly once. It requires reuse of at least 17,000 tokens, more than
+256 restored blocks, bounded completed read bytes and greedy outputs matching its no-disk
+reference. A warm second attempt cannot satisfy these assertions. This scenario still needs a
+real artifact/GPU run.
 
 Compare restored KV and StateImage bytes exactly with their captured representation. Compare
 Disk and hot restores of the same snapshot under the same continuation path. Root-vs-resumed

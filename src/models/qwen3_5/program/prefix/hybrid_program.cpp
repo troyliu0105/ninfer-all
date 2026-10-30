@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 #include <bit>
 #include <chrono>
@@ -263,60 +264,105 @@ HybridCachePersistence public_result(const HybridPersistResult& result) {
 
 // ---- disk staging helpers ------------------------------------------------------------------------
 
-bool ProgramImpl::hybrid_staged_held(pc::NodeRef node) const noexcept {
-    const auto matches = [&](const HybridDiskTier::StagedBlock& staged) {
-        return staged.node == node;
-    };
-    return std::any_of(staged_blocks_.begin(), staged_blocks_.end(), matches) ||
-           std::any_of(staged_inflight_.begin(), staged_inflight_.end(), matches);
-}
-
-std::vector<pc::NodeRef>
-ProgramImpl::hybrid_disk_stageable(std::span<const pc::NodeRef> nodes) const {
-    std::vector<pc::NodeRef> cold;
-    if (hybrid_disk_ == nullptr) { return cold; }
-    const pc::PrefixCacheIndex& index = hybrid_->index();
-    for (const pc::NodeRef node : nodes) {
-        if (!index.valid(node)) { continue; }
-        const pc::NodeView view = index.node(node);
-        if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Absent ||
-            view.disk != pc::CopyState::Resident) {
-            continue; // not disk-only: nothing to stage (a Host fill in flight is not either)
+bool ProgramImpl::hybrid_prepare_auxiliary(pc::SnapshotRef snapshot, bool allow_reads) {
+    const auto view = hybrid_->index().snapshot(snapshot);
+    bool ready = true;
+    if (view.device_slot == pc::kNoId && view.host != pc::CopyState::Resident) {
+        if (allow_reads && !image_staged_inflight_) {
+            hybrid_disk_->release_staged_image_except(snapshot);
+            (void)hybrid_disk_->stage_image(snapshot, hybrid_->index());
         }
-        if (hybrid_staged_held(node)) { continue; } // already landed or a batch reads it
-        cold.push_back(node);
+        ready = hybrid_disk_->take_staged_image(snapshot) != nullptr;
     }
-    return cold;
+    if (view.tail_len != 0 && view.tail_device_copy != pc::CopyState::Resident &&
+        view.host != pc::CopyState::Resident) {
+        if (allow_reads && !tail_staged_inflight_) {
+            hybrid_disk_->release_staged_tail_except(snapshot);
+            (void)hybrid_disk_->stage_tail(snapshot, hybrid_->index());
+        }
+        ready = ready && hybrid_disk_->staged_tail(snapshot) != nullptr;
+    }
+    return ready;
 }
 
-void ProgramImpl::hybrid_disk_release_stale_staging() {
-    if (hybrid_disk_ == nullptr || staged_blocks_.empty()) { return; }
-    const pc::PrefixCacheIndex& index = hybrid_->index();
-    std::vector<HybridDiskTier::StagedBlock> expired;
-    for (std::size_t i = 0; i < staged_blocks_.size();) {
-        HybridDiskTier::StagedBlock& staged = staged_blocks_[i];
-        ++staged.age;
-        bool drop = false;
-        if (!index.valid(staged.node)) {
-            drop = true; // the node left the index: the bytes serve nobody
-        } else {
-            const pc::CopyState device = index.node(staged.node).device;
-            if (device == pc::CopyState::Resident) {
-                // A Device copy exists and no batch reads these bytes: the staging is redundant
-                // (a consuming batch holds the node Filling until its H2D event lands).
-                drop = true;
-            } else if (device != pc::CopyState::Filling) {
-                drop = staged.age >= 2; // nobody consumed it in two cycles: return the slot
+std::uint32_t ProgramImpl::hybrid_prepare_copy(
+    std::span<const HybridDiskTier::StagedBlock> blocks, std::span<const pc::NodeRef> path) {
+    if (hybrid_->prefetch_landing() || hybrid_->restore_open() || has_context_transaction()) {
+        return 0;
+    }
+    auto& index = hybrid_->index();
+    index.acquire_path(path);
+    std::uint32_t started = 0;
+    try {
+        auto& text_pool = text_kv_pages->physical_pool();
+        auto* backend_pool = backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
+        const auto available = [&] {
+            return backend_pool ? std::min(text_pool.available_pages(), backend_pool->available_pages())
+                                : text_pool.available_pages();
+        };
+        auto wanted = std::min(static_cast<std::uint32_t>(blocks.size()), kPrefetchBatchBlocks);
+        while (available() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        wanted = std::min(wanted, available());
+        if (wanted != 0) {
+            auto text = text_pool.reserve(wanted);
+            auto backend = backend_pool ? backend_pool->reserve(wanted)
+                                        : std::optional<DeviceKVPageReservation>{};
+            if (text && (!backend_pool || backend)) {
+                hybrid_->open_restore(device.stream);
+                for (std::uint32_t i = 0; i < wanted; ++i) {
+                    HybridBlockPages pages{
+                        .text = text_kv_pages->materialize_transfer_destination(*text, kBlock)};
+                    if (backend_pool) {
+                        pages.backend = backend_kv_pages->materialize_transfer_destination(*backend, kBlock);
+                    }
+                    hybrid_->restore_block_from_staging(blocks[i].node, blocks[i].bytes, pages);
+                    ++started;
+                }
+                hybrid_->submit_restore();
+                hybrid_->detach_prefetch();
             }
         }
-        if (!drop) {
-            ++i;
-            continue;
-        }
-        expired.push_back(staged);
-        staged_blocks_.erase(staged_blocks_.begin() + static_cast<std::ptrdiff_t>(i));
+    } catch (...) {
+        hybrid_->abort_restore();
+        index.release_path(path);
+        throw;
     }
-    if (!expired.empty()) { hybrid_disk_->release_staged(expired); }
+    index.release_path(path);
+    return started;
+}
+
+bool ProgramImpl::hybrid_prepare_pending() const noexcept {
+    return hybrid_disk_ && cold_preparation_.pending(*hybrid_disk_);
+}
+
+void ProgramImpl::hybrid_prepare_abandon(std::uint64_t publication_order) noexcept {
+    if (hybrid_disk_) { cold_preparation_.abandon(publication_order, *hybrid_disk_); }
+}
+
+bool ProgramImpl::hybrid_prepare_progress() {
+    if (!hybrid_prepare_pending() || has_context_transaction() || hybrid_->restore_open()) {
+        return false;
+    }
+    hybrid_->poll();
+    hybrid_disk_poll(false);
+    const ColdPreparation::Copies copies{
+        this, hybrid_->copy_completion_revision(),
+        [](void* p) {
+            const auto& self = *static_cast<ProgramImpl*>(p);
+            return self.hybrid_->prefetch_landing() ? 0U : self.hybrid_prefetch_room();
+        },
+        [](void* p, std::span<const HybridDiskTier::StagedBlock> blocks,
+           std::span<const pc::NodeRef> path) {
+            return static_cast<ProgramImpl*>(p)->hybrid_prepare_copy(blocks, path);
+        },
+        [](void* p, pc::SnapshotRef snapshot, bool allow_reads) {
+            return static_cast<ProgramImpl*>(p)->hybrid_prepare_auxiliary(snapshot, allow_reads);
+        }};
+    const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    const bool changed = cold_preparation_.progress(hybrid_->index(), *hybrid_disk_, now, copies);
+    if (changed) { advance_resource_revision(); }
+    return changed;
 }
 
 HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
@@ -385,9 +431,47 @@ std::uint32_t ProgramImpl::hybrid_backend_frontier(std::uint32_t frontier) const
 
 // ---- admission ---------------------------------------------------------------------------------
 
+MaterializationDiagnostics HybridQuoteImpl::diagnostics(bool preparing) const {
+    MaterializationDiagnostics out;
+    const auto nanoseconds = [](double seconds) {
+        if (!(seconds > 0.0)) { return std::uint64_t{0}; }
+        constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+        if (!std::isfinite(seconds) || seconds >= static_cast<double>(maximum) / 1.0e9) {
+            return maximum;
+        }
+        return static_cast<std::uint64_t>(seconds * 1.0e9);
+    };
+    out.cached_prefix_tokens = cached_prefix_tokens;
+    out.best_reuse_prompt_tokens = std::max(best_matched_frontier, reuse_frontier);
+    out.matched_snapshots = matched_snapshots;
+    out.eligible_snapshots = eligible_snapshots;
+    out.filtered_filling_snapshots = filtered_filling_snapshots;
+    out.filtered_vision_snapshots = filtered_vision_snapshots;
+    out.filtered_capacity_snapshots = filtered_capacity_snapshots;
+    out.filtered_preparation_snapshots = filtered_preparation_snapshots;
+    out.selection_root_ns = nanoseconds(root_seconds);
+    out.selection_best_offered_ns = nanoseconds(offered_seconds);
+    out.selected_restore_bytes = selected_restore_bytes;
+    out.selected_disk_read_bytes = selected_disk_read_bytes;
+    if (preparing) {
+        out.prefix_source_decision = PrefixSourceDecision::Preparing;
+    } else if (reuse_frontier != 0) {
+        out.prefix_source_decision = PrefixSourceDecision::Selected;
+    } else if (!selection_ran) {
+        out.prefix_source_decision = PrefixSourceDecision::None;
+    } else if (eligible_snapshots == 0) {
+        out.prefix_source_decision = matched_snapshots != 0 ? PrefixSourceDecision::RootFiltered
+                                                           : PrefixSourceDecision::RootNoSnapshot;
+    } else {
+        out.prefix_source_decision = PrefixSourceDecision::RootPriced;
+    }
+    return out;
+}
+
 HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
                                                const RequestBasePlan& base,
-                                               runtime::LaneId destination) {
+                                               runtime::LaneId destination,
+                                               std::uint64_t publication_order) {
     if (!hybrid_ || base.impl_ == nullptr) {
         throw std::logic_error("hybrid admission requires the hybrid prefix cache");
     }
@@ -395,7 +479,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         throw std::out_of_range("hybrid admission lane is out of range");
     }
     hybrid_->poll();
-    if (hybrid_disk_) { hybrid_disk_poll(); }
+    if (hybrid_disk_) { hybrid_disk_poll(true); }
     const RequestBasePlanImpl& plan = *base.impl_;
     const auto n                    = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n == 0 || n != plan.summary.prompt_tokens) {
@@ -458,7 +542,9 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     };
 
     std::optional<pc::MatchCandidate> selected;
-    if (plan.allow_prefix_reuse && prompt.identity.reusable) {
+    double preparation_budget_seconds = 0.0;
+    quote->selection_ran = plan.allow_prefix_reuse && prompt.identity.reusable;
+    if (quote->selection_ran) {
         // Preparation computed the lookup keys once; every quote of this prompt reads them.
         if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
             throw std::logic_error("prepared prompt carries no hybrid block keys");
@@ -489,17 +575,62 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             match = index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         }
         quote->cached_prefix_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
+        quote->matched_snapshots    = static_cast<std::uint32_t>(match.candidates.size());
+        quote->best_matched_frontier =
+            match.candidates.empty()
+                ? 0U
+                : std::max_element(match.candidates.begin(), match.candidates.end(),
+                                   [](const pc::MatchCandidate& left,
+                                      const pc::MatchCandidate& right) {
+                                       return left.frontier < right.frontier;
+                                   })
+                      ->frontier;
         const std::vector<VisionTokenRange> ranges =
             prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
             const std::span<const pc::NodeRef> path(match.path.data(), candidate.path_blocks);
-            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
-                   !fits(&candidate, path);
+            if (candidate.filling_blocks != 0) {
+                ++quote->filtered_filling_snapshots;
+                return true;
+            }
+            if (inside_vision(candidate.frontier, ranges)) {
+                ++quote->filtered_vision_snapshots;
+                return true;
+            }
+            if (!fits(&candidate, path)) {
+                ++quote->filtered_capacity_snapshots;
+                return true;
+            }
+            if (cold_preparation_.owns(publication_order) &&
+                cold_preparation_.state() == ColdPreparation::State::Fallback &&
+                candidate.disk_read_bytes != 0) {
+                ++quote->filtered_preparation_snapshots;
+                return true;
+            }
+            return false;
         });
+        quote->eligible_snapshots = static_cast<std::uint32_t>(match.candidates.size());
         // Root participates in the same remaining-time comparison. Do not reinsert candidates
         // the cost model rejected after it selected recomputation.
         const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
-        if (choice.candidate) { selected = match.candidates[*choice.candidate]; }
+        quote->root_seconds    = choice.root_seconds;
+        quote->offered_seconds = choice.best_offered_seconds;
+        if (choice.candidate) {
+            selected                           = match.candidates[*choice.candidate];
+            quote->selected_restore_bytes      = choice.restore_bytes;
+            quote->selected_disk_read_bytes    = choice.disk_read_bytes;
+            double alternative = choice.root_seconds;
+            for (const auto& candidate : match.candidates) {
+                if (candidate.disk_read_bytes == 0) {
+                    alternative = std::min(alternative,
+                        hybrid_cost_.restore_seconds(candidate.restore_bytes) +
+                        hybrid_cost_.prefill_seconds(candidate.frontier,
+                                                     lookup_tokens - candidate.frontier));
+                }
+            }
+            preparation_budget_seconds = std::max(0.0, alternative -
+                hybrid_cost_.prefill_seconds(selected->frontier, lookup_tokens - selected->frontier));
+        }
     }
 
     HybridAdmissionQuote out;
@@ -516,45 +647,35 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         quote->reuse_frontier                 = selected->frontier;
         quote->summary.reusable_prompt_tokens = selected->frontier;
         quote->summary.prefix_reuse_path = reuse_path_for(index.snapshot(selected->snapshot).kind);
-        if (hybrid_disk_) {
-            // The admission this quote names will restore from this snapshot: stage its disk
-            // sources now so the staging has landed by the time the quote is staged.
-            const pc::SnapshotView view = index.snapshot(selected->snapshot);
-            if (view.host != pc::CopyState::Resident && view.disk == pc::CopyState::Resident) {
-                // A staged image the quotes no longer name must not block this one's read —
-                // but one an admission's H2D already borrows stays until its restore lands.
-                if (!image_staged_inflight_) {
-                    hybrid_disk_->release_staged_image_except(selected->snapshot);
-                }
-                if (!tail_staged_inflight_) {
-                    hybrid_disk_->release_staged_tail_except(selected->snapshot);
-                }
-                if (view.device_slot == pc::kNoId) { (void)hybrid_disk_->stage_image(selected->snapshot, index); }
-                if (view.tail_len != 0 && view.tail_device_copy != pc::CopyState::Resident) {
-                    (void)hybrid_disk_->stage_tail(selected->snapshot, index);
-                }
+        if (hybrid_disk_ && selected->disk_read_bytes != 0) {
+            std::vector<pc::NodeRef> path;
+            for (auto node = index.snapshot(selected->snapshot).anchor; node.valid();
+                 node = index.node(node).parent) {
+                path.push_back(node);
             }
-            if (view.disk == pc::CopyState::Resident) {
-                // The admission's restore path consumes staged block bytes, but the prefetch
-                // cadence that normally stages them does not run while the FIFO head waits:
-                // the quote stages the snapshot's disk-only anchor blocks itself. The request is
-                // bounded by the staging pool (stage_blocks streams what fits, deduped against
-                // what a batch already holds), so a chain longer than the pool advances a batch
-                // per cycle instead of never being admitted.
-                std::vector<pc::NodeRef> cold;
-                for (pc::NodeRef walk = view.anchor; walk.valid();
-                     walk             = index.node(walk).parent) {
-                    const pc::NodeView node_view = index.node(walk);
-                    if (node_view.device == pc::CopyState::Absent &&
-                        node_view.host == pc::CopyState::Absent &&
-                        node_view.disk == pc::CopyState::Resident) {
-                        cold.push_back(walk);
-                    }
-                }
-                if (const auto stageable = hybrid_disk_stageable(cold); !stageable.empty()) {
-                    (void)hybrid_disk_->stage_blocks(stageable, index);
-                }
+            std::reverse(path.begin(), path.end());
+            const auto now = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const auto budget = static_cast<std::uint64_t>(std::min(
+                preparation_budget_seconds,
+                static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1.0e9) * 1.0e9);
+            cold_preparation_.select(publication_order, selected->snapshot, path, now, budget,
+                                      *hybrid_disk_);
+            (void)hybrid_prepare_progress();
+            if (cold_preparation_.state() == ColdPreparation::State::Fallback) {
+                return hybrid_quote(prompt, base, destination, publication_order);
             }
+            if (cold_preparation_.state() != ColdPreparation::State::Ready) {
+                out.readiness = runtime::Readiness::Preparing;
+                out.summary = quote->summary;
+                out.diagnostics = quote->diagnostics(true);
+                return out;
+            }
+        }
+        if (hybrid_disk_ && cold_preparation_.owns(publication_order)) {
+            quote->prepared_restore_bytes =
+                cold_preparation_.copied_blocks() * hybrid_disk_->block_payload_bytes();
         }
     } else if (fits(nullptr, {})) {
         quote->summary.reusable_prompt_tokens = 0;
@@ -562,7 +683,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     } else if (hybrid_->transfers_pending()) {
         // Blocks pinned only by their in-flight Host writes become evictable once those land.
         hybrid_->drain();
-        return hybrid_quote(prompt, base, destination);
+        return hybrid_quote(prompt, base, destination, publication_order);
     } else {
         out.readiness = runtime::Readiness::TemporarilyBlocked;
         out.summary   = quote->summary;
@@ -587,6 +708,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
 
     out.readiness = runtime::Readiness::Ready;
     out.summary   = quote->summary;
+    out.diagnostics = quote->diagnostics();
     out.impl      = std::move(quote);
     return out;
 }
@@ -599,22 +721,6 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
     }
     if (has_context_transaction() || hybrid_->restore_open()) { return std::nullopt; }
     hybrid_->poll();
-    if (hybrid_disk_) { hybrid_disk_->publish_completions(hybrid_->index()); }
-    // The staging retry deadline: entries no admission consumed in two cycles go back, and an
-    // entry whose node already has a Device copy is dropped (no batch can still read it).
-    hybrid_disk_release_stale_staging();
-    if (hybrid_disk_ && !staged_inflight_.empty()) {
-        // Node state marks landing for both prefetch and admission batches: Filling means the
-        // H2D is still reading the staged bytes.
-        std::vector<HybridDiskTier::StagedBlock> landed;
-        std::erase_if(staged_inflight_, [&](const HybridDiskTier::StagedBlock& staged) {
-            const bool done = !hybrid_->index().valid(staged.node) ||
-                              hybrid_->index().node(staged.node).device != pc::CopyState::Filling;
-            if (done) { landed.push_back(staged); }
-            return done;
-        });
-        if (!landed.empty()) { hybrid_disk_->release_staged(landed); }
-    }
     if (hybrid_->prefetch_landing()) { return std::nullopt; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n == 0 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { return 0U; }
@@ -632,25 +738,13 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
     const pc::MatchCandidate* chosen =
         choice.candidate ? &match.candidates[*choice.candidate] : nullptr;
     const std::uint32_t cold_blocks =
-        chosen != nullptr ? chosen->host_only_blocks + chosen->disk_only_blocks : 0U;
+        chosen != nullptr ? chosen->host_only_blocks : 0U;
     if (chosen == nullptr || cold_blocks == 0) {
         return 0U;
     }
     const std::span<const pc::NodeRef> path(match.path.data(),
                                             chosen->path_blocks);
 
-    // Disk-only blocks: stage their records this cycle, restore their staging bytes the next.
-    // The request is bounded by the staging pool: a cold chain longer than the pool stages and
-    // consumes one batch per cycle (docs §5.3), instead of requesting more than the pool holds
-    // and making no progress at all.
-    if (hybrid_disk_) {
-        if (const auto stageable = hybrid_disk_stageable(path); !stageable.empty()) {
-            (void)hybrid_disk_->stage_blocks(stageable, index);
-        }
-        // Staged bytes that landed last cycle become this cycle's restores.
-        const std::vector<HybridDiskTier::StagedBlock> staged = hybrid_disk_->take_staged_blocks();
-        staged_blocks_.insert(staged_blocks_.end(), staged.begin(), staged.end());
-    }
 
     // Pinned while room is made, so no block of this path is evicted to hold another of them.
     // Room comes from free pages and host-backed cache, least recently used first: a prefetch
@@ -665,9 +759,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
             const std::uint32_t text = text_pool.available_pages();
             return backend_pool != nullptr ? std::min(text, backend_pool->available_pages()) : text;
         };
-        // Copy only what has a source now: a host-backed block, or a disk-only block whose staged
-        // bytes already landed. Reserving pages for blocks still being staged would fail the
-        // whole batch on a pool that cannot hold the chain.
+        // Only Host-ready blocks belong to this opportunistic prefetch. Disk-only blocks are
+        // consumed by the explicit preparation owner before a Ready admission is issued.
         const auto ready = [&] {
             std::uint32_t count = 0;
             for (const pc::NodeRef node : path) {
@@ -675,8 +768,6 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
                 if (view.device != pc::CopyState::Absent) { continue; }
                 if (view.host == pc::CopyState::Resident) {
                     ++count;
-                } else if (view.host == pc::CopyState::Absent && hybrid_staged_held(node)) {
-                    ++count; // disk-only with landed staging bytes
                 }
             }
             return count;
@@ -697,29 +788,14 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
                 if (started == wanted) { break; }
                 if (index.node(node).device != pc::CopyState::Absent) { continue; }
                 const pc::NodeView view = index.node(node);
+                if (view.host != pc::CopyState::Resident) { continue; }
                 HybridBlockPages pages{
                     .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
                 if (backend_pool != nullptr) {
                     pages.backend =
                         backend_kv_pages->materialize_transfer_destination(*backend_pages, kBlock);
                 }
-                if (view.host == pc::CopyState::Resident) {
-                    hybrid_->restore_block(node, pages);
-                } else if (view.host == pc::CopyState::Absent) {
-                    const auto staged = std::find_if(
-                        staged_blocks_.begin(), staged_blocks_.end(),
-                        [&](const HybridDiskTier::StagedBlock& entry) {
-                            return entry.node == node;
-                        });
-                    if (staged == staged_blocks_.end()) {
-                        continue; // staging not landed for this node yet
-                    }
-                    hybrid_->restore_block_from_staging(node, staged->bytes, pages);
-                    staged_inflight_.push_back(*staged);
-                    staged_blocks_.erase(staged);
-                } else {
-                    continue; // a Host write is still filling this node's slab
-                }
+                hybrid_->restore_block(node, pages);
                 ++started;
             }
             hybrid_->submit_restore();
@@ -918,9 +994,9 @@ ProgramImpl::progress_hybrid_materialization(runtime::CancellationFlagView cance
         if (hybrid_->restore_pending()) {
             transaction.restore_ticket = hybrid_->land_restore(device.stream);
         }
-        out.diagnostics.cached_prefix_tokens = transaction.quote->cached_prefix_tokens;
-        out.diagnostics.restored_host_bytes  = transaction.restore_bytes;
-        out.diagnostics.restored_disk_bytes  = transaction.restore_disk_bytes;
+        out.diagnostics = transaction.quote->diagnostics();
+        out.diagnostics.restored_host_bytes = transaction.restore_bytes;
+        out.diagnostics.restored_disk_bytes = transaction.restore_disk_bytes;
         out.published.emplace(hybrid_activate(transaction));
     } catch (...) {
         // The abort returns the state slot a landing restore may still be writing.
@@ -1000,7 +1076,6 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     }
 
     std::vector<pc::NodeRef> host_only;
-    std::vector<pc::NodeRef> disk_only;
     for (const pc::NodeRef node : transaction.path) {
         const pc::NodeView view = index.node(node);
         if (view.device == pc::CopyState::Absent) {
@@ -1009,8 +1084,6 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
             }
             if (view.host == pc::CopyState::Resident) {
                 host_only.push_back(node);
-            } else if (view.disk == pc::CopyState::Resident) {
-                disk_only.push_back(node); // staged by the tier on the prefetch cadence
             } else {
                 return false; // no source anywhere: stale
             }
@@ -1021,7 +1094,7 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
     const bool image_restore = reuse != 0 && snapshot.device_slot == pc::kNoId;
     const bool backend_pool  = backend_kv_pages != nullptr;
-    const auto restored = static_cast<std::uint32_t>(host_only.size() + disk_only.size()) +
+    const auto restored = static_cast<std::uint32_t>(host_only.size()) +
                           (tail_restore ? 1U : 0U);
     const std::uint32_t text_need = quote.text_kv_page_entitlement - full + restored;
     const std::uint32_t backend_need =
@@ -1039,25 +1112,14 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     }
     transaction.state = state_store->reserve_destination();
     if (!transaction.state) { return false; }
+    transaction.restore_bytes = quote.prepared_restore_bytes;
+    transaction.restore_disk_bytes = quote.prepared_restore_bytes;
     if (restored == 0 && !image_restore) { return true; }
 
     // Staged-source checks come before anything submits: a miss returns false for the Engine
     // to replan, and nothing below this point may hold reservations across a retry.
-    std::vector<HybridDiskTier::StagedBlock> consumed;
     const std::byte* staged_image = nullptr;
     const std::byte* staged_tail  = nullptr;
-    if (hybrid_disk_ && !disk_only.empty()) {
-        for (const pc::NodeRef node : disk_only) {
-            const auto staged = std::find_if(staged_blocks_.begin(), staged_blocks_.end(),
-                                             [&](const HybridDiskTier::StagedBlock& entry) {
-                                                 return entry.node == node;
-                                             });
-            if (staged == staged_blocks_.end()) {
-                return false;
-            }
-            consumed.push_back(*staged);
-        }
-    }
     if (hybrid_disk_ && tail_restore && snapshot.host != pc::CopyState::Resident) {
         staged_tail = hybrid_disk_->staged_tail(quote.snapshot);
         if (staged_tail == nullptr) {
@@ -1074,12 +1136,11 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
     // Host restores run on the restore stream while other lanes keep executing; the transaction
     // stays in progress until they complete.
     const std::uint64_t block_bytes = hybrid_->host_layout().block_payload_bytes;
-    transaction.restore_bytes =
+    transaction.restore_bytes +=
         static_cast<std::uint64_t>(restored) * block_bytes +
         (image_restore ? static_cast<std::uint64_t>(hybrid_->host_layout().image_bytes) : 0U);
-    // The disk tier's share of `restore_bytes`: the disk-only block payloads, plus the snapshot
-    // image and tail bundle when they came from disk staging rather than a Host copy.
-    transaction.restore_disk_bytes = static_cast<std::uint64_t>(disk_only.size()) * block_bytes;
+    // Cold KV has already landed outside this transaction. Include its actual H2D workload,
+    // alongside the image/tail still consumed by this short admission.
     if (image_restore && snapshot.host != pc::CopyState::Resident) {
         transaction.restore_disk_bytes += hybrid_->host_layout().image_bytes;
     }
@@ -1097,16 +1158,6 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
         return pages;
     };
     for (const pc::NodeRef node : host_only) { hybrid_->restore_block(node, destination(kBlock)); }
-    for (const HybridDiskTier::StagedBlock& staged : consumed) {
-        hybrid_->restore_block_from_staging(staged.node, staged.bytes, destination(kBlock));
-        staged_inflight_.push_back(staged);
-    }
-    std::erase_if(staged_blocks_, [&](const HybridDiskTier::StagedBlock& staged) {
-        return std::find_if(consumed.begin(), consumed.end(),
-                            [&](const HybridDiskTier::StagedBlock& entry) {
-                                return entry.bytes == staged.bytes;
-                            }) != consumed.end();
-    });
     if (tail_restore) {
         if (snapshot.host == pc::CopyState::Resident) {
             hybrid_->restore_tail(quote.snapshot, destination(tail));
@@ -1525,7 +1576,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || !sequence.kv) { return; }
     hybrid_->poll();
-    if (hybrid_disk_) { hybrid_disk_poll(); }
+    if (hybrid_disk_) { hybrid_disk_poll(true); }
     std::uint32_t frontier = sequence.text_kv_valid;
     // Every enabled pool must hold the whole block. The DFlash2 draft ring is StateImage content,
     // not block content, so it does not bound block publication.
@@ -1552,21 +1603,10 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     if (!lane.pending.empty()) { hybrid_publish_pending(sequence, false); }
 }
 
-void ProgramImpl::hybrid_disk_poll() {
+void ProgramImpl::hybrid_disk_poll(bool allow_demotion) {
     if (hybrid_disk_ == nullptr) { return; }
     pc::PrefixCacheIndex& index = hybrid_->index();
     hybrid_disk_->publish_completions(index);
-    // Reads the quote staged land here (the prefetch cadence may not run while the FIFO head
-    // waits): folded into staged_blocks_ for the next admission to consume. The worker lands
-    // blocks one at a time, so every poll appends whatever completed since the last one.
-    const std::vector<HybridDiskTier::StagedBlock> landed = hybrid_disk_->take_staged_blocks();
-    for (const HybridDiskTier::StagedBlock& staged : landed) {
-        staged_blocks_.push_back(staged);
-        staged_blocks_.back().age = 0;
-    }
-    // Entries no admission consumed in two cycles go back, and an entry whose node already has
-    // a Device copy is dropped: its bytes have served, so the slot must recycle.
-    hybrid_disk_release_stale_staging();
     // Staging releases on landing marks, not a coarse pending check. A restored image goes to
     // the admission's own state slot — the snapshot's index device_slot stays empty — so the
     // cache's restore batches are the image's landing signal. The tail's device copy and the
@@ -1589,22 +1629,7 @@ void ProgramImpl::hybrid_disk_poll() {
             tail_staged_inflight_ = false;
         }
     }
-    if (!staged_inflight_.empty()) {
-        std::vector<HybridDiskTier::StagedBlock> landed;
-        for (std::size_t i = 0; i < staged_inflight_.size();) {
-            const pc::NodeRef node = staged_inflight_[i].node;
-            const bool done =
-                !index.valid(node) || index.node(node).device != pc::CopyState::Filling;
-            if (done) {
-                landed.push_back(staged_inflight_[i]);
-                staged_inflight_.erase(staged_inflight_.begin() +
-                                       static_cast<std::ptrdiff_t>(i));
-                continue;
-            }
-            ++i;
-        }
-        if (!landed.empty()) { hybrid_disk_->release_staged(landed); }
-    }
+    if (!allow_demotion) { return; }
     // Demotion after the bookkeeping: the completions it observes are current.
     struct CopyContext {
         HybridPrefixCache& cache;

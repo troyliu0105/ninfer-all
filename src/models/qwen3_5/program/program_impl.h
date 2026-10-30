@@ -24,6 +24,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix/hybrid_disk.h"
+#include "models/qwen3_5/program/prefix/cold_preparation.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/output_budget.h"
@@ -342,8 +343,30 @@ struct HybridQuoteImpl {
     std::uint32_t reuse_frontier = 0;
     // Longest prompt prefix held as cached full blocks, reusable or not.
     std::uint32_t cached_prefix_tokens = 0;
+    // Whether selection ran for this quote (cache enabled and the prompt reusable); separates a
+    // root decision the selection made from one it never considered.
+    bool selection_ran = false;
+    // Source-selection attribution, filled once per quote and copied into the request's
+    // materialization diagnostics at activation. Counting scalars only (one quote's match).
+    std::uint32_t matched_snapshots           = 0;
+    std::uint32_t eligible_snapshots          = 0;
+    std::uint32_t filtered_filling_snapshots  = 0;
+    std::uint32_t filtered_vision_snapshots   = 0;
+    std::uint32_t filtered_capacity_snapshots = 0;
+    std::uint32_t filtered_preparation_snapshots = 0;
+    // Deepest snapshot frontier the match offered, before any filter (0: none matched).
+    std::uint32_t best_matched_frontier = 0;
+    // The cost model's root price and the cheapest offered snapshot's price (0 when none was
+    // offered); the admission compares the two.
+    double root_seconds    = 0.0;
+    double offered_seconds = 0.0;
+    // The chosen source's copy workload (0 for a root decision).
+    std::uint64_t selected_restore_bytes   = 0;
+    std::uint64_t selected_disk_read_bytes = 0;
+    std::uint64_t prepared_restore_bytes = 0;
     std::uint32_t destination          = 0;
     std::uint64_t destination_epoch    = 0;
+    [[nodiscard]] MaterializationDiagnostics diagnostics(bool preparing = false) const;
 };
 
 // A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
@@ -848,7 +871,8 @@ public:
 
     [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base,
-                                                    runtime::LaneId destination);
+                                                    runtime::LaneId destination,
+                                                    std::uint64_t publication_order);
     [[nodiscard]] bool hybrid_reservable(const HybridAdmissionQuote& quote,
                                          runtime::CancellationFlagView cancellation) const noexcept;
     [[nodiscard]] runtime::ContextTransactionReserveStatus
@@ -863,6 +887,9 @@ public:
                                                                const RequestBasePlan& base);
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    [[nodiscard]] bool hybrid_prepare_progress();
+    [[nodiscard]] bool hybrid_prepare_pending() const noexcept;
+    void hybrid_prepare_abandon(std::uint64_t publication_order) noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -1422,21 +1449,18 @@ private:
 
     std::array<CudaEventTimer, 3> context_transfer_timers_;
 
-    // Hybrid prefix cache (null in Legacy mode).
-    std::unique_ptr<HybridPrefixCache> hybrid_;
-    // Physical staging outlives the tier: its worker settles before these buffers are destroyed.
+    // Reverse destruction: disk worker, cache CUDA copies, then their borrowed pinned staging.
     std::optional<PinnedHostBuffer> hybrid_disk_block_staging_;
     std::optional<PinnedHostBuffer> hybrid_disk_image_staging_;
     std::optional<PinnedHostBuffer> hybrid_disk_tail_staging_;
+    // Hybrid prefix cache (null in Legacy mode).
+    std::unique_ptr<HybridPrefixCache> hybrid_;
     // Disk tier (null unless --disk-kv-path enabled the hybrid disk tier).
     std::unique_ptr<HybridDiskTier> hybrid_disk_;
     // Block payload slots the disk tier's staging holds, reserved out of the advertised Host
     // budget by create_hybrid_prefix_cache (plan_hybrid_disk_staging).
     std::uint32_t hybrid_disk_staging_blocks_ = 0;
-    // Staged disk block bytes landed but not yet consumed by a restore batch.
-    std::vector<HybridDiskTier::StagedBlock> staged_blocks_;
-    // Nodes whose staged bytes a landing batch is still reading.
-    std::vector<HybridDiskTier::StagedBlock> staged_inflight_;
+    ColdPreparation cold_preparation_;
     // The disk tier's image/tail staging buffers a landing batch is still reading.
     bool image_staged_inflight_ = false;
     bool tail_staged_inflight_  = false;
@@ -1498,19 +1522,14 @@ private:
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
-    // The disk tier's share of the poll cadence: publishes completions, releases staging a
-    // landed batch no longer reads, and stages the sources the next admission will want.
-    void hybrid_disk_poll();
-    // Whether the Program already holds landed staging bytes for `node` (a batch may be reading
-    // them), so a stage request never duplicates a slot.
-    [[nodiscard]] bool hybrid_staged_held(runtime::prefix_cache::NodeRef node) const noexcept;
-    // The nodes of `nodes` that are disk-only and not already staged or held: the bounded
-    // staging request (docs/maintainer/hybrid-prefix-cache-disk-tier.md §5.3).
-    [[nodiscard]] std::vector<runtime::prefix_cache::NodeRef>
-    hybrid_disk_stageable(std::span<const runtime::prefix_cache::NodeRef> nodes) const;
-    // Returns the staging slots whose bytes no admission consumed (two cycles) or whose node
-    // already has a Device copy. Only a landed batch's node state authorizes recycling.
-    void hybrid_disk_release_stale_staging();
+    // Adopt disk completions and recycle landed image/tail staging. Preparation progress
+    // suppresses background demotion; ColdPreparation alone owns block-staging consumption.
+    void hybrid_disk_poll(bool allow_demotion);
+    [[nodiscard]] bool hybrid_prepare_auxiliary(runtime::prefix_cache::SnapshotRef snapshot,
+                                               bool allow_reads);
+    [[nodiscard]] std::uint32_t
+    hybrid_prepare_copy(std::span<const HybridDiskTier::StagedBlock> blocks,
+                        std::span<const runtime::prefix_cache::NodeRef> path);
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
     // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
     void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);

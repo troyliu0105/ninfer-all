@@ -201,6 +201,8 @@ def run_round(name: str, prompt: str, max_tokens: int, cohort: int) -> dict:
             f"{name} C{cohort}: expected one warmup plus {cohort} measured requests, found {len(done)}"
         )
     done = done[-cohort:]
+    if any(record["timings_seconds"]["ttft"] is None for record in done):
+        raise RuntimeError("cohort contains a request with no first token; inspect request log")
     generated = sum(record["result"]["completion_tokens"] for record in done)
     prompt_tokens = sum(record["result"]["prompt_tokens"] for record in done)
     computed_prefill = sum(record["result"]["computed_prefill_tokens"] for record in done)

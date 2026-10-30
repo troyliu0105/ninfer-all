@@ -14,7 +14,8 @@ add_library(ninfer_prefix_disk_cpu_support STATIC
   "${NINFER_ROOT}/src/runtime/prefix_cache/tap_planner.cpp"
   "${NINFER_ROOT}/src/runtime/prefix_cache/disk_catalog.cpp"
   "${NINFER_ROOT}/src/runtime/prefix_cache/disk_worker.cpp"
-  "${NINFER_ROOT}/src/models/qwen3_5/program/prefix/hybrid_disk.cpp")
+  "${NINFER_ROOT}/src/models/qwen3_5/program/prefix/hybrid_disk.cpp"
+  "${NINFER_ROOT}/src/models/qwen3_5/program/prefix/cold_preparation.cpp")
 target_compile_features(ninfer_prefix_disk_cpu_support PUBLIC cxx_std_20)
 set_target_properties(ninfer_prefix_disk_cpu_support PROPERTIES CXX_EXTENSIONS OFF)
 target_include_directories(ninfer_prefix_disk_cpu_support PUBLIC

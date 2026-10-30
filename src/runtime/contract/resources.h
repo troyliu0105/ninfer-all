@@ -98,9 +98,18 @@ struct ContextOperationCounts {
 enum class Readiness : std::uint8_t {
     Ready,
     NeedsTransfer,
+    Preparing,
     TemporarilyBlocked,
     PermanentlyInfeasible,
 };
+
+enum class BlockedHeadAction : std::uint8_t { Prepare, WaitForCapacity, RejectIdle };
+
+[[nodiscard]] inline constexpr BlockedHeadAction
+blocked_head_action(Readiness readiness, bool active) noexcept {
+    if (readiness == Readiness::Preparing) { return BlockedHeadAction::Prepare; }
+    return active ? BlockedHeadAction::WaitForCapacity : BlockedHeadAction::RejectIdle;
+}
 
 enum class ContextTransactionStatus : std::uint8_t {
     InProgress,

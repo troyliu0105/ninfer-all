@@ -35,7 +35,6 @@ static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 
 constexpr int k35N           = 32;
 constexpr int k35K           = 2048;
-constexpr int k35LogicalRows = 2 * k35N;
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(

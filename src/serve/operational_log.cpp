@@ -257,8 +257,7 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics     = outcome.metrics;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = static_cast<double>(metrics.computed_prefill_tokens);
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
     std::ostringstream out;
@@ -287,8 +286,13 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << ", " << product::format_pretty_bytes(metrics.materialization.restored_disk_bytes)
             << " from disk";
     }
-    out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
-        << product::format_pretty_duration(metrics.total_seconds);
+    out << ") | TTFT ";
+    if (metrics.ttft_seconds) {
+        out << product::format_pretty_duration(*metrics.ttft_seconds);
+    } else {
+        out << "no first token";
+    }
+    out << " | total " << product::format_pretty_duration(metrics.total_seconds);
     if (metrics.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
             << product::format_pretty_duration(metrics.engine_timing.queue_wait_seconds);
@@ -465,22 +469,33 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
             << product::format_pretty_bytes(report.current.hybrid_host_capacity_bytes) << ')';
     }
     // Hybrid prefix cache disk tier: demotions (Host → disk) and restores (disk → Host) in
-    // this interval, with the bytes moved.
+    // this interval, with the bytes moved. Blocks, images and bytes are named separately: an
+    // image-only demotion or a restore that read only a snapshot image or tail bundle is real
+    // traffic and must not hide behind a zero block delta or read as a misleading "0 blocks".
     const std::uint64_t disk_demoted = report.current.hybrid_disk_demoted_blocks -
                                        report.previous.hybrid_disk_demoted_blocks;
+    const std::uint64_t disk_images =
+        report.current.hybrid_disk_demoted_images - report.previous.hybrid_disk_demoted_images;
     const std::uint64_t disk_restored = report.current.hybrid_disk_restored_blocks -
                                        report.previous.hybrid_disk_restored_blocks;
+    const std::uint64_t disk_write =
+        report.current.hybrid_disk_write_bytes - report.previous.hybrid_disk_write_bytes;
+    const std::uint64_t disk_read =
+        report.current.hybrid_disk_read_bytes - report.previous.hybrid_disk_read_bytes;
     if (disk_demoted != 0) {
         out << " | disk demoted " << product::format_pretty_count(disk_demoted) << " blocks ("
-            << product::format_pretty_bytes(
-                   report.current.hybrid_disk_write_bytes - report.previous.hybrid_disk_write_bytes)
-            << ')';
+            << product::format_pretty_bytes(disk_write) << ')';
     }
-    if (disk_restored != 0) {
-        out << " | disk restored " << product::format_pretty_count(disk_restored) << " blocks ("
-            << product::format_pretty_bytes(
-                   report.current.hybrid_disk_read_bytes - report.previous.hybrid_disk_read_bytes)
-            << ')';
+    if (disk_demoted == 0 && disk_images != 0) {
+        out << " | disk demoted " << product::format_pretty_count(disk_images) << " images ("
+            << product::format_pretty_bytes(disk_write) << ')';
+    }
+    if (disk_restored != 0 || disk_read != 0) {
+        // A restore's bytes may be blocks, a snapshot image, a tail bundle or all of them; the
+        // count only ever names whole blocks, so bytes stand on their own.
+        out << " | disk restored " << product::format_pretty_count(disk_restored)
+            << (disk_restored == 1 ? " block" : " blocks") << " ("
+            << product::format_pretty_bytes(disk_read) << " read)";
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }

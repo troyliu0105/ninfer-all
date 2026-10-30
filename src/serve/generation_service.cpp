@@ -834,9 +834,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
-    outcome.metrics.ttft_seconds =
-        prepared.prepare_seconds +
-        std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
+    // A first token the request actually committed sets the TTFT; a cancelled or failed request
+    // with no output has none, and reporting the prepare time in its place would fabricate a
+    // latency the client never saw.
+    if (!outcome.tokens.empty()) {
+        outcome.metrics.ttft_seconds =
+            prepared.prepare_seconds +
+            std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
+    }
     outcome.metrics.vision_seconds  = result.timings.vision_seconds;
     outcome.metrics.overlay_windows           = result.timings.overlay_windows;
     outcome.metrics.overlay_exclusive_windows = result.timings.overlay_exclusive_windows;
@@ -846,6 +851,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.overlay_evicted_bytes   = result.timings.overlay_evicted_bytes;
     outcome.metrics.overlay_staged_bytes    = result.timings.overlay_staged_bytes;
     outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
+    // The steps the Engine reported for this request: the tokens prefill actually evaluated,
+    // not what admission planned. A cancelled prefill reports what ran before the cancellation,
+    // so downstream aggregates never credit unexecuted tokens.
+    outcome.metrics.computed_prefill_tokens = result.computed_prompt_tokens;
     outcome.metrics.decode_seconds          = result.timings.decode_seconds;
     outcome.metrics.prompt_wall_seconds     = result.timings.prompt_wall_seconds;
     outcome.metrics.generation_wall_seconds = result.timings.generation_wall_seconds;

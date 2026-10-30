@@ -166,6 +166,35 @@ materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
     return "none";
 }
 
+// Bounded source-selection attribution. Preparing describes a queued choice, not a completed hit.
+enum class PrefixSourceDecision : std::uint8_t {
+    None,           // selection did not run (cache disabled or the prompt is not reusable)
+    Selected,       // a snapshot source was chosen over recomputation
+    Preparing,
+    RootNoSnapshot, // cached blocks matched but no valid snapshot was offered on the path
+    RootFiltered,   // snapshots matched but every one was dropped by a filter below
+    RootPriced,     // snapshots were offered but every one priced worse than recomputing
+};
+
+[[nodiscard]] inline constexpr const char*
+prefix_source_decision_name(PrefixSourceDecision decision) noexcept {
+    switch (decision) {
+    case PrefixSourceDecision::None:
+        return "none";
+    case PrefixSourceDecision::Selected:
+        return "selected";
+    case PrefixSourceDecision::Preparing:
+        return "preparing";
+    case PrefixSourceDecision::RootNoSnapshot:
+        return "root_no_snapshot";
+    case PrefixSourceDecision::RootFiltered:
+        return "root_filtered";
+    case PrefixSourceDecision::RootPriced:
+        return "root_priced";
+    }
+    return "none";
+}
+
 struct MaterializationDiagnostics {
     std::uint64_t predicted_now_ns           = 0;
     std::uint64_t predicted_future_loss_ns   = 0;
@@ -191,7 +220,8 @@ struct MaterializationDiagnostics {
     bool search_boundary_limited                 = false;
     // The most prompt reuse any admission candidate offered, independent of the plan that won.
     // Beside a root plan, 0 points at prefix matching (nothing was on the table); a large value
-    // points at the planner's pricing.
+    // points at the planner's pricing. Hybrid admissions fill it with the deepest snapshot
+    // frontier the match offered, before any filter.
     std::uint32_t best_reuse_prompt_tokens = 0;
 
     // Hybrid prefix cache admission. `cached_prefix_tokens` is the longest prompt prefix held as
@@ -204,6 +234,23 @@ struct MaterializationDiagnostics {
     // `restored_disk_bytes` is the part of that restore the disk tier delivered (staged block
     // payloads, the snapshot image and the tail bundle); it is a subset of `restored_host_bytes`.
     std::uint64_t restored_disk_bytes  = 0;
+
+    // Hybrid attribution for the latest quote (also retained when preparation is cancelled).
+    // Filter counts partition matched minus eligible, in order filling, vision, capacity,
+    // preparation budget. Costs are predicted nanoseconds, not measured I/O durations.
+    // `selected_restore_bytes` and `selected_disk_read_bytes` are the chosen source's copy
+    // workload at admission; both are 0 for a root decision.
+    PrefixSourceDecision prefix_source_decision = PrefixSourceDecision::None;
+    std::uint32_t matched_snapshots             = 0;
+    std::uint32_t eligible_snapshots            = 0;
+    std::uint32_t filtered_filling_snapshots    = 0;
+    std::uint32_t filtered_vision_snapshots     = 0;
+    std::uint32_t filtered_capacity_snapshots   = 0;
+    std::uint32_t filtered_preparation_snapshots = 0;
+    std::uint64_t selection_root_ns             = 0;
+    std::uint64_t selection_best_offered_ns     = 0;
+    std::uint64_t selected_restore_bytes        = 0;
+    std::uint64_t selected_disk_read_bytes      = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

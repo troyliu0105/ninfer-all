@@ -647,6 +647,11 @@ struct GenerationResult {
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
+    // Prompt tokens this request's prefill actually evaluated, as the per-step progress
+    // reported. Zero with no executed prefill pass; a cancelled prefill reports the tokens
+    // computed before the cancellation. Deliberately distinct from prompt-minus-reuse, which is
+    // only the plan.
+    std::uint32_t computed_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     MaterializationDiagnostics materialization;
     // The private catalog cell the finished session was retained in and its session digest, or

@@ -96,6 +96,8 @@ def run_mode(name: str, draft_tokens: int) -> dict:
     (out / "responses.json").write_text(json.dumps(responses, indent=2), encoding="utf-8")
     records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
     done = [record for record in records if record.get("event") == "request_done"]
+    if any(record["timings_seconds"]["ttft"] is None for record in done):
+        raise RuntimeError("cohort contains a request with no first token; inspect request log")
     generated = sum(record["result"]["completion_tokens"] for record in done)
     decode_seconds = sum(record["timings_seconds"]["decode"] for record in done)
     result = {

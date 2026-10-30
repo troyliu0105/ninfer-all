@@ -673,8 +673,10 @@ bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix
 
 HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt,
                                            const RequestBasePlan& base,
-                                           runtime::LaneId destination) {
-    return impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination);
+                                           runtime::LaneId destination,
+                                           std::uint64_t publication_order) {
+    return impl_->hybrid_quote(PreparedPromptAccess::view(prompt), base, destination,
+                               publication_order);
 }
 
 runtime::ContextTransactionReserveStatus
@@ -702,6 +704,14 @@ std::optional<std::uint32_t> Program::hybrid_prefetch(const PreparedPrompt& prom
 
 std::uint32_t Program::hybrid_prefetch_room() const noexcept {
     return impl_->hybrid_prefetch_room();
+}
+
+bool Program::hybrid_prepare_progress() { return impl_->hybrid_prepare_progress(); }
+
+bool Program::hybrid_prepare_pending() const noexcept { return impl_->hybrid_prepare_pending(); }
+
+void Program::hybrid_prepare_abandon(std::uint64_t publication_order) noexcept {
+    impl_->hybrid_prepare_abandon(publication_order);
 }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
