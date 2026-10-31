@@ -536,7 +536,8 @@ void causal_attention_small_t_load_modules(std::int32_t q_heads, std::int32_t kv
         std::int32_t widest_tile = 0;
         for (std::int32_t width = 4; width <= std::min(max_width, 2 * kWidest); ++width) {
             widest_tile = std::max(widest_tile, causal_attention_parallel_tile_width(
-                                                    Geometry::ModelQHeads, width, 1, storage));
+                                                    Geometry::ModelQHeads, Geometry::ModelKVHeads,
+                                                    width, 1, storage));
         }
         load_widths.template operator()<CausalCachedInput>(widest_tile);
     });
