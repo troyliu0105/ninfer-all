@@ -583,6 +583,9 @@ struct FakePhysicalUsage {
     std::uint32_t device_main_kv_lease_pages    = 0;
     std::uint32_t device_backend_kv_lease_pages = 0;
     std::size_t host_kv_bytes                   = 0;
+    std::uint32_t device_main_kv_capacity_pages    = 0;
+    std::uint32_t device_backend_kv_capacity_pages = 0;
+    std::uint32_t device_main_kv_page_tokens       = 0;
 };
 
 class FakeProgram;
@@ -4749,6 +4752,9 @@ void test_backfill_proof_and_stats_follow_program_revision() {
         .device_main_kv_lease_pages    = 4,
         .device_backend_kv_lease_pages = 2,
         .host_kv_bytes                 = 4096,
+        .device_main_kv_capacity_pages    = 4'096,
+        .device_backend_kv_capacity_pages = 4'224,
+        .device_main_kv_page_tokens       = 64,
     };
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
@@ -4756,7 +4762,10 @@ void test_backfill_proof_and_stats_follow_program_revision() {
                 stats.device_main_kv_occupied_pages == 11 &&
                 stats.device_backend_kv_occupied_pages == 5 &&
                 stats.device_main_kv_lease_pages == 4 && stats.device_backend_kv_lease_pages == 2 &&
-                stats.host_kv_occupied_bytes == 4096,
+                stats.host_kv_occupied_bytes == 4096 &&
+                stats.device_main_kv_capacity_pages == 4'096 &&
+                stats.device_backend_kv_capacity_pages == 4'224 &&
+                stats.device_main_kv_page_tokens == 64,
             "runtime physical gauges did not come directly from Program");
 }
 

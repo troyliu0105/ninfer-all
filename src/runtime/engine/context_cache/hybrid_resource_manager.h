@@ -350,6 +350,9 @@ public:
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.device_main_kv_lease_pages       = usage.device_main_kv_lease_pages;
         out.device_backend_kv_lease_pages    = usage.device_backend_kv_lease_pages;
+        out.device_main_kv_capacity_pages    = usage.device_main_kv_capacity_pages;
+        out.device_backend_kv_capacity_pages = usage.device_backend_kv_capacity_pages;
+        out.device_main_kv_page_tokens       = usage.device_main_kv_page_tokens;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
         const auto hybrid                    = program.hybrid_stats();
         out.hybrid_cached_blocks             = hybrid.device_resident_blocks;

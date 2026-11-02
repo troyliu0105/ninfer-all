@@ -2705,6 +2705,10 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const auto lease = [](const std::unique_ptr<LogicalKVPageStore>& store) noexcept {
         return store == nullptr ? 0U : store->physical_pool().reserved_pages();
     };
+    const DeviceKVPagePool* text_pool =
+        text_kv_pages ? &text_kv_pages->physical_pool() : nullptr;
+    const DeviceKVPagePool* backend_pool =
+        backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
     return qwen3_5::PhysicalUsageSnapshot{
         .resource_revision             = resource_revision_,
         .device_state_slots            = usage.device.state_slots,
@@ -2714,6 +2718,9 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         .device_main_kv_lease_pages    = lease(text_kv_pages),
         .device_backend_kv_lease_pages = lease(backend_kv_pages),
         .host_kv_bytes                 = usage.host.kv_bytes,
+        .device_main_kv_capacity_pages    = text_pool ? text_pool->capacity_pages() : 0U,
+        .device_backend_kv_capacity_pages = backend_pool ? backend_pool->capacity_pages() : 0U,
+        .device_main_kv_page_tokens       = text_pool ? text_pool->geometry().page_tokens : 0U,
     };
 }
 

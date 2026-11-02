@@ -2581,6 +2581,11 @@ feasible: unlike `captures.aborted` it has no other trace, so it is the counter 
 loss. `occupancy.device_main_kv_lease_pages` and `device_backend_kv_lease_pages` are the part of
 `device_main_kv_pages` and `device_backend_kv_pages` that active requests hold as reservation but
 have not yet written.
+`occupancy.device_main_kv_capacity_pages`, `device_backend_kv_capacity_pages` and
+`device_main_kv_page_tokens` are the pools' physical extents and the Main page size: the same
+resolution `--kv-capacity` produced, so `device_main_kv_pages / device_main_kv_capacity_pages` is
+the live pool share (retained cache included, and the un-written lease reservation within it), in
+the shape the pretty line's `device kv` clause prints.
 
 With the hybrid prefix cache, `context_cache.hybrid` is present once the cache has inserted a
 block or holds a snapshot. `device_blocks` (Device-resident 64-token KV blocks), `evictable_blocks`

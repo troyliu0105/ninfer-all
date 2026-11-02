@@ -780,6 +780,9 @@ int main() {
     throughput.current.device_main_kv_lease_pages       = 4;
     throughput.current.device_backend_kv_occupied_pages = 5;
     throughput.current.device_backend_kv_lease_pages    = 2;
+    throughput.current.device_main_kv_capacity_pages    = 100;
+    throughput.current.device_backend_kv_capacity_pages = 103;
+    throughput.current.device_main_kv_page_tokens       = 64;
     throughput.current.active_captures_skipped          = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
@@ -817,7 +820,8 @@ int main() {
         check(pretty_throughput ==
                   "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
                   "running 2 (prefill 1, decode-ready 1) | waiting 3 | materializing 1 | "
-                  "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
+                  "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms) | "
+                  "device kv 9.0% (576/6,400 tok)",
               "pretty throughput record mismatch");
     ThroughputReport single_decode;
     single_decode.interval_seconds                     = 5.000168;
@@ -847,6 +851,15 @@ int main() {
                           throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
+    failures += check(
+        throughput_json.at("context_cache").at("occupancy").at("device_main_kv_capacity_pages") ==
+            100 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("device_backend_kv_capacity_pages") == 103 &&
+            throughput_json.at("context_cache").at("occupancy").at("device_main_kv_page_tokens") ==
+                64,
+        "device KV pool capacity gauges missing from the throughput record");
     failures += check(throughput_json.at("engine_recoveries") == 2 &&
                           !throughput_json.at("context_cache").contains("engine_recoveries"),
                       "engine_recoveries must be a top-level interval delta, not nested under "

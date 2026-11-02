@@ -1595,6 +1595,9 @@ public:
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.device_main_kv_lease_pages       = usage.device_main_kv_lease_pages;
         out.device_backend_kv_lease_pages    = usage.device_backend_kv_lease_pages;
+        out.device_main_kv_capacity_pages    = usage.device_main_kv_capacity_pages;
+        out.device_backend_kv_capacity_pages = usage.device_backend_kv_capacity_pages;
+        out.device_main_kv_page_tokens       = usage.device_main_kv_page_tokens;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {

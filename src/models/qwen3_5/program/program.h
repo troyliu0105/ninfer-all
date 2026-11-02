@@ -49,7 +49,8 @@ struct CaptureAssessmentImpl;
 // The `_lease_pages` fields split the un-written growth reservation out of the corresponding
 // `device_*_kv_pages` total, so a reader can tell KV that actually exists from KV an active
 // request is merely still entitled to.  Only reporting the total hides how much Device KV a
-// running request reserves against the context cache.
+// running request reserves against the context cache.  The `_capacity_pages` fields carry each
+// pool's physical extent, so occupancy gauges can state their share of the configured pool.
 struct PhysicalUsageSnapshot {
     runtime::ProgramResourceRevision resource_revision;
     std::uint32_t device_state_slots            = 0;
@@ -59,6 +60,9 @@ struct PhysicalUsageSnapshot {
     std::uint32_t device_main_kv_lease_pages    = 0;
     std::uint32_t device_backend_kv_lease_pages = 0;
     std::size_t host_kv_bytes                   = 0;
+    std::uint32_t device_main_kv_capacity_pages    = 0;
+    std::uint32_t device_backend_kv_capacity_pages = 0;
+    std::uint32_t device_main_kv_page_tokens       = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;

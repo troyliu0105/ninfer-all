@@ -167,6 +167,12 @@ struct RuntimeStats {
     // entitled to, which is what made context-cache starvation invisible in the request log.
     std::uint32_t device_main_kv_lease_pages           = 0;
     std::uint32_t device_backend_kv_lease_pages        = 0;
+    // Physical extent of each Device KV pool (the --kv-capacity resolution for Main), and the
+    // token count of one Main page; zero when the model reports no paged pools. Occupancy shares
+    // and token equivalents are derived against these.
+    std::uint32_t device_main_kv_capacity_pages        = 0;
+    std::uint32_t device_backend_kv_capacity_pages     = 0;
+    std::uint32_t device_main_kv_page_tokens           = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;

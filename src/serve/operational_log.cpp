@@ -459,6 +459,24 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
     out << " | host " << product::format_pretty_percent(host_ratio) << " ("
         << product::format_pretty_duration(host_seconds) << ')';
+    // Device KV pool pressure: the share of the configured --kv-capacity pool that exists (live
+    // sequence KV plus retained cache, including the un-written lease reservation). The used
+    // tokens use the pool's page size, so the capacity token count is exactly the pool's
+    // token-equivalent extent, and `cache n (x%, ...)` continues to name reuse, not occupancy.
+    if (report.current.device_main_kv_capacity_pages != 0 &&
+        report.current.device_main_kv_page_tokens != 0) {
+        const std::uint64_t page_tokens = report.current.device_main_kv_page_tokens;
+        const std::uint64_t used_tokens =
+            static_cast<std::uint64_t>(report.current.device_main_kv_occupied_pages) * page_tokens;
+        const std::uint64_t capacity_tokens =
+            static_cast<std::uint64_t>(report.current.device_main_kv_capacity_pages) * page_tokens;
+        const double device_kv_ratio =
+            static_cast<double>(report.current.device_main_kv_occupied_pages) /
+            static_cast<double>(report.current.device_main_kv_capacity_pages);
+        out << " | device kv " << product::format_pretty_percent(device_kv_ratio) << " ("
+            << product::format_pretty_count(used_tokens) << '/'
+            << product::format_pretty_count(capacity_tokens) << " tok)";
+    }
     // Host KV pressure: the pinned slab pool's occupancy. Absolute gauges, not deltas.
     if (report.current.hybrid_host_capacity_bytes != 0) {
         const double host_kv_ratio =
